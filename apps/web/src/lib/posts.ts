@@ -64,14 +64,14 @@ Agentfly is free and needs no account. This page is the whole of installing it: 
 
 ## Windows: the Microsoft Store
 
-On the [download page](/versions), click **Download for Windows**. Your browser downloads the installer from the Microsoft Store. Open it and click **Install** - the Store downloads Agentfly, and keeps it updated from then on.
+On the [download page](/versions), click **Download for Windows**. Your browser downloads \`Agentfly Installer.exe\`, a small installer from the Microsoft Store. Open it and click **Install** - the Store downloads Agentfly, and keeps it updated from then on.
 
 The Store package is certified and signed by Microsoft, so Windows installs it without a SmartScreen warning. You can also search for Agentfly in the Microsoft Store app, or [open its Store page](https://apps.microsoft.com/detail/9MSW2N027GJX).
 
 ## Linux: a package
 
-- **Debian and Ubuntu** - download the .deb from the [download page](/versions) and open it with your software installer.
-- **Any other distribution** - download the AppImage, make it executable with \`chmod +x\`, and run it.
+- **Debian and Ubuntu** - download \`Agentfly-amd64.deb\` from the [download page](/versions) and open it with your software installer.
+- **Any other distribution** - download \`Agentfly-x86_64.AppImage\`, make it executable with \`chmod +x\`, and run it.
 
 ## Or one terminal command
 

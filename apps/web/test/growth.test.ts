@@ -72,7 +72,7 @@ describe("the post", () => {
 
   it("says exactly the figures picked, in order, and links the site", () => {
     expect(buildPost(growth, ["developers", "joined7d", "active30d"])).toBe(
-      "Agentfly, by the numbers:\n\n632 developers on Agentfly\n+214 joined this week\n324 active this month\n\nFarm four stables on Solana devnet.\nadcode.bluethenics.com",
+      "Agentfly, by the numbers:\n\n632 developers on Agentfly\n+214 joined this week\n324 active this month\n\nThe free AI code editor that pays you to build.\nadcode.bluethenics.com",
     );
   });
 

@@ -16,52 +16,82 @@ import { JsonLd } from "@/components/JsonLd";
 import { FAQ, faqPage } from "@/lib/schema";
 import { comparisons, landingPath } from "@/lib/landings";
 import { pageMetadata } from "@/lib/seo";
-import { SITE, TEAM } from "@/lib/site";
+import { SITE } from "@/lib/site";
 
+/*
+ * The title leads with what the page is, not only with what it promises.
+ *
+ * "Earn while you code" is the brand line and it stays - it is on the hero, and it is what
+ * makes this different. But a title is also the query it has to match, and nobody searches
+ * for a slogan. "Free AI code editor" is what somebody types when they are looking for
+ * exactly this and do not yet know it exists; the promise then earns the click.
+ *
+ * `absolute` because the layout template appends " - Agentfly", which would push a
+ * title that already names the product past the length a result will show.
+ */
 export const metadata: Metadata = pageMetadata({
   path: "/",
-  title: { absolute: `${SITE.name} - farm four stables on Solana devnet` },
+  title: { absolute: `${SITE.name} - a free AI code editor that pays you to use it` },
   socialTitle: `${SITE.name} - ${SITE.tagline}`,
-  description: SITE.description,
+  description:
+    "A full IDE with AI agents, real terminals and git - free forever. An occasional sponsored card funds it, and half of that ad revenue is credited to you.",
 });
 
 export default function Home() {
   return (
     <div className="marketplace-home">
+    {/*
+        The answers were already written and only a text file read them. Emitting the
+        schema beside the section that prints them is what lets a search engine quote
+        "Agentfly is free" instead of guessing it from marketing copy.
+      */}
       <JsonLd data={faqPage(FAQ)} />
       <a className="skip-link" href="#marketplace-main">Skip to content</a>
       <section className="marketplace-hero studio-hero" id="earn">
       <div className="marketplace-wrap" id="marketplace-main">
       <div className="studio-hero-top"><div className="marketplace-hero-copy">
-      <h1>Farm four stables<br />on one book.</h1>
-      <p>nUSDC, nUSDT, nPYUSD, and nUSDe share one reserve on Solana devnet. A swap moves that same book. Eight floors sit around $1.</p>
-      <ul className="hero-proof" aria-label="What this farm is">
-        <li>Solana devnet</li>
-        <li>One book, four coins</li>
-        <li>Claim 1,000 nUSDC once</li>
+      {/*
+        The one heading on the page that says what the product is. "A place to build your
+        next big idea" matched no query anybody types; "free AI code editor" is the query,
+        and the promise that follows is what earns the click.
+      */}
+      <h1>The free AI code editor<br />that pays you to build.</h1>
+      <p>Describe your idea and watch it get built - AI agents write the code, run it in a live preview and keep it in git. Free from the first line, and it pays you half of the ad revenue it earns.</p>
+      {/*
+        The three doubts that stop a first install, answered before the button: does it cost
+        anything, is the AI part a second bill, and can I see what it does on my machine.
+      */}
+      <ul className="hero-proof" aria-label="Before you install">
+        <li>No card, no trial - free</li>
+        <li>Free AI built in - no key</li>
+        <li>Open source, Apache-2.0</li>
       </ul>
       <HeroInstall source="hero" tour="#how-it-works" />
-      <p className="hero-team-note">Have a question before you start? <a href={TEAM.bookingUrl} target="_blank" rel="noopener noreferrer">Talk to the team <span aria-hidden="true">↗</span></a></p>
       </div><LiveImpressionsCounter /></div>
       <AppShowcase />
       <Partners />
       </div>
       </section>
 
+      {/*
+        Median time on this page was under five seconds (30 days to 2026-10-07), and 57% of
+        desktop visits saw no second page. What a visitor needs in that time is how far away
+        a working app is: three steps, each one a thing they will actually do.
+      */}
       <section className="first-build marketplace-wrap" id="how-it-works" aria-labelledby="first-build-heading">
-        <h2 id="first-build-heading">From a devnet wallet to a fill, in three steps.</h2>
+        <h2 id="first-build-heading">From download to a running app in three steps.</h2>
         <ol>
           <li>
-            <h3>Point at devnet</h3>
-            <p>The book, the floors, and every swap settle on Solana devnet. A mainnet wallet is looking at a different cluster.</p>
+            <h3>Install</h3>
+            <p>One click from the Microsoft Store on Windows 10 and 11, or a .deb or AppImage on Linux. Updates arrive on their own.</p>
           </li>
           <li>
-            <h3>Name the two coins</h3>
-            <p>Pay one stable and receive another. Both sides read the shared reserve, so size is not stuck in a single pair.</p>
+            <h3>Sign in - the AI is ready</h3>
+            <p><strong>Free models from our partners are built in</strong>, with a daily allowance and no key to find. Prefer your own? Run a model on your computer with Ollama, or paste any key you already have.</p>
           </li>
           <li>
-            <h3>Claim, or buy with SOL</h3>
-            <p>Claim 1,000 nUSDC once per wallet. Or pay SOL and mint 100 whole tokens of any book coin. The book itself does not move.</p>
+            <h3>Describe it</h3>
+            <p>Say what you want in a sentence. Agents plan it, write the code and open it running in the preview, with Undo on every turn.</p>
           </li>
         </ol>
       </section>
@@ -72,14 +102,15 @@ export default function Home() {
       <ModeShowcase />
 
       <section className="product-story marketplace-wrap" aria-labelledby="product-story-heading">
-      <div className="product-story-heading"><p className="marketplace-eyebrow">THE BOOK</p><h2 id="product-story-heading">One reserve.<br /><span>Eight floors.</span></h2><p>Depth is not split across six pair markets. The seed leans toward a dollar, and a broken floor steps aside.</p></div>
+      <div className="product-story-heading"><p className="marketplace-eyebrow">THE SPACE TO BUILD</p><h2 id="product-story-heading">Everything you need.<br /><span>Nothing in your way.</span></h2><p>From the first idea to the final commit, make yourself at home in an editor built around your work.</p></div>
       <div className="product-features">
-      <article><span className="feature-symbol" aria-hidden="true">✧</span><span className="feature-number">01 / BOOK</span><h3>Four coins.<br />One surface.</h3><p>Paying nUSDC to receive nUSDe reads the same balances as paying nPYUSD to receive nUSDT. The fee is one basis point, kept by the pool.</p><Link href="/docs">Explore the workspace <span aria-hidden="true">↗</span></Link></article>
-      <article><span className="feature-symbol" aria-hidden="true">⌘</span><span className="feature-number">02 / FLOORS</span><h3>Most of the seed<br />sits near $1.</h3><p>A tight floor quotes while the peg holds. A wider floor stays if a coin slips further. Full range has no floor, so it does not stop.</p><Link href="/free-ai-code-editor">Meet your new editor <span aria-hidden="true">↗</span></Link></article>
-      <article><span className="feature-symbol" aria-hidden="true">↗</span><span className="feature-number">03 / ONCE</span><h3>One claim.<br />Then the book.</h3><p>The first claim mints 1,000 nUSDC to the connected wallet. A second claim for that wallet is refused. After that, you swap or buy with SOL.</p><Link href="/earn-while-you-code">How earnings work <span aria-hidden="true">↗</span></Link></article>
+      <article><span className="feature-symbol" aria-hidden="true">✧</span><span className="feature-number">01 / INTELLIGENCE</span><h3>A second mind.<br />Right beside your code.</h3><p>Free models from our partners are built in - sign in and start, with no key and no bill. Or bring any key you already have - OpenAI, Anthropic, OpenRouter and more - or a model on your own computer, and pick the one that fits the task.</p><Link href="/docs">Explore the workspace <span aria-hidden="true">↗</span></Link></article>
+      <article><span className="feature-symbol" aria-hidden="true">⌘</span><span className="feature-number">02 / CRAFT</span><h3>Stay in flow.<br />Ship what matters.</h3><p>Monaco editing, real terminals, and integrated Git. The tools you reach for, together where you need them.</p><Link href="/free-ai-code-editor">Meet your new editor <span aria-hidden="true">↗</span></Link></article>
+      <article><span className="feature-symbol" aria-hidden="true">↗</span><span className="feature-number">03 / YOUR SHARE</span><h3>Your attention.<br />Something in return.</h3><p>An occasional sponsored card keeps the editor free. Half of the ad revenue is credited to you, with every event itemized.</p><Link href="/earn-while-you-code">How earnings work <span aria-hidden="true">↗</span></Link></article>
       </div>
+      {/* The homepage is the most-linked page on the site; what it links to, a crawler visits first. */}
       <p className="product-compare">
-        Switching from something else? See how {SITE.name} compares with{" "}
+        Switching from something else? See how Agentfly compares with{" "}
         {comparisons().map((page, index, all) => (
           <span key={page.slug}>
             <Link href={landingPath(page)}>{page.comparison?.subject.replace(/ \(formerly .*\)$/, "")}</Link>
@@ -91,12 +122,18 @@ export default function Home() {
 
       <AboutUs />
       <HomeFaq />
-      <section className="closing-cta marketplace-wrap"><p className="marketplace-eyebrow">DEVNET</p><h2>The book is open.</h2><HeroInstall source="closing" advertise={false} /><p>Connect a devnet wallet, then pay one stable and receive another.</p></section>
+      <section className="closing-cta marketplace-wrap"><p className="marketplace-eyebrow">YOUR NEXT CHAPTER</p><h2>Your first app is<br />one sentence away.</h2><HeroInstall source="closing" advertise={false} /><p>Free to build, no card, and half the ad revenue is yours.</p></section>
 
+      {/*
+        Advertisers are a second audience with their own nav button and their own page. The
+        builder used to sit between the product story and the FAQ, so a developer deciding
+        whether to install scrolled through a bid form to reach the answers; now the
+        developer story ends with its install, and the advertiser half starts here.
+      */}
       <section className="marketplace-bid" id="advertise">
       <div className="marketplace-wrap marketplace-bid-grid">
       <header className="marketplace-section-intro">
-      <p className="marketplace-eyebrow"><span /> Advertise on {SITE.name}</p>
+      <p className="marketplace-eyebrow"><span /> Advertise on Agentfly</p>
       <h2>Reach developers<br />while they build.</h2>
       <p>Bid from <strong>$1 per 500 verified impressions</strong>. Live demand sets the price, and a winning campaign can pay less than its maximum bid.</p>
       <dl><div><dt>50%</dt><dd>paid to developers</dd></div><div><dt>$1</dt><dd>minimum block bid</dd></div><div><dt>0</dt><dd>personal code collected</dd></div></dl>
@@ -105,9 +142,10 @@ export default function Home() {
       </div>
       </section>
 
-      <section className="marketplace-principles" aria-label={`How ${SITE.name} works`}>
+      <section className="marketplace-principles" aria-label="How Agentfly works">
       <div className="marketplace-wrap"><p><span>01</span><strong>Verified attention</strong><small>Only a real, eligible view can bill.</small></p><p><span>02</span><strong>Second-price auction</strong><small>Win at your maximum; often pay less.</small></p><p><span>03</span><strong>Human review</strong><small>Every creative is checked before delivery.</small></p></div>
       </section>
+      {/* Last on the page: whoever read this far is checking it will hold up - the manual says so. */}
       <DocsShowcase />
       <StickyInstall />
       </div>

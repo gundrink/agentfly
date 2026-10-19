@@ -167,7 +167,7 @@ export function buildPost(growth: Growth, metrics: readonly ShareMetric[]): stri
     const line = shareLine(growth, metric);
     return `${line.value} ${line.label}`;
   });
-  return [`${SITE.name}, by the numbers:`, "", ...lines, "", SITE.tagline, SITE.origin.replace(/^https?:\/\//, "")].join("\n");
+  return [`${SITE.name}, by the numbers:`, "", ...lines, "", "The free AI code editor that pays you to build.", SITE.origin.replace(/^https?:\/\//, "")].join("\n");
 }
 
 /** X's compose window, prefilled. The person still reads and sends it themselves. */

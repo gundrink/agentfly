@@ -22,7 +22,7 @@ export const SHARE_IMAGE = {
   url: url("/opengraph-image.png"),
   width: 1200,
   height: 630,
-  alt: `${SITE.name} - farm four stables on Solana devnet`,
+  alt: `${SITE.name} - a free AI code editor that pays you to use it`,
   type: "image/png",
 } as const;
 
@@ -139,8 +139,8 @@ export function docTitle(page: { title: string; authored: boolean }): { absolute
   if (page.authored) return { absolute: plain };
 
   for (const candidate of [
-    `${page.title} - ${SITE.name}, a Solana devnet farm`,
-    `${page.title} - ${SITE.name} on Solana`,
+    `${page.title} - ${SITE.name}, the free AI code editor`,
+    `${page.title} - ${SITE.name} AI code editor`,
   ]) {
     if (candidate.length <= TITLE_LIMIT) return { absolute: candidate };
   }
@@ -157,5 +157,5 @@ export function docTitle(page: { title: string; authored: boolean }): { absolute
 export function docDescription(description: string): string {
   const clean = description.replace(/\s+/g, " ").trim();
   if (clean.length >= 90) return metaDescription(clean);
-  return metaDescription(`${clean} A feature of ${SITE.name}, a Solana devnet farm.`);
+  return metaDescription(`${clean} A feature of ${SITE.name}, the free AI code editor that pays you to use it.`);
 }

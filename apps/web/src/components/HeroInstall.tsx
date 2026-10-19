@@ -145,7 +145,7 @@ function WindowsInstall({ source, secondary, advertiseNote, invite }: { source: 
 
       {started ? (
         <ol className="install-next" aria-live="polite">
-          <li><span><strong>Open the installer</strong> from your browser&apos;s downloads.</span></li>
+          <li><span><strong>Open Agentfly Installer.exe</strong> from your browser&apos;s downloads.</span></li>
           <li><span><strong>Click Install.</strong> The Microsoft Store downloads Agentfly and keeps it updated.</span></li>
           <li><span><strong>Agentfly opens.</strong> Open a folder and build. You earn from the first sponsored card, no account needed.</span></li>
           <li className="install-next-fallback">

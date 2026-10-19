@@ -12,15 +12,6 @@
 .actions > a:last-child { color: var(--text); font-size: 13px; text-underline-offset: 4px; }
 .actions > a:last-child:hover { text-decoration: underline; }
 .actions a:focus-visible { outline: 2px solid var(--text); outline-offset: 4px; }
-.note { display: block; margin-top: 14px; color: var(--faint); font-size: 12px; line-height: 1.7; }
-.founder { margin: 0; min-width: 0; max-width: 480px; width: 100%; justify-self: end; border: 1px solid var(--hairline); border-radius: 18px; overflow: hidden; background: var(--card); }
-.founder img { display: block; width: 100%; height: auto; aspect-ratio: 1; object-fit: cover; }
-.founder figcaption { display: flex; flex-direction: column; gap: 8px; padding: 24px; }
-.founder strong { color: var(--text); font-size: clamp(19px, 2vw, 24px); font-weight: 550; letter-spacing: -.025em; }
-.founder figcaption > span:last-child { color: var(--muted); font-size: 13px; }
-.role { color: var(--faint); font-size: 10px; letter-spacing: .12em; font-weight: 550; }
 @media (max-width: 760px) {
-  .section { grid-template-columns: minmax(0, 1fr); gap: 32px; }
-  .founder { justify-self: start; max-width: 420px; }
   .story > p.lead { font-size: 17px; }
 }

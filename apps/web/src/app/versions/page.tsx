@@ -30,11 +30,11 @@ export const metadata: Metadata = pageMetadata({
 const STEPS: readonly { name: string; text: string }[] = [
   {
     name: "Download Agentfly",
-    text: "On Windows, click Download for Windows to get the installer from the Microsoft Store. On Linux, download the .deb for Debian and Ubuntu, or the AppImage for any other distribution.",
+    text: "On Windows, click Download for Windows to get Agentfly Installer.exe from the Microsoft Store. On Linux, download the .deb for Debian and Ubuntu, or the AppImage for any other distribution.",
   },
   {
     name: "Run the installer",
-    text: `On Windows, open the installer and click Install - no administrator rights needed. On Linux, open the .deb with your software installer, or make the AppImage executable and run it. Prefer a terminal? On Windows run ${WINDOWS_COMMAND}; on Linux run ${LINUX_COMMAND}.`,
+    text: `On Windows, open Agentfly Installer.exe and click Install - no administrator rights needed. On Linux, open the .deb with your software installer, or make the AppImage executable and run it. Prefer a terminal? On Windows run ${WINDOWS_COMMAND}; on Linux run ${LINUX_COMMAND}.`,
   },
   {
     name: "Start Agentfly",
@@ -107,15 +107,15 @@ export default async function VersionsPage() {
           <dl>
             <div>
               <dt>Windows 10 and 11</dt>
-              <dd><a href={MICROSOFT_STORE.installerUrl("versions-list")}>Windows installer</a> from the Microsoft Store · <a href={MICROSOFT_STORE.pageUrl} rel="noreferrer">Store page</a></dd>
+              <dd><a href={MICROSOFT_STORE.installerUrl("versions-list")}>Agentfly Installer.exe</a> from the Microsoft Store · <a href={MICROSOFT_STORE.pageUrl} rel="noreferrer">Store page</a></dd>
             </div>
             <div>
               <dt>Linux, Debian and Ubuntu</dt>
-              <dd><a href={LINUX_DOWNLOADS(GITHUB_REPO).deb}>Debian package (.deb)</a></dd>
+              <dd><a href={LINUX_DOWNLOADS(GITHUB_REPO).deb}>Agentfly-amd64.deb</a></dd>
             </div>
             <div>
               <dt>Linux, any distribution</dt>
-              <dd><a href={LINUX_DOWNLOADS(GITHUB_REPO).appImage}>AppImage</a></dd>
+              <dd><a href={LINUX_DOWNLOADS(GITHUB_REPO).appImage}>Agentfly-x86_64.AppImage</a></dd>
             </div>
             <div>
               <dt>macOS</dt>

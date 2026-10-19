@@ -54,12 +54,12 @@ export const metadata: Metadata = {
   description: SITE.description,
   applicationName: SITE.name,
   keywords: [
+    "ad supported IDE",
+    "code editor that pays",
+    "AI code editor",
+    "free IDE",
+    "developer earnings",
     "Agentfly",
-    "Solana",
-    "Solana devnet",
-    "stablecoin",
-    "farming",
-    "nUSDC",
   ],
   authors: [{ name: SITE.name, url: SITE.origin }],
   /*

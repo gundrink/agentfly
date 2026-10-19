@@ -136,7 +136,7 @@ describe("snippet-sized text", () => {
 
   it("names the category on a generated page's title, where it fits", () => {
     expect(docTitle({ title: "Race mode", authored: false })).toEqual({
-      absolute: "Race mode - Agentfly, a Solana devnet farm",
+      absolute: "Race mode - Agentfly, the free AI code editor",
     });
     // Too long for the category: the plain form rather than a truncated result.
     const long = "Open IDE in a separate window with every panel restored";
@@ -150,7 +150,7 @@ describe("snippet-sized text", () => {
   it("gives a tooltip-length description enough to be worth a snippet", () => {
     const out = docDescription("Which company's AI you want to use.");
     expect(out.startsWith("Which company's AI you want to use.")).toBe(true);
-    expect(out).toContain("Solana devnet farm");
+    expect(out).toContain("AI code editor");
     expect(out.length).toBeLessThanOrEqual(DESCRIPTION_LIMIT);
   });
 });

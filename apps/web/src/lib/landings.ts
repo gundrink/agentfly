@@ -174,7 +174,7 @@ export const LANDINGS: readonly Landing[] = [
     slug: "earn-while-you-code",
     title: "Get paid to code: how much an ad-supported editor pays",
     description:
-      "An honest account of earning while you code in Agentfly - the auction, the revenue share, the arithmetic on a real working month, and why it is not an income.",
+      "An honest account of earning while you code in Agentfly - the ad auction, the revenue share, the arithmetic on a real working month, and why it is not an income.",
     heading: "Getting paid to code, and what that is actually worth",
     lede: `Agentfly credits you a share of what advertisers pay to reach you while you work. This page sets out how much that is, using the real rates rather than a best case: what one impression pays, what a normal working month adds up to, and why the honest description is "your editor and your AI subscription pay for themselves" rather than "a second income".`,
     updated: "2026-09-02",
@@ -333,9 +333,9 @@ export const LANDINGS: readonly Landing[] = [
   },
   {
     slug: "cursor",
-    title: "Agentfly vs Cursor: free Cursor alternative, no subscription",
+    title: "Agentfly vs Cursor: a free Cursor alternative, no subscription",
     description:
-      "Cursor's full plan is monthly. Agentfly runs AI agents on your own API key and pays you a share of ad revenue. Cost, models, and where Cursor wins.",
+      "Cursor's full plan is a monthly subscription. Agentfly runs AI agents on your own API key and pays you a share of ad revenue. Cost, models, and where Cursor wins.",
     heading: "Agentfly vs Cursor",
     lede: `Cursor is an AI-first editor with a limited free plan and a monthly subscription that bundles a model allowance. Agentfly is an AI-native editor with no subscription, where you bring your own provider key and the editor pays you rather than the other way round. The trade is real in both directions and this page states it both ways.`,
     updated: "2026-09-30",

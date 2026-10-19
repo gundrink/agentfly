@@ -16,11 +16,15 @@ export function ChainMarks() {
 
   return (
     <span className="chain-marks">
-      {xUrl ? (
-        <a className="chain-mark" href={xUrl} target="_blank" rel="noreferrer" aria-label="X">
-          <XIcon />
-        </a>
-      ) : null}
+      <a
+        className="chain-mark"
+        href={xUrl || undefined}
+        target={xUrl ? "_blank" : undefined}
+        rel={xUrl ? "noreferrer" : undefined}
+        aria-label="X"
+      >
+        <XIcon />
+      </a>
       <button
         className="chain-mark chain-ca"
         type="button"

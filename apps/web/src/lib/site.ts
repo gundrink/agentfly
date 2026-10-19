@@ -60,11 +60,6 @@ export const PARENT = {
   id: "https://bluethenics.com/#organization",
 } as const;
 
-/** A team booking link, shared by the homepage and navigation. No personal name or photo. */
-export const TEAM = {
-  bookingUrl: "https://calendly.com/bluethenics01/30min",
-} as const;
-
 /**
  * Where the code lives and how it is licensed.
  *
@@ -129,9 +124,9 @@ export const APP_VERSION: string = packageJson.version;
 
 export const SITE = {
   name: "Agentfly",
-  tagline: "Farm four stables on Solana devnet.",
+  tagline: "Earn while you code",
   description:
-    "Agentfly farms four test stablecoins on one Solana devnet book. nUSDC, nUSDT, nPYUSD, and nUSDe share the reserve, with eight floors around $1.",
+    "Agentfly is a free AI code editor - AI agents, Monaco editing, real terminals, git - that shows an occasional sponsored card and credits you half the revenue, on a ledger you can audit.",
   origin: SITE_ORIGIN,
   locale: "en_US",
 } as const;

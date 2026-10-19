@@ -9,7 +9,6 @@ import { Mark } from "./Mark";
 import { useAuth } from "./AuthProvider";
 import { PortalActions } from "./PortalActions";
 import { ThemePicker } from "./ThemeProvider";
-import { TEAM } from "@/lib/site";
 
 export function Nav() {
   const pathname = usePathname();
@@ -70,7 +69,6 @@ export function Nav() {
         Compare
       </Link>
       <Link href="/support" className="glass-nav-link nav-mobile-only" aria-current={pathname === "/support" ? "page" : undefined}>Support</Link>
-      <a href={TEAM.bookingUrl} className="glass-nav-link nav-team nav-mobile-only" target="_blank" rel="noopener noreferrer">Talk to the team <span aria-hidden="true">↗</span></a>
       {/* The desktop bar has its own Download button; a second "Download" beside it split one action in two. Phones hide that button, so the sheet keeps this. */}
       <Link href="/versions" className="glass-nav-link nav-mobile-only" aria-current={pathname === "/versions" ? "page" : undefined}>Download</Link>
       {isAdmin && <Link href="/admin" className="glass-nav-link">Admin</Link>}
@@ -94,7 +92,6 @@ export function Nav() {
         <nav className="glass-nav" aria-label="Main navigation">
           <span className="glass-nav-secondary">{secondaryLinks}</span>
           <ThemePicker />
-          <a href={TEAM.bookingUrl} className="glass-nav-link nav-team nav-team-action" target="_blank" rel="noopener noreferrer">Talk to the team <span aria-hidden="true">↗</span></a>
           <PortalActions />
           {/* The primary action on every page: most visitors came to get the editor. */}
           <Link href="/versions" className="nav-download">Download</Link>
