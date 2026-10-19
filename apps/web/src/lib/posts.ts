@@ -674,14 +674,10 @@ const fileposts = (): Post[] =>
  * returned by either, which is the point of the setting: one piece of writing, two homes,
  * rather than a copy in each that drifts.
  */
-export async function allPosts(options?: { surface?: "blog" | "docs" }): Promise<Post[]> {
-  const wanted = options?.surface;
-  const onSurface = (post: Post): boolean =>
-    wanted === undefined || post.surface === "both" || (post.surface ?? "blog") === wanted;
-
+async function loadPosts(): Promise<Post[]> {
   try {
     const response = await readApi("/v1/posts", REVALIDATE_SECONDS);
-    if (!response.ok) return fileposts().filter(onSurface);
+    if (!response.ok) return fileposts();
 
     const body = (await response.json()) as { posts?: ApiPost[] };
     const posts = Array.isArray(body.posts) ? body.posts.map(fromApi) : [];
@@ -701,12 +697,29 @@ export async function allPosts(options?: { surface?: "blog" | "docs" }): Promise
     const merged = new Map(fileposts().map((post) => [post.slug, post]));
     for (const post of posts) merged.set(post.slug, post);
 
-    return [...merged.values()]
-      .filter(onSurface)
-      .sort((a, b) => b.published.localeCompare(a.published));
+    return [...merged.values()].sort((a, b) => b.published.localeCompare(a.published));
   } catch {
-    return fileposts().filter(onSurface);
+    return fileposts();
   }
+}
+
+/**
+ * One shared load while `next build` renders every docs page.
+ *
+ * Each page asks for the full list several times. Repeating a network read that does not
+ * answer turns a 60-second page limit into a failed export. A running server still reads
+ * through the revalidated fetch, so an edit in the admin can show up without a redeploy.
+ */
+let builtPosts: Promise<Post[]> | undefined;
+
+export async function allPosts(options?: { surface?: "blog" | "docs" }): Promise<Post[]> {
+  const wanted = options?.surface;
+  const onSurface = (post: Post): boolean =>
+    wanted === undefined || post.surface === "both" || (post.surface ?? "blog") === wanted;
+
+  const loading =
+    process.env["NEXT_PHASE"] === "phase-production-build" ? (builtPosts ??= loadPosts()) : loadPosts();
+  return (await loading).filter(onSurface);
 }
 
 export async function getPost(slug: string): Promise<Post | null> {
