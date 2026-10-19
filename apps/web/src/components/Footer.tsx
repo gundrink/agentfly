@@ -28,7 +28,6 @@ export function Footer() {
           <Link href="/">Overview</Link>
           <Link href="/versions">Download</Link>
           <Link href="/docs">Documentation</Link>
-          <a href={SOURCE.repo}>Source code</a>
           <Link href="/#advertise">Advertise</Link>
         </nav>
 
@@ -66,8 +65,7 @@ export function Footer() {
       <div className="marketplace-wrap footer-base">
         <span>
           © {new Date().getFullYear()} {SITE.name}. A{" "}
-          <a href={PARENT.url}>{PARENT.name}</a> product. Open source under{" "}
-          <a href={SOURCE.licenceUrl}>{SOURCE.licence}</a>.
+          <a href={PARENT.url}>{PARENT.name}</a> product. Open source under {SOURCE.licence}.
         </span>
         {/* Here rather than after the footer, where its button floated on the page on its
             own. The consent card it opens is fixed-position, so placement moves nothing else. */}

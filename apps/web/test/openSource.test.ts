@@ -17,11 +17,12 @@ describe("the site says Agentfly is open source", () => {
     });
   });
 
-  it("links to the source from the footer, from the shared constant", () => {
+  it("names the licence in the footer without a repository link", () => {
     const footer = read("components/Footer.tsx");
-    expect(footer).toContain("SOURCE.repo");
     expect(footer).toContain("SOURCE.licence");
-    expect(footer).toContain("Source code");
+    expect(footer).not.toContain("SOURCE.repo");
+    expect(footer).not.toContain("SOURCE.licenceUrl");
+    expect(footer).not.toContain("Source code");
   });
 
   it("answers the question in the FAQ", () => {
