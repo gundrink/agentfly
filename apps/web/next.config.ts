@@ -36,11 +36,11 @@ const config: NextConfig = {
    * inference depends on the working directory: from the repository root it picks the
    * repository, but `npm run deploy` runs from `apps/web`, where it picks `apps/web` and
    * puts the API outside the project. Same code, same command, two different answers.
-   */
-  /*
-   * Vercel installs this app's dependencies in `apps/web/node_modules`. Turbopack's root is
-   * the repository, so `services/api` never walks into that folder. These names are relative
-   * to this app, which is where the install actually put the packages.
+   *
+   * Vercel installs this app's dependencies in `apps/web/node_modules`. With the root pinned
+   * to the repository, `services/api` never walks into that folder. These aliases are
+   * relative to this app, which is where that install put `firebase` and
+   * `@supabase/supabase-js`.
    */
   turbopack: {
     root: join(HERE, "..", ".."),
