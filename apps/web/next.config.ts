@@ -1,0 +1,86 @@
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { NextConfig } from "next";
+
+/** This file's directory. `import.meta.dirname` is not in this project's `ImportMeta` type. */
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * This deploys to a Cloudflare Worker via `@opennextjs/cloudflare`.
+ */
+const config: NextConfig = {
+  reactStrictMode: true,
+  poweredByHeader: false,
+
+  /*
+   * Required, not left over from the Cloud Run deployment this replaced. The adapter does
+   * not bundle from `.next`: `@opennextjs/aws`, which the Cloudflare adapter builds on,
+   * reads `.next/standalone` by hard-coded path (`copyTracedFiles.js`). Without this the
+   * site builds cleanly and then the bundle step dies on a missing `pages-manifest.json`,
+   * which reads like a broken adapter rather than a missing option.
+   */
+  output: "standalone",
+
+  /*
+   * `services/api` lives outside this app's directory, and `/v1/*` imports it. Next
+   * refuses to bundle files from outside the project root without this.
+   */
+  experimental: { externalDir: true },
+
+  /*
+   * Pin the root Turbopack resolves modules against. Files outside it are not resolved at
+   * all, and `@adcode/api/*` points at `../../services/api/*`, so getting this wrong fails
+   * the build with a module-not-found on every adapter.
+   *
+   * It has to be pinned because Next infers the root from the nearest lockfile, and that
+   * inference depends on the working directory: from the repository root it picks the
+   * repository, but `npm run deploy` runs from `apps/web`, where it picks `apps/web` and
+   * puts the API outside the project. Same code, same command, two different answers.
+   */
+  turbopack: { root: join(HERE, "..", "..") },
+
+  /*
+   * The routes retired by the single-page restructure, moved permanently.
+   *
+   * They used to be pages that called `redirect()`, which answers 307 - temporary - so a
+   * search engine kept the old URL on file and passed nothing it had earned to the new
+   * one. Worse, every `/blog/<post>` went to the homepage, although every post has lived
+   * at `/docs/<post>` since the blog folded into the docs. A 308 to the real address is
+   * the only redirect that carries a link's value across.
+   */
+  async redirects() {
+    return [
+      { source: "/blog", destination: "/docs", permanent: true },
+      { source: "/blog/:slug", destination: "/docs/:slug", permanent: true },
+      { source: "/changelog", destination: "/versions", permanent: true },
+      { source: "/download", destination: "/versions", permanent: true },
+      { source: "/downloads", destination: "/versions", permanent: true },
+      { source: "/install", destination: "/versions", permanent: true },
+      { source: "/advertise", destination: "/#advertise", permanent: true },
+      { source: "/rss.xml", destination: "/feed.xml", permanent: true },
+      { source: "/rss", destination: "/feed.xml", permanent: true },
+    ];
+  },
+
+  async headers() {
+    return [
+      {
+        source: "/:path*",
+        headers: [
+          /*
+           * HTTPS only, remembered for a year. `middleware.ts` redirects plain http on the
+           * brand host; this makes every browser that has visited once skip that hop for good.
+           * No `includeSubDomains`: this host does not speak for the parent domain's.
+           */
+          { key: "Strict-Transport-Security", value: "max-age=31536000" },
+          { key: "X-Content-Type-Options", value: "nosniff" },
+          { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "X-Frame-Options", value: "DENY" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },
+        ],
+      },
+    ];
+  },
+};
+
+export default config;

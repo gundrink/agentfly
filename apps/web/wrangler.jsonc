@@ -1,0 +1,84 @@
+/**
+ * The Cloudflare Worker that serves adcode.bluethenics.com.
+ *
+ * One Worker serves everything: the marketing site, the advertiser portal, the dashboard,
+ * the admin panel, and the API at `/v1/*`. That is the point of folding `services/api` into
+ * the Next app - one deployment, one origin, one set of secrets, and no CORS preflight on
+ * the path the editor uses most.
+ *
+ * Nothing secret belongs in this file. It is committed. Secrets are set with
+ * `wrangler secret put`, which stores them encrypted on Cloudflare and never writes them to
+ * disk - see SETUP.md step 7 for the exact list.
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "adcode",
+  "main": ".open-next/worker.js",
+  /* Billing webhooks also use the existing workers.dev address. */
+  "workers_dev": true,
+  "preview_urls": false,
+  /* Preserve public runtime variables edited in Cloudflare's dashboard. Secrets are retained by Wrangler. */
+  "keep_vars": true,
+
+  /* Keep the existing production hostname attached when deploying from this project. */
+  "routes": [
+    {
+      "pattern": "adcode.bluethenics.com",
+      "custom_domain": true,
+      "enabled": true,
+      "previews_enabled": false
+    }
+  ],
+
+  /*
+   * Pins the runtime's behaviour to a known date. Raising it can change how existing APIs
+   * behave, so it moves deliberately rather than automatically.
+   */
+  "compatibility_date": "2026-08-01",
+
+  /*
+   * `nodejs_compat` is not optional here. Three things in this codebase need it:
+   * `node:buffer` in `services/api/src/fetchHandler.ts`, `node:crypto`'s `createHmac` and
+   * `timingSafeEqual` in `src/billing.ts` for the Dodo webhook signature, and Next's own
+   * server runtime.
+   */
+  "compatibility_flags": ["nodejs_compat"],
+
+  /*
+   * Server-side rendering plus the `/v1/*` API routinely needs more than the
+   * Workers Free plan's 10 ms CPU budget per request, which surfaces as
+   * Error 1102 ("Worker exceeded resource limits") even for a single visitor.
+   * This explicit 30 s budget requires the Workers Paid plan; on Free, either
+   * upgrade or remove this block and expect SSR routes to keep hitting 1102.
+   */
+  "limits": {
+    "cpu_ms": 30000
+  },
+
+  /* The prerendered pages and static files Next produced. */
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  /*
+   * Logs, so a failing request has an account of itself. On the free plan this is a
+   * rolling window rather than retained history, which is enough to debug a deploy.
+   */
+  "observability": {
+    "enabled": true
+  },
+
+  "vars": {
+    /*
+     * Public by design: it identifies the site, it does not authorise anything.
+     *
+     * The brand domain, not the `workers.dev` one the Worker also answers on. This is the
+     * host every canonical, the sitemap, the robots `Host` line and the install scripts
+     * name, and `src/middleware.ts` redirects the other origin here so a search engine is
+     * not offered the same site twice. `/v1` is deliberately exempt from that redirect -
+     * Dodo's webhook is registered against the `workers.dev` URL and must keep resolving.
+     */
+    "NEXT_PUBLIC_SITE_ORIGIN": "https://adcode.bluethenics.com"
+  }
+}

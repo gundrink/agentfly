@@ -1,0 +1,285 @@
+import type { PopupId } from "./popupLayer.ts";
+import type { LayoutInput } from "./motion.ts";
+
+export type PopupSize = "anchored" | "medium" | "large" | "workspace";
+type SurfacePresentation = { opacity: string; scale: string; translate: string };
+let nextTitleId = 0;
+
+export interface PopupShellOptions {
+  readonly id: PopupId;
+  readonly title: string;
+  readonly size: PopupSize;
+  readonly modal: boolean;
+  readonly host: HTMLElement;
+  readonly content: HTMLElement;
+  readonly initialFocus?: () => HTMLElement | null;
+  readonly closeOnBackdrop?: boolean;
+  readonly onRequestClose: () => void;
+  /** Runs after the native dialog releases focus and the top layer. */
+  readonly onClosed?: () => void;
+}
+
+export interface PopupOpenOptions {
+  readonly trigger?: HTMLElement;
+  readonly anchor?: HTMLElement;
+  readonly input?: LayoutInput;
+  readonly initialFocus?: HTMLElement;
+}
+
+export interface PopupShell {
+  readonly element: HTMLDialogElement;
+  readonly surface: HTMLElement;
+  open(options?: PopupOpenOptions): void;
+  close(options?: { readonly restoreFocus?: boolean; readonly immediate?: boolean }): void;
+  isOpen(): boolean;
+  focus(): void;
+}
+
+/** An open popup owns Escape before a background editor can consume the key. */
+export function handleOutsidePopupEscape(
+  event: KeyboardEvent,
+  primary: Pick<PopupShell, "element" | "surface">,
+  dependent: Pick<PopupShell, "element" | "surface"> | undefined,
+  dismiss: () => void,
+): boolean {
+  if (event.key !== "Escape" || event.defaultPrevented) return false;
+  if ((dependent ?? primary).surface.contains(event.target as Node)) return false;
+  const modal = document.querySelector("dialog:modal");
+  if (modal !== null && modal !== primary.element && modal !== dependent?.element) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  dismiss();
+  return true;
+}
+
+/**
+ * A click's composed path survives synchronous replacement of its original target.
+ *
+ * A floating panel the popup hosts (the chat's Team and activity panel, opened from an
+ * expanded chat) sits outside the surface but belongs to it, so a click there is not a
+ * request to close the popup.
+ */
+export function isPopupShellBackdrop(event: Event, surface: HTMLElement): boolean {
+  const path = event.composedPath();
+  if (path.includes(surface)) return false;
+  return !path.some((node) => (node as Partial<Element>).classList?.contains("floating-panel") === true);
+}
+
+/**
+ * A native modal placed above a closing popup stops Chromium from advancing the lower
+ * popup's Web Animation. The coordinator has already made that popup logically closed,
+ * so retire its native top-layer entry before opening the next modal.
+ */
+function dismissClosingPopupDialogs(): void {
+  for (const closing of document.querySelectorAll<HTMLDialogElement>(
+    'dialog.popup-shell[open][data-closing="true"]',
+  )) {
+    closing.close();
+  }
+}
+
+export function createPopupShell(options: PopupShellOptions): PopupShell {
+  const dialog = document.createElement("dialog");
+  dialog.className = "popup-shell";
+  dialog.dataset["popupId"] = options.id;
+  dialog.dataset["popupSize"] = options.size;
+
+  const surface = document.createElement("section");
+  surface.className = "popup-shell-surface";
+  surface.tabIndex = -1;
+  surface.append(options.content);
+
+  const visibleTitle = options.content.querySelector<HTMLElement>("h1, h2");
+  const titleElement = visibleTitle ?? document.createElement("h2");
+  titleElement.id = `popup-shell-title-${options.id}-${String(++nextTitleId)}`;
+  if (visibleTitle === null) {
+    titleElement.className = "popup-shell-title";
+    titleElement.textContent = options.title;
+    surface.prepend(titleElement);
+  }
+  dialog.setAttribute("aria-labelledby", titleElement.id);
+  dialog.append(surface);
+  options.host.append(dialog);
+
+  let restoreTarget: HTMLElement | null = null;
+  let sourceOffset = { x: 0, y: 6 };
+  let motionGeneration = 0;
+  let surfaceMotion: Animation | undefined;
+  let backdropPressed = false;
+  let anchor: HTMLElement | undefined;
+
+  window.addEventListener("resize", () => {
+    if (dialog.open && options.size === "anchored" && anchor?.isConnected)
+      positionAnchored(dialog, anchor);
+  });
+
+  const reducedMotion = (): boolean =>
+    document.documentElement.dataset["reducedMotion"] === "true" ||
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const enterTiming = {
+    duration: 180,
+    easing: "cubic-bezier(.32,.72,0,1)",
+  } satisfies KeyframeAnimationOptions;
+  const reducedTiming = {
+    duration: 100,
+    easing: "linear",
+  } satisfies KeyframeAnimationOptions;
+
+  const cancelSurfaceMotion = (): void => {
+    motionGeneration += 1;
+    // Keep the handle: hidden/top-layer-retired dialogs may not enumerate their effects.
+    surfaceMotion?.cancel();
+    surfaceMotion = undefined;
+    surface.getAnimations().forEach((animation) => animation.cancel());
+  };
+
+  // Computed styles are live. Copy the painted values before canceling their animation.
+  const presentation = (): SurfacePresentation => {
+    const current = getComputedStyle(surface);
+    return { opacity: current.opacity, scale: current.scale, translate: current.translate };
+  };
+
+  const offsetFrom = (trigger: HTMLElement | undefined): { x: number; y: number } => {
+    if (trigger === undefined) return { x: 0, y: 6 };
+    const origin = trigger.getBoundingClientRect();
+    const destination = surface.getBoundingClientRect();
+    return {
+      x: Math.max(-12, Math.min(12, origin.left + origin.width / 2 - (destination.left + destination.width / 2))),
+      y: Math.max(-12, Math.min(12, origin.top + origin.height / 2 - (destination.top + destination.height / 2))),
+    };
+  };
+
+  const animateOpen = (input: LayoutInput, trigger: HTMLElement | undefined, current?: SurfacePresentation): void => {
+    cancelSurfaceMotion();
+    delete dialog.dataset["closing"];
+    if (input === "keyboard") return;
+
+    if (current === undefined) {
+      sourceOffset = options.size === "anchored" ? offsetFrom(trigger) : { x: 0, y: 6 };
+      surface.style.transformOrigin = options.size === "anchored"
+        ? `left ${String(Math.max(0, Math.min(surface.clientHeight, (trigger?.getBoundingClientRect().top ?? 0) - surface.getBoundingClientRect().top)))}px`
+        : "center";
+    }
+    const reduce = reducedMotion();
+    const keyframes: Keyframe[] = reduce
+      ? [{ opacity: current?.opacity ?? 0 }, { opacity: 1 }]
+      : [
+          current ?? { opacity: 0, scale: 0.985, translate: `${String(sourceOffset.x)}px ${String(sourceOffset.y)}px` },
+          { opacity: 1, scale: 1, translate: "0 0" },
+        ];
+    surfaceMotion = surface.animate(keyframes, reduce ? reducedTiming : enterTiming);
+  };
+
+  const finishClose = (generation: number, restoreFocus: boolean): void => {
+    if (generation !== motionGeneration || !dialog.open) return;
+    // A forwards-filled exit must not survive as an invisible presentation on reuse.
+    cancelSurfaceMotion();
+    dialog.close();
+    delete dialog.dataset["closing"];
+    if (restoreFocus) restoreTarget?.focus();
+  };
+
+  const announce = (open: boolean): void => {
+    restoreTarget?.setAttribute("aria-expanded", String(open));
+    restoreTarget?.setAttribute("aria-pressed", String(open));
+  };
+
+  dialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    options.onRequestClose();
+  });
+  dialog.addEventListener("close", () => options.onClosed?.());
+  dialog.addEventListener("keydown", (event) => {
+    if (!options.modal && event.key === "Escape") {
+      event.preventDefault();
+      options.onRequestClose();
+    }
+  });
+  dialog.addEventListener("click", (event) => {
+    const dismiss = backdropPressed && isPopupShellBackdrop(event, surface);
+    backdropPressed = false;
+    if (options.closeOnBackdrop !== false && dismiss) {
+      options.onRequestClose();
+    }
+  });
+  dialog.addEventListener("pointerdown", (event) => {
+    backdropPressed = event.button === 0 && isPopupShellBackdrop(event, surface);
+  }, true);
+  dialog.addEventListener("pointercancel", () => { backdropPressed = false; });
+
+  return {
+    element: dialog,
+    surface,
+    open(openOptions = {}) {
+      backdropPressed = false;
+      anchor = openOptions.anchor;
+      const current = dialog.open ? presentation() : undefined;
+      cancelSurfaceMotion();
+      restoreTarget = openOptions.trigger ?? null;
+      if (openOptions.anchor !== undefined) positionAnchored(dialog, openOptions.anchor);
+      if (!dialog.open) {
+        if (options.modal) {
+          dismissClosingPopupDialogs();
+          dialog.showModal();
+        }
+        else dialog.show();
+      }
+      if (anchor !== undefined && options.size === "anchored") positionAnchored(dialog, anchor);
+      const input = openOptions.input ?? "keyboard";
+      dialog.dataset["input"] = input;
+      animateOpen(input, openOptions.trigger, current);
+      announce(true);
+      (openOptions.initialFocus ?? options.initialFocus?.() ?? surface).focus({
+        preventScroll: true,
+      });
+    },
+    close(closeOptions = {}) {
+      backdropPressed = false;
+      if (!dialog.open) return;
+      if (
+        dialog.dataset["closing"] === "true" &&
+        closeOptions.immediate !== true
+      )
+        return;
+      const current = presentation();
+      cancelSurfaceMotion();
+      announce(false);
+      const restoreFocus = closeOptions.restoreFocus !== false;
+      if (closeOptions.immediate === true) {
+        finishClose(motionGeneration, restoreFocus);
+        return;
+      }
+
+      dialog.dataset["closing"] = "true";
+      const generation = motionGeneration;
+      const duration = reducedMotion() ? 100 : 160;
+      const keyframes: Keyframe[] = reducedMotion()
+        ? [{ opacity: current.opacity }, { opacity: 0 }]
+        : [
+            { opacity: current.opacity, scale: current.scale, translate: current.translate },
+            { opacity: 0, scale: 0.985, translate: `${String(sourceOffset.x)}px ${String(sourceOffset.y)}px` },
+          ];
+      const animation = surface.animate(keyframes, {
+        duration,
+        easing: enterTiming.easing,
+        fill: "forwards",
+      });
+      surfaceMotion = animation;
+      void animation.finished
+        .then(() => finishClose(generation, restoreFocus))
+        .catch(() => undefined);
+    },
+    isOpen: () => dialog.open,
+    focus: () => surface.focus({ preventScroll: true }),
+  };
+}
+
+function positionAnchored(dialog: HTMLDialogElement, anchor: HTMLElement): void {
+  const box = anchor.getBoundingClientRect();
+  const width = Math.min(420, window.innerWidth - 72);
+  const x = Math.max(12, Math.min(box.right + 10, window.innerWidth - width - 12));
+  dialog.style.setProperty("--popup-anchor-x", `${String(x)}px`);
+  const height = dialog.querySelector<HTMLElement>(".popup-shell-surface")?.offsetHeight ?? 620;
+  const y = Math.max(12, Math.min(box.top, window.innerHeight - height - 12));
+  dialog.style.setProperty("--popup-anchor-y", `${String(y)}px`);
+}

@@ -1,0 +1,424 @@
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { createWorkspaceSearch, type WorkspaceSearch } from "../src/textSearch.ts";
+
+/**
+ * Run against a real directory tree. The parts most likely to be wrong - which files get
+ * skipped, how binary content is detected, what a hostile regex does - are all about the
+ * filesystem, and a fake tree would only confirm my own assumptions about it.
+ */
+let dir: string;
+let search: WorkspaceSearch;
+
+async function write(path: string, contents: string): Promise<void> {
+  const full = join(dir, path);
+  await mkdir(join(full, ".."), { recursive: true });
+  await writeFile(full, contents, "utf8");
+}
+
+async function collect<T>(stream: AsyncIterable<T>): Promise<T[]> {
+  const items: T[] = [];
+  for await (const item of stream) items.push(item);
+  return items;
+}
+
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "adcode-search-"));
+  search = createWorkspaceSearch({ root: dir });
+});
+
+afterEach(async () => {
+  await rm(dir, { recursive: true, force: true });
+});
+
+describe("listing files", () => {
+  it("walks the tree", async () => {
+    await write("a.ts", "x");
+    await write("src/b.ts", "y");
+    await write("src/deep/c.ts", "z");
+
+    const files = await search.listFiles();
+    expect(files.sort()).toEqual(["a.ts", "src/b.ts", "src/deep/c.ts"]);
+  });
+
+  it("skips the directories nobody wants to search", async () => {
+    await write("a.ts", "x");
+    await write("node_modules/pkg/index.js", "x");
+    await write(".git/config", "x");
+    await write("dist/bundle.js", "x");
+
+    expect(await search.listFiles()).toEqual(["a.ts"]);
+  });
+
+  it("uses forward slashes on every platform", async () => {
+    await write("src/deep/c.ts", "z");
+    expect((await search.listFiles())[0]).toBe("src/deep/c.ts");
+  });
+
+  it("still lists images, so Go to File can open them", async () => {
+    await write("a.ts", "x");
+    await write("shot.png", "x");
+
+    expect((await search.listFiles()).sort()).toEqual(["a.ts", "shot.png"]);
+  });
+
+  it("excludes nested worktrees and deployment caches from search", async () => {
+    await write("src/main.ts", "needle");
+    await write(".worktrees/old/src/main.ts", "needle");
+    await write("apps/web/.open-next/server/index.ts", "needle");
+    await write("apps/web/.wrangler/cache/index.ts", "needle");
+    await write(".adcode-cache/tools/index.ts", "needle");
+    await write("apps/desktop/.adcode-cache/build/index.ts", "needle");
+    expect(await search.listFiles()).toEqual(["src/main.ts"]);
+    expect(await collect(search.search({ pattern: "needle" }))).toHaveLength(1);
+  });
+
+  /*
+   * Claude Code checks a whole second copy of the repository out under
+   * `.claude/worktrees/<name>/`. Measured in this repo with one present: 1,062 of 2,763
+   * listed files came from it, a symbol search answered from the copy as often as from the
+   * source, and the desktop smoke run's searches timed out under the doubled walk.
+   */
+  it("skips agent worktrees under .claude/worktrees", async () => {
+    await write("src/a.ts", "needle");
+    await write(".claude/settings.json", "needle");
+    await write(".claude/worktrees/x/src/a.ts", "needle");
+
+    expect((await search.listFiles()).sort()).toEqual([".claude/settings.json", "src/a.ts"]);
+    const hits = await collect(search.search({ pattern: "needle" }));
+    expect(hits.map((hit) => hit.path).sort()).toEqual([".claude/settings.json", "src/a.ts"]);
+  });
+
+  it("skips a directory the .gitignore leaves out, but not a gitignored file", async () => {
+    await write(".gitignore", "generated/\n.env\n");
+    await write("src/a.ts", "needle");
+    await write("src/generated/types.ts", "needle");
+    await write(".env", "needle");
+
+    expect((await search.listFiles()).sort()).toEqual([".env", ".gitignore", "src/a.ts"]);
+    const hits = await collect(search.search({ pattern: "needle" }));
+    expect(hits.map((hit) => hit.path).sort()).toEqual([".env", "src/a.ts"]);
+  });
+
+  it("returns nothing for a directory that does not exist", async () => {
+    const missing = createWorkspaceSearch({ root: join(dir, "nope") });
+    expect(await missing.listFiles()).toEqual([]);
+  });
+});
+
+describe("plain text search", () => {
+  beforeEach(async () => {
+    await write("a.ts", "const alpha = 1;\nconst beta = 2;\n");
+    await write("src/b.ts", "function alpha() {}\n");
+  });
+
+  it("finds matches across files with line and column", async () => {
+    const results = await collect(search.search({ pattern: "alpha" }));
+
+    expect(results).toHaveLength(2);
+    const first = results.find((r) => r.path === "a.ts");
+    expect(first?.line).toBe(1);
+    expect(first?.column).toBe(7);
+    expect(first?.text).toContain("alpha");
+  });
+
+  it("is case-insensitive by default", async () => {
+    expect(await collect(search.search({ pattern: "ALPHA" }))).toHaveLength(2);
+  });
+
+  it("respects case sensitivity when asked", async () => {
+    expect(await collect(search.search({ pattern: "ALPHA", caseSensitive: true }))).toHaveLength(0);
+  });
+
+  it("treats the pattern literally unless regex is requested", async () => {
+    await write("c.ts", "a.b\naxb\n");
+    // `.` must not match `x` when the user has not asked for a regex.
+    const results = await collect(search.search({ pattern: "a.b" }));
+
+    expect(results.every((r) => r.text.includes("a.b"))).toBe(true);
+  });
+
+  it("finds every match on a line, not just the first", async () => {
+    await write("c.ts", "alpha alpha alpha\n");
+    const results = await collect(search.search({ pattern: "alpha", include: "c.ts" }));
+
+    expect(results).toHaveLength(3);
+    expect(results.map((r) => r.column)).toEqual([1, 7, 13]);
+  });
+
+  it("returns nothing for a pattern that matches nothing", async () => {
+    expect(await collect(search.search({ pattern: "zzzz" }))).toEqual([]);
+  });
+
+  it("returns nothing for an empty pattern rather than every line", async () => {
+    expect(await collect(search.search({ pattern: "" }))).toEqual([]);
+  });
+});
+
+describe("regex search", () => {
+  beforeEach(async () => {
+    await write("a.ts", "const alpha = 1;\nlet beta = 2;\n");
+  });
+
+  it("matches a regular expression", async () => {
+    const results = await collect(search.search({ pattern: "^(const|let)\\s+\\w+", isRegex: true }));
+    expect(results).toHaveLength(2);
+  });
+
+  it("reports an invalid regex instead of throwing", async () => {
+    const results = await collect(search.search({ pattern: "a(", isRegex: true }));
+    expect(results).toEqual([]);
+  });
+
+  it("matches whole words when asked", async () => {
+    await write("b.ts", "alpha alphabet\n");
+    const results = await collect(search.search({ pattern: "alpha", wholeWord: true, include: "b.ts" }));
+
+    expect(results).toHaveLength(1);
+    expect(results[0]?.column).toBe(1);
+  });
+
+  it("cannot be made to hang by a zero-width pattern", async () => {
+    // `a*` matches the empty string at every position; a naive exec loop never advances.
+    const results = await collect(search.search({ pattern: "a*", isRegex: true }));
+    expect(Array.isArray(results)).toBe(true);
+  });
+});
+
+describe("filters", () => {
+  beforeEach(async () => {
+    await write("a.ts", "target\n");
+    await write("b.js", "target\n");
+    await write("src/c.ts", "target\n");
+  });
+
+  it("includes only matching paths", async () => {
+    const results = await collect(search.search({ pattern: "target", include: "*.ts" }));
+    expect(results.map((r) => r.path).sort()).toEqual(["a.ts", "src/c.ts"]);
+  });
+
+  it("excludes matching paths", async () => {
+    const results = await collect(search.search({ pattern: "target", exclude: "src/**" }));
+    expect(results.map((r) => r.path).sort()).toEqual(["a.ts", "b.js"]);
+  });
+
+  it("matches a directory glob", async () => {
+    const results = await collect(search.search({ pattern: "target", include: "src/**" }));
+    expect(results.map((r) => r.path)).toEqual(["src/c.ts"]);
+  });
+
+  /*
+   * Brace alternation, which every other search tool accepts and this one used to escape
+   * as literal text - so `*.{ts,js}` matched nothing at all, silently, and looked like a
+   * search that had found nothing rather than a glob that could not be expressed.
+   */
+  it("matches any of a brace alternation", async () => {
+    const results = await collect(search.search({ pattern: "target", include: "*.{ts,js}" }));
+    expect(results.map((r) => r.path).sort()).toEqual(["a.ts", "b.js", "src/c.ts"]);
+  });
+
+  it("combines a brace alternation with a directory glob", async () => {
+    const results = await collect(search.search({ pattern: "target", include: "src/**/*.{ts,tsx}" }));
+    expect(results.map((r) => r.path)).toEqual(["src/c.ts"]);
+  });
+
+  it("takes a nested alternation", async () => {
+    const results = await collect(search.search({ pattern: "target", include: "*.{ts,{js,jsx}}" }));
+    expect(results.map((r) => r.path).sort()).toEqual(["a.ts", "b.js", "src/c.ts"]);
+  });
+
+  it("treats an unmatched brace as the character it is", async () => {
+    await write("od{d.ts", "target\n");
+
+    const results = await collect(search.search({ pattern: "target", include: "od{d.ts" }));
+    expect(results.map((r) => r.path)).toEqual(["od{d.ts"]);
+  });
+});
+
+describe("what it refuses to read", () => {
+  it("skips a binary file rather than emitting noise", async () => {
+    // A NUL byte in the first block is the standard heuristic, and the reason searching
+    // a repository with images in it does not fill the panel with garbage.
+    await writeFile(join(dir, "image.png"), Buffer.from([0x89, 0x50, 0x00, 0x01, 0x02]));
+    await write("a.ts", "target\n");
+
+    const results = await collect(search.search({ pattern: "", isRegex: false }));
+    expect(results.every((r) => r.path !== "image.png")).toBe(true);
+  });
+
+  it("never opens an image, video or font - even one whose bytes would pass for text", async () => {
+    // The NUL check needs the file read first, which for a format that is never text is
+    // pure cost: a project with a few hundred screenshots spent most of every search,
+    // Go to Symbol included, reading PNGs it was always going to throw away.
+    await write("shot.png", "target\n");
+    await write("clip.mp4", "target\n");
+    await write("font.woff2", "target\n");
+    await write("icon.svg", "<svg>target</svg>\n");
+    await write("a.ts", "target\n");
+
+    const results = await collect(search.search({ pattern: "target" }));
+    expect(results.map((r) => r.path).sort()).toEqual(["a.ts", "icon.svg"]);
+  });
+
+  it("skips a file larger than the cap", async () => {
+    await write("huge.ts", `${"x".repeat(3_000_000)}\ntarget\n`);
+    await write("a.ts", "target\n");
+
+    const results = await collect(search.search({ pattern: "target" }));
+    expect(results.map((r) => r.path)).toEqual(["a.ts"]);
+  });
+});
+
+describe("bounds and cancellation", () => {
+  it("stops at the result cap", async () => {
+    await write("many.ts", Array.from({ length: 500 }, () => "target").join("\n"));
+
+    const results = await collect(search.search({ pattern: "target", maxResults: 20 }));
+    expect(results).toHaveLength(20);
+  });
+
+  it("stops when the caller aborts", async () => {
+    for (let i = 0; i < 30; i++) await write(`f${i}.ts`, "target\n");
+
+    const controller = new AbortController();
+    const results: unknown[] = [];
+
+    for await (const result of search.search({ pattern: "target" }, controller.signal)) {
+      results.push(result);
+      if (results.length === 3) controller.abort();
+    }
+
+    expect(results.length).toBeLessThan(30);
+  });
+
+  it("streams results rather than collecting them all first", async () => {
+    // §7 budgets first results, not total time; the panel must be able to fill as the
+    // walk proceeds.
+    for (let i = 0; i < 20; i++) await write(`f${i}.ts`, "target\n");
+
+    const iterator = search.search({ pattern: "target" })[Symbol.asyncIterator]();
+    const first = await iterator.next();
+
+    expect(first.done).toBe(false);
+    await iterator.return?.();
+  });
+});
+
+describe("replaceAll", () => {
+  /** Read a file back through the same encoding the replacer writes with. */
+  const read = async (path: string): Promise<string> =>
+    (await import("node:fs/promises")).readFile(join(dir, path), "utf8");
+
+  it("replaces every occurrence across files", async () => {
+    await write("a.ts", "target one\ntarget two\n");
+    await write("b.ts", "nothing here\n");
+    await write("c.ts", "a target\n");
+
+    const summary = await search.replaceAll({ pattern: "target" }, "hit");
+
+    expect(summary.files).toBe(2);
+    expect(summary.replacements).toBe(3);
+    expect(await read("a.ts")).toBe("hit one\nhit two\n");
+    expect(await read("b.ts")).toBe("nothing here\n");
+  });
+
+  it("leaves files untouched when nothing matches", async () => {
+    await write("a.ts", "unchanged\n");
+
+    const summary = await search.replaceAll({ pattern: "absent" }, "x");
+
+    expect(summary.files).toBe(0);
+    expect(await read("a.ts")).toBe("unchanged\n");
+  });
+
+  it("treats a literal replacement literally", async () => {
+    await write("a.ts", "cost: X\n");
+
+    await search.replaceAll({ pattern: "X" }, "$0.50");
+    expect(await read("a.ts")).toBe("cost: $0.50\n");
+  });
+
+  it("honours capture groups when the pattern is a regex", async () => {
+    await write("a.ts", "get(name)\nget(age)\n");
+
+    await search.replaceAll({ pattern: "get\\((\\w+)\\)", isRegex: true }, "read($1)");
+    expect(await read("a.ts")).toBe("read(name)\nread(age)\n");
+  });
+
+  it("respects case sensitivity", async () => {
+    await write("a.ts", "Target target\n");
+
+    await search.replaceAll({ pattern: "target", caseSensitive: true }, "x");
+    expect(await read("a.ts")).toBe("Target x\n");
+  });
+
+  it("respects whole-word matching", async () => {
+    await write("a.ts", "cat catalogue\n");
+
+    await search.replaceAll({ pattern: "cat", wholeWord: true }, "dog");
+    expect(await read("a.ts")).toBe("dog catalogue\n");
+  });
+
+  it("respects include and exclude globs", async () => {
+    await write("a.ts", "target\n");
+    await write("b.md", "target\n");
+
+    await search.replaceAll({ pattern: "target", include: "*.ts" }, "x");
+
+    expect(await read("a.ts")).toBe("x\n");
+    expect(await read("b.md")).toBe("target\n");
+  });
+
+  it("skips binary files", async () => {
+    await writeFile(join(dir, "blob.bin"), Buffer.from([0x74, 0x00, 0x74]));
+
+    const summary = await search.replaceAll({ pattern: "t" }, "x");
+    expect(summary.files).toBe(0);
+  });
+
+  it("never rewrites a file whose name says it is binary", async () => {
+    await write("shot.png", "t\n");
+
+    const summary = await search.replaceAll({ pattern: "t" }, "x");
+    expect(summary.files).toBe(0);
+    expect(await read("shot.png")).toBe("t\n");
+  });
+
+  it("refuses an empty pattern rather than rewriting every file", async () => {
+    await write("a.ts", "untouched\n");
+
+    const summary = await search.replaceAll({ pattern: "" }, "x");
+
+    expect(summary).toEqual({ files: 0, replacements: 0 });
+    expect(await read("a.ts")).toBe("untouched\n");
+  });
+
+  it("refuses a pattern that can match nothing at all", async () => {
+    await write("a.ts", "untouched\n");
+
+    // `a*` matches the empty string everywhere; replacing that would shred the file.
+    const summary = await search.replaceAll({ pattern: "x*", isRegex: true }, "!");
+
+    expect(summary).toEqual({ files: 0, replacements: 0 });
+    expect(await read("a.ts")).toBe("untouched\n");
+  });
+
+  it("returns nothing for an invalid regex instead of throwing", async () => {
+    await write("a.ts", "target\n");
+
+    const summary = await search.replaceAll({ pattern: "(unclosed", isRegex: true }, "x");
+    expect(summary).toEqual({ files: 0, replacements: 0 });
+  });
+
+  it("stops when the caller aborts", async () => {
+    for (let i = 0; i < 40; i++) await write(`f${i}.ts`, "target\n");
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const summary = await search.replaceAll({ pattern: "target" }, "x", controller.signal);
+    expect(summary.files).toBe(0);
+  });
+});

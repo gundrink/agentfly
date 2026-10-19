@@ -1,0 +1,1833 @@
+/**
+ * Routing and error mapping.
+ *
+ * Deliberately the least clever file in the service: a bug in `money.ts` is expensive and
+ * quiet, a bug here is obvious the first time anyone calls the endpoint. All the logic
+ * worth testing hard lives in the modules this one wires together.
+ */
+import type { WorkerSecrets } from "./workerSecrets.ts";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { once } from "node:events";
+import { createTagflowHandler, isTagflowPath } from "./tagflow.ts";
+import { authenticate, type TokenVerifier } from "./auth.ts";
+import { handleServe } from "./serve.ts";
+import { handleReceipts } from "./receipts.ts";
+import { handleBalance, handleLedger } from "./balance.ts";
+import { handleConfig } from "./config.ts";
+import {
+  handleAdminLedger,
+  handleListPosts,
+  handleListUsers,
+  handleQueueTestServe,
+  handleRehostAssets,
+  handleReviewQueue,
+  handleSavePost,
+  handleSavePostAsset,
+  parsePostAsset,
+  handleSetCreativeStatus,
+  handleSetUserStatus,
+  handleListAdvertisers,
+  handleAdminCampaigns,
+  handleSetAdvertiserStatus,
+  handlePublishNotice,
+  handleRetractNotice,
+  handleAddAdmin,
+  handleListAdmins,
+  handleRemoveAdmin,
+  handleListNotices,
+  parseAdminEmail,
+  parseNotice,
+  parsePost,
+  parseRelease,
+  handleDraftRelease,
+  handleListReleases,
+  handleOverview,
+  handleSaveRelease,
+} from "./admin.ts";
+import { parseReceiptsRequest, parseReportRequest, parseServeRequest } from "./contract.ts";
+import {
+  parseDecisionNote,
+  parsePayoutProfile,
+  parseProviderRef,
+  parseWithdrawalAmount,
+} from "./contract.ts";
+import {
+  handleAdminListReports,
+  handleDeleteReport,
+  handleSetReportStatus,
+  handleSubmitReport,
+} from "./reports.ts";
+import {
+  adjustBalance,
+  cancelWithdrawal,
+  approveWithdrawal,
+  listWithdrawals,
+  markWithdrawalPaid,
+  markWithdrawalFailed,
+  readPayouts,
+  readWithdrawalDestination,
+  rejectWithdrawal,
+  requestWithdrawal,
+  returnWithdrawal,
+  savePayoutProfile,
+  type Outcome as PayoutOutcome,
+  type PayoutError,
+} from "./withdrawals.ts";
+import { checkRate } from "./rateLimit.ts";
+import { corsHeaders } from "./cors.ts";
+import {
+  campaignSeries,
+  createAdvertiser,
+  createCampaign,
+  createCreative,
+  getMyAdvertiser,
+  listCampaigns,
+  listCreatives,
+  setCampaignStatus,
+  moveCampaignBudget,
+  PORTAL_LIMITS,
+  type AdvertiserError,
+  type Outcome,
+} from "./advertisers.ts";
+import { ACTIVITY_LIMITS, readActivity, recordActivity } from "./activity.ts";
+import { parseMilestones, recordMilestones } from "./milestones.ts";
+import {
+  parseActivity,
+  parseAdjustment,
+  parseCampaign,
+  parseBudgetMove,
+  parseCreateAdvertiser,
+  parseCreative,
+} from "./contract.ts";
+import { handleFundingWebhook } from "./funding.ts";
+import type { PaymentProvider } from "./payments.ts";
+import { createCreditCheckout } from "./creditOrders.ts";
+import { readDemand } from "./demand.ts";
+import { PAYOUT_FIELD_KINDS } from "./payoutCorridors.ts";
+import { createMemoryStore } from "./memoryStore.ts";
+import { isSafeAssetKey } from "./assets.ts";
+import type { Clock, IdGen, Store } from "./store.ts";
+import { isAutomatedAgent, parseWebsiteEvents, summarizeWebsiteEvents, type WebsiteAnalyticsStore } from "./websiteAnalytics.ts";
+import { growthToWire } from "./growth.ts";
+import { parseModelCatalog, readModelCatalog, saveModelCatalog } from "./modelCatalog.ts";
+import { parseModelOutcomes, readModelHealth, recordModelOutcomes } from "./modelOutcomes.ts";
+import {
+  ReferralsUnavailable,
+  attributeAdvertiser,
+  awardReport,
+  claimReferral,
+  createCampaignCode,
+  listCampaignCodes,
+  lookupInvite,
+  parseAward,
+  parseClaim,
+  parseCodePatch,
+  parseNewCampaignCode,
+  parseReferralConfig,
+  parseSettleDay,
+  parseShowName,
+  readMyReferrals,
+  readReferralConfig,
+  readSources,
+  readUserReferrals,
+  saveReferralConfig,
+  setShowName,
+  settleDay,
+  updateCampaignCode,
+} from "./referralRoutes.ts";
+
+export interface ApiServer {
+  url: string;
+  close(): Promise<void>;
+}
+
+const MAX_BODY_BYTES = 1_000_000;
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 200;
+
+function send(
+  res: ServerResponse,
+  status: number,
+  body: unknown,
+  extra: Record<string, string> = {},
+): void {
+  res.writeHead(status, { "content-type": "application/json", ...extra });
+  res.end(JSON.stringify(body));
+}
+
+/**
+ * Shared-secret comparison without a timing signal.
+ *
+ * Mirrors `constantTimeEquals` in `billing.ts`: `timingSafeEqual` throws on a length
+ * mismatch, so lengths are compared first and a mismatch is a plain false.
+ */
+function agentTokenEquals(offered: string, secret: string): boolean {
+  const left = Buffer.from(offered, "utf8");
+  const right = Buffer.from(secret, "utf8");
+  if (left.length !== right.length) return false;
+  return timingSafeEqual(left, right);
+}
+
+/**
+ * Advertiser refusals to status codes.
+ *
+ * `not-found` covers both "no such campaign" and "not yours" on purpose - distinguishing
+ * them tells a competitor whether an id exists.
+ */
+const ADVERTISER_STATUS: Record<AdvertiserError, number> = {
+  "no-advertiser": 404,
+  "already-advertiser": 409,
+  suspended: 403,
+  "not-found": 404,
+  "insufficient-funds": 402,
+  "no-approved-creative": 409,
+  "invalid-state": 409,
+  "exceeds-unspent": 409,
+  "budget-limit": 409,
+};
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    total += buf.length;
+    if (total > MAX_BODY_BYTES) throw new Error("body too large");
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function pageFrom(url: URL): { limit: number; cursor: string | null } {
+  const raw = Number(url.searchParams.get("limit") ?? String(DEFAULT_PAGE_LIMIT));
+  const limit = Number.isInteger(raw) ? Math.max(1, Math.min(raw, MAX_PAGE_LIMIT)) : DEFAULT_PAGE_LIMIT;
+  return { limit, cursor: url.searchParams.get("cursor") };
+}
+
+/**
+ * `?days=` for the two reporting endpoints.
+ *
+ * A missing, non-numeric, or out-of-range value falls back to the default rather than
+ * failing: a chart that refuses to render because a query string was fat-fingered is
+ * worse than a chart showing the usual window. The handlers clamp again on their own -
+ * this is the transport's answer, not the rule.
+ */
+function daysFrom(url: URL, fallback: number): number {
+  const raw = Number(url.searchParams.get("days") ?? "");
+  if (!Number.isInteger(raw) || raw < 1) return fallback;
+  return Math.min(raw, 365);
+}
+
+/**
+ * Payout refusals to status codes.
+ *
+ * `not-eligible` is a 409 rather than a 403: nothing about the caller is forbidden, the
+ * account simply is not in a state that allows the request yet, and `GET /v1/payouts`
+ * says exactly which rule it failed.
+ */
+const PAYOUT_STATUS: Record<PayoutError, number> = {
+  "not-eligible": 409,
+  "insufficient-funds": 402,
+  "invalid-amount": 400,
+  "not-found": 404,
+  "invalid-state": 409,
+};
+
+const ADMIN_LEDGER = /^\/v1\/admin\/users\/([^/]+)\/ledger$/;
+const ADMIN_ADJUST = /^\/v1\/admin\/users\/([^/]+)\/adjust$/;
+const REPORT_STATUSES: ReadonlySet<string> = new Set(["open", "triaged", "closed"]);
+const WITHDRAWAL_STATUSES: ReadonlySet<string> = new Set([
+  "requested",
+  "approved",
+  "paid",
+  "rejected",
+  "failed",
+  "cancelled",
+  "returned",
+]);
+
+/** Node gives a repeated header as an array; a signature header must be one value. */
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+export interface ApiOptions {
+  tagflow?: { apiKey?: string; fetchImpl?: typeof fetch; country?: (request: Request) => string | undefined; workerSecrets?: WorkerSecrets };
+  websiteAnalytics?: WebsiteAnalyticsStore;
+  port?: number;
+  store?: Store;
+  verifier?: TokenVerifier;
+  clock?: Clock;
+  ids?: IdGen;
+  payments?: PaymentProvider;
+  webhookSecret?: string;
+  siteOrigin?: string;
+}
+
+/** What both transports below are: a request in, a response written. */
+export type RequestHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+
+/**
+ * Every route, wired to its dependencies, with no opinion about how it is reached.
+ *
+ * Split from `createApiServer` so the service can also run somewhere that has no sockets
+ * to listen on. On Cloudflare there is no `server.listen` - there is a `fetch` handler
+ * receiving a Web `Request` - and `adapters/fetchHandler.ts` bridges to exactly this
+ * function. Keeping the routing here rather than duplicating it for each transport is
+ * what stops the deployed API and the tested API from drifting apart.
+ */
+export function createRequestHandler(options: ApiOptions = {}): RequestHandler {
+  const verifier = options.verifier;
+  if (verifier === undefined) throw new Error("a TokenVerifier is required");
+
+  const store = options.store ?? createMemoryStore();
+  const clock = options.clock ?? { now: () => Date.now() };
+  const tagflow = createTagflowHandler({ store, verifier, clock, ...options.tagflow });
+
+  let counter = 0;
+  const ids = options.ids ?? { next: (prefix: string) => `${prefix}-${++counter}-${Date.now()}` };
+
+  const payments = options.payments;
+  const webhookSecret = options.webhookSecret ?? process.env["DODO_WEBHOOK_SECRET"];
+  const siteOrigin = options.siteOrigin ?? "https://adcode.bluethenics.com";
+
+  /**
+   * The origin a caller actually reached us on.
+   *
+   * Creative artwork is addressed by absolute URL, and that URL has to be one the editor
+   * can fetch - so it is taken from the request rather than configured. Cloudflare sets
+   * `x-forwarded-proto`; a loopback host with no such header is a local run over http, and
+   * guessing https there would produce asset URLs that resolve to nothing.
+   */
+  const requestOrigin = (req: IncomingMessage): string => {
+    const host = req.headers.host;
+    if (typeof host !== "string" || host === "") return siteOrigin;
+
+    const forwarded = req.headers["x-forwarded-proto"];
+    const proto =
+      typeof forwarded === "string" && forwarded !== ""
+        ? (forwarded.split(",")[0] ?? "https").trim()
+        : /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(host)
+          ? "http"
+          : "https";
+
+    return `${proto}://${host}`;
+  };
+
+  const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const path = url.pathname;
+    const cors = corsHeaders(req.headers.origin);
+
+    if (isTagflowPath(path)) {
+      const controller = new AbortController();
+      const closed = (): void => controller.abort();
+      res.on("close", closed);
+      try {
+        const headers = new Headers();
+        for (const [key, value] of Object.entries(req.headers)) if (value !== undefined) headers.set(key, Array.isArray(value) ? value.join(", ") : value);
+        const method = req.method ?? "GET";
+        const response = await tagflow(new Request(url, { method, headers, signal: controller.signal, ...(method === "GET" || method === "HEAD" ? {} : { body: await readBody(req) }) }));
+        if (response === null) throw new Error("Missing Tagflow response");
+        res.writeHead(response.status, Object.fromEntries(response.headers));
+        const reader = response.body?.getReader();
+        if (reader !== undefined) {
+          try {
+            for (;;) {
+              const chunk = await reader.read();
+              if (chunk.done) break;
+              if (!res.write(chunk.value)) await once(res, "drain", { signal: controller.signal });
+            }
+          } finally { await reader.cancel().catch(() => undefined); reader.releaseLock(); }
+        }
+        res.end();
+      } catch {
+        if (!res.headersSent) send(res, 503, { error: { message: "Included AI is unavailable." } }, cors);
+        else res.destroy();
+      } finally { res.removeListener("close", closed); }
+      return;
+    }
+
+    // Preflight is answered before authentication: a browser sends OPTIONS without the
+    // Authorization header, so requiring a token here would fail every cross-origin call.
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, cors);
+      res.end();
+      return;
+    }
+
+    /*
+     * GET /assets/:key - creative artwork.
+     *
+     * Unauthenticated, and it has to be: the editor fetches these through its asset cache,
+     * which is a plain image fetch with no bearer token. Nothing here is secret - it is the
+     * picture an advertiser is paying to show people - and the key is unguessable enough to
+     * not be an enumeration surface worth defending.
+     *
+     * Not under `/v1`: the version prefix is the serving *contract*, and this is a file.
+     */
+    if (path.startsWith("/assets/") && (req.method === "GET" || req.method === "HEAD")) {
+      const key = decodeURIComponent(path.slice("/assets/".length));
+
+      // Keys are generated by `assetKey`, but this one arrived over the network. A key is a
+      // filename; anything else never reaches the storage layer.
+      if (!isSafeAssetKey(key)) {
+        send(res, 404, { error: "not found" }, cors);
+        return;
+      }
+
+      const asset = await store.getAsset(key);
+      if (asset === null) {
+        send(res, 404, { error: "not found" }, cors);
+        return;
+      }
+
+      res.writeHead(200, {
+        ...cors,
+        "content-type": asset.contentType,
+        "content-length": String(asset.bytes.byteLength),
+        // Keyed by creative id and content, so a given key's bytes never change meaning.
+        // The editor caches these on disk too; this is for everything in between.
+        "cache-control": "public, max-age=31536000, immutable",
+      });
+      res.end(req.method === "HEAD" ? undefined : Buffer.from(asset.bytes));
+      return;
+    }
+
+    if (!path.startsWith("/v1/")) {
+      send(res, 404, { error: "not found" }, cors);
+      return;
+    }
+
+    /*
+     * GET /v1/health - is the service and its database answering?
+     *
+     * Before authentication, and deliberately so. It exists because a Supabase project on
+     * the free plan pauses after a week without activity, and a paused database means the
+     * ad path returns 500s until somebody notices. A scheduled request keeps it awake - but
+     * only if the request actually reaches the database, and every authenticated endpoint
+     * answers 401 without touching it. So this one reads a row.
+     *
+     * It reads the config row, which is a single-row primary-key lookup, and reports
+     * nothing about it. A boolean and a status code: an unauthenticated endpoint on a money
+     * API says as little as it possibly can.
+     */
+    if (path === "/v1/health" && req.method === "GET") {
+      try {
+        await store.getConfig();
+        send(res, 200, { ok: true }, cors);
+      } catch {
+        // 503 rather than 500: the service is up, its dependency is not, and the difference
+        // is what an uptime check needs in order to page the right person.
+        send(res, 503, { ok: false }, cors);
+      }
+      return;
+    }
+
+    if (path === "/v1/impressions" && req.method === "GET") {
+      const total = await store.liveImpressions();
+      send(res, 200, { total, asOf: clock.now() }, {
+        ...cors,
+        "cache-control": "public, max-age=15, stale-while-revalidate=15",
+      });
+      return;
+    }
+
+    if (path === "/v1/stats" && req.method === "GET") {
+      const stats = await store.publicStats(clock.now());
+      send(res, 200, { ...stats, asOf: clock.now() }, {
+        ...cors,
+        "cache-control": "public, max-age=60, stale-while-revalidate=30",
+      });
+      return;
+    }
+
+    /*
+     * GET /v1/models/overrides - the admin panel's curation of the model list.
+     *
+     * Public and unauthenticated: every editor reads it on launch, before any account
+     * exists, and it says nothing a model list would not. Cached at the edge for five
+     * minutes, so a change in the panel reaches people within one coffee.
+     */
+    if (path === "/v1/models/overrides" && req.method === "GET") {
+      const record = await readModelCatalog(store);
+      send(res, 200, { overrides: record.overrides, updatedAt: record.updatedAt }, {
+        ...cors,
+        "cache-control": "public, max-age=300, stale-while-revalidate=600",
+      });
+      return;
+    }
+
+    if (path === "/v1/demand" && req.method === "GET") {
+      const demand = await readDemand(store, clock.now());
+      send(res, 200, demand, {
+        ...cors,
+        "cache-control": "public, max-age=60, stale-while-revalidate=30",
+      });
+      return;
+    }
+
+    /*
+     * The payment webhook, before authentication and before the rate limiter.
+     *
+     * Dodo sends no bearer token - the HMAC signature over the raw body is the
+     * authentication - and there is no UID to rate limit against. It is also the one
+     * route that needs the body bytes exactly as sent, so it reads them itself rather
+     * than going through a JSON parse first.
+     */
+    if (path === "/v1/webhooks/dodo" && req.method === "POST") {
+      if (webhookSecret === undefined) {
+        send(res, 503, { error: "webhooks not configured" }, cors);
+        return;
+      }
+
+      let raw: string;
+      try {
+        raw = await readBody(req);
+      } catch {
+        send(res, 400, { error: "body too large" }, cors);
+        return;
+      }
+
+      const result = await handleFundingWebhook(
+        { store, clock, webhookSecret },
+        {
+          id: firstHeader(req.headers["webhook-id"]),
+          timestamp: firstHeader(req.headers["webhook-timestamp"]),
+          signature: firstHeader(req.headers["webhook-signature"]),
+        },
+        raw,
+      );
+
+      if (result.ok) send(res, 200, { received: true, outcome: result.reason }, cors);
+      else send(res, result.status, { error: result.reason }, cors);
+      return;
+    }
+
+    /*
+     * Published blog posts, before authentication.
+     *
+     * These are public by definition - they are what the marketing site renders for
+     * search engines. Requiring a token would mean the site needed a service account to
+     * read its own blog. Drafts are never included; that filter is in the store query,
+     * not in a caller-supplied flag.
+     */
+    /*
+     * Published releases, before authentication.
+     *
+     * Public for the same reason the blog is: the marketing site renders a changelog from
+     * this, and the desktop client reads it to decide whether anything is worth telling
+     * somebody about. Drafts are excluded in the store query rather than by a flag the
+     * caller could set - an unpublished note must not be reachable by asking nicely.
+     */
+    if (path === "/v1/releases" && req.method === "GET") {
+      const releases = await store.listReleases({ publishedOnly: true });
+      send(res, 200, { releases }, cors);
+      return;
+    }
+
+    if (path === "/v1/posts" && req.method === "GET") {
+      const posts = await store.listPosts({ publishedOnly: true });
+      send(res, 200, { posts }, cors);
+      return;
+    }
+
+    const publicPost = /^\/v1\/posts\/([^/]+)$/.exec(path);
+    if (publicPost !== null && req.method === "GET") {
+      const post = await store.getPost(decodeURIComponent(publicPost[1] ?? ""));
+      if (post === null || post.status !== "published") {
+        send(res, 404, { error: "not found" }, cors);
+        return;
+      }
+      send(res, 200, post, cors);
+      return;
+    }
+
+    const jsonBodyOr400 = async (): Promise<unknown | undefined> => {
+      try {
+        return JSON.parse(await readBody(req)) as unknown;
+      } catch {
+        send(res, 400, { error: "malformed body" }, cors);
+        return undefined;
+      }
+    };
+
+    /*
+     * A release note drafted by a tool.
+     *
+     * Guarded by a shared secret rather than a user account, because the caller is a script
+     * in a release pipeline. It can only ever create a draft - `handleDraftRelease` forces
+     * that regardless of what is posted - so the worst a leaked token buys is an unpublished
+     * note in the admin panel that a person then reads and deletes.
+     */
+    if (path === "/v1/releases/draft" && req.method === "POST") {
+      const secret = process.env["ADCODE_AGENT_TOKEN"];
+      const offered = (req.headers["authorization"] ?? "").toString().replace(/^Bearer /i, "");
+
+      if (secret === undefined || secret.length === 0 || !agentTokenEquals(offered, secret)) {
+        send(res, 401, { error: "unauthorized" }, cors);
+        return;
+      }
+
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+
+      const input = parseRelease(raw);
+      if (input === null) {
+        send(res, 400, { error: "malformed release" }, cors);
+        return;
+      }
+
+      send(res, 200, await handleDraftRelease({ store, clock }, input), cors);
+      return;
+    }
+
+    if (path === "/v1/website-events" && req.method === "POST") {
+      // Public collection, but browser submissions must come from the configured site.
+      if (req.headers.origin !== siteOrigin) {
+        send(res, 403, { error: "origin" }, cors);
+        return;
+      }
+      if (!options.websiteAnalytics) { send(res, 503, { error: "analytics-unavailable" }, cors); return; }
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      // A crawler or a scripted browser that clicked through the consent banner is not a
+      // visitor. Answered as accepted so it has no reason to retry, and stored nowhere.
+      const agent = req.headers["user-agent"];
+      if (isAutomatedAgent(Array.isArray(agent) ? agent[0] : agent)) { send(res, 200, { accepted: 0 }, { ...cors, "cache-control": "no-store" }); return; }
+      const events = parseWebsiteEvents(raw, clock.now());
+      if (!events) { send(res, 400, { error: "malformed events" }, cors); return; }
+      // A shared, persistent ceiling bounds anonymous writes even if session IDs rotate.
+      const minute = Math.floor(clock.now() / 60000) * 60000;
+      if (await store.bumpRequestCount("website-analytics-global", minute) > 600 ||
+          await store.bumpRequestCount(`website-session:${events[0]!.session}`, minute) > 30) {
+        send(res, 429, { error: "rate-limited" }, { ...cors, "retry-after": "60" }); return;
+      }
+      if (events.some(e => e.session !== events[0]!.session)) { send(res, 400, { error: "mixed sessions" }, cors); return; }
+      await options.websiteAnalytics.append(events);
+      send(res, 200, { accepted: events.length }, { ...cors, "cache-control": "no-store" });
+      return;
+    }
+
+    const referralDeps = { store, clock, siteOrigin };
+
+    /** Invites live in tables of their own; when they cannot answer, only they say so. */
+    const referralsUnavailable = (error: unknown): boolean => {
+      if (!(error instanceof ReferralsUnavailable)) return false;
+      send(res, 503, { error: "referrals-unavailable" }, cors);
+      return true;
+    };
+
+    /*
+     * GET /v1/invite/:code - what an invite page shows: whether the code is live, and the
+     * inviter's first name if they let it be shown. Public, because the person reading the
+     * page has no account yet; cached, because a post can send a crowd to one link. One
+     * shared ceiling bounds anyone walking the code space - 600 lookups a minute would take
+     * longer than the universe has left to try every seven-character code.
+     */
+    const inviteLookup = /^\/v1\/invite\/([^/]+)$/.exec(path);
+    if (inviteLookup !== null && req.method === "GET") {
+      try {
+        const minute = Math.floor(clock.now() / 60_000) * 60_000;
+        if ((await store.bumpRequestCount("invite-lookup", minute)) > 600) {
+          send(res, 429, { error: "rate-limited" }, { ...cors, "retry-after": "60" });
+          return;
+        }
+        const raw = decodeURIComponent(inviteLookup[1] ?? "");
+        send(res, 200, await lookupInvite(referralDeps, raw), { ...cors, "cache-control": "public, max-age=300" });
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    /*
+     * Authentication and the serving config go out together: neither depends on the
+     * other, and each costs a full database round trip. Serve has to fit inside the
+     * editor's 3,000ms timeout and was measured at ~5,000ms with every read
+     * sequential, so each spared round trip is ~500ms back.
+     *
+     * The ordering guarantees are unchanged: the rate counter is still per verified
+     * UID (it runs after this), and still gates every endpoint below.
+     */
+    const [auth, config] = await Promise.all([
+      authenticate({ store, verifier, clock }, req.headers.authorization),
+      store.getConfig(),
+    ]);
+    if (!auth.ok) {
+      // A ban is 403 rather than 401: the credentials are fine, the answer is still no,
+      // and a client that retries auth on a 401 would loop forever.
+      send(res, auth.failure === "banned" ? 403 : 401, { error: auth.failure }, cors);
+      return;
+    }
+
+    // Spec §9. Applied after authentication so the counter is per verified UID rather
+    // than per connection, and before any routing so no endpoint can be exempted by
+    // accident.
+    if (!(await checkRate(store, config, auth.uid, clock.now()))) {
+      res.writeHead(429, {
+        "content-type": "application/json",
+        "retry-after": String(Math.ceil(config.rateWindowMs / 1000)),
+        ...cors,
+      });
+      res.end(JSON.stringify({ error: "rate-limited" }));
+      return;
+    }
+
+    /** Reads and parses a JSON body, answering 400 itself if it cannot. */
+
+    /*
+     * Who the caller is, as this service sees them.
+     *
+     * The browser cannot work out `isAdmin` for itself. It used to try: the web app read
+     * a Firebase custom claim called `admin`, which was correct until administrators
+     * moved into a table (see `auth.ts`) and nothing has written that claim since. The
+     * result was an admin who could reach every admin endpoint and never saw the link to
+     * them, because the client had quietly decided they were not one.
+     *
+     * So the server says. It already computes this on every single request; this endpoint
+     * only returns what `authenticate` worked out a few lines above, and the admin gate
+     * below still re-checks it. A client that lies to itself about this reaches endpoints
+     * that refuse it anyway.
+     */
+    if (path === "/v1/me" && req.method === "GET") {
+      send(res, 200, { uid: auth.uid, isAdmin: auth.isAdmin }, cors);
+      return;
+    }
+
+    /*
+     * One gate for the whole admin surface, ahead of every admin route.
+     *
+     * A per-route check is a check someone forgets when adding the next route. Matching
+     * on the path prefix means a new /v1/admin/* endpoint is guarded before it is
+     * written, not after somebody notices.
+     */
+    if (path.startsWith("/v1/admin/") && !auth.isAdmin) {
+      send(res, 403, { error: "not-admin" }, cors);
+      return;
+    }
+
+    const payoutDeps = { store, clock, ids };
+
+    /** Unwraps a payout Outcome onto the wire. Same shape as `settle`, different map. */
+    const settlePayout = <T,>(result: PayoutOutcome<T>): void => {
+      if (result.ok) send(res, 200, result.value, cors);
+      else send(res, PAYOUT_STATUS[result.error], { error: result.error }, cors);
+    };
+
+    if (path === "/v1/admin/website-analytics" && req.method === "GET") {
+      if (!options.websiteAnalytics) { send(res, 503, { error: "analytics-unavailable" }, cors); return; }
+      const days = Math.min(90, daysFrom(url, 30));
+      const end = Math.floor(clock.now() / 86400000) * 86400000 + 86400000;
+      const start = end - days * 86400000;
+      const result = await options.websiteAnalytics.read(start, end);
+      send(res, 200, summarizeWebsiteEvents(result.events, start, end, result.truncated), { ...cors, "cache-control": "no-store" });
+      return;
+    }
+
+    /* ── Admin: invites ─────────────────────────────────────────────── */
+
+    if (path === "/v1/admin/sources" && req.method === "GET") {
+      const raw = url.searchParams.get("days");
+      const days = raw === "0" ? 0 : Math.min(365, daysFrom(url, 30));
+      try {
+        await store.writeAudit({ adminUid: auth.uid, action: "read-sources", subjectUid: "*", at: clock.now() });
+        send(res, 200, await readSources({ ...referralDeps, websiteAnalytics: options.websiteAnalytics }, days), { ...cors, "cache-control": "no-store" });
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    if (path === "/v1/admin/ref-codes" && (req.method === "GET" || req.method === "POST")) {
+      try {
+        if (req.method === "GET") {
+          send(res, 200, await listCampaignCodes(referralDeps), cors);
+          return;
+        }
+        const raw = await jsonBodyOr400();
+        if (raw === undefined) return;
+        const input = parseNewCampaignCode(raw);
+        if (input === null) {
+          send(res, 400, { error: "malformed code" }, cors);
+          return;
+        }
+        const created = await createCampaignCode(referralDeps, input);
+        await store.writeAudit({ adminUid: auth.uid, action: "create-ref-code", subjectUid: input.code, at: clock.now() });
+        if (created === null) send(res, 409, { error: "code-taken" }, cors);
+        else send(res, 200, created, cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    const refCodeEdit = /^\/v1\/admin\/ref-codes\/([^/]+)$/.exec(path);
+    if (refCodeEdit !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const patch = parseCodePatch(raw);
+      if (patch === null) {
+        send(res, 400, { error: "malformed change" }, cors);
+        return;
+      }
+      try {
+        const updated = await updateCampaignCode(referralDeps, decodeURIComponent(refCodeEdit[1] ?? ""), patch);
+        if (updated === null) send(res, 404, { error: "not-found" }, cors);
+        else send(res, 200, updated, cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    if (path === "/v1/admin/referral-config" && (req.method === "GET" || req.method === "POST")) {
+      try {
+        if (req.method === "GET") {
+          send(res, 200, await readReferralConfig(referralDeps), cors);
+          return;
+        }
+        const raw = await jsonBodyOr400();
+        if (raw === undefined) return;
+        const config = parseReferralConfig(raw);
+        if (config === null) {
+          send(res, 400, { error: "malformed config" }, cors);
+          return;
+        }
+        send(res, 200, await saveReferralConfig(referralDeps, auth.uid, config), cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    if (path === "/v1/admin/referrals/settle" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const day = parseSettleDay(raw, clock.now());
+      if (day === null) {
+        send(res, 400, { error: "a finished UTC day, YYYY-MM-DD" }, cors);
+        return;
+      }
+      try {
+        send(res, 200, await settleDay(referralDeps, auth.uid, day), cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    const userReferrals = /^\/v1\/admin\/users\/([^/]+)\/referrals$/.exec(path);
+    if (userReferrals !== null && req.method === "GET") {
+      try {
+        send(res, 200, await readUserReferrals(referralDeps, decodeURIComponent(userReferrals[1] ?? "")), cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    const reportAward = /^\/v1\/admin\/reports\/([^/]+)\/award$/.exec(path);
+    if (reportAward !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const micros = parseAward(raw);
+      if (micros === null) {
+        send(res, 400, { error: "an award is whole micros, above 0 and at most $100" }, cors);
+        return;
+      }
+      const outcome = await awardReport({ store, clock }, auth.uid, decodeURIComponent(reportAward[1] ?? ""), micros);
+      if (outcome.ok) send(res, 200, outcome, cors);
+      else send(res, outcome.error === "not-found" ? 404 : 409, { error: outcome.error }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/growth" && req.method === "GET") {
+      const now = clock.now();
+      await store.writeAudit({ adminUid: auth.uid, action: "read-growth", subjectUid: "*", at: now });
+      send(res, 200, { ...growthToWire(await store.growthStats(now)), asOf: now }, { ...cors, "cache-control": "no-store" });
+      return;
+    }
+
+    if (path === "/v1/admin/model-health" && req.method === "GET") {
+      const days = Math.min(90, daysFrom(url, 7));
+      send(res, 200, { days, models: await readModelHealth({ store, clock }, days) }, { ...cors, "cache-control": "no-store" });
+      return;
+    }
+
+    if (path === "/v1/admin/models" && req.method === "GET") {
+      send(res, 200, await readModelCatalog(store), { ...cors, "cache-control": "no-store" });
+      return;
+    }
+
+    if (path === "/v1/admin/models" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const overrides = parseModelCatalog(raw);
+      if (overrides === null) {
+        send(res, 400, { error: "malformed catalog" }, cors);
+        return;
+      }
+      send(res, 200, await saveModelCatalog({ store, clock }, auth.uid, overrides), cors);
+      return;
+    }
+
+    if (path === "/v1/admin/overview" && req.method === "GET") {
+      send(res, 200, await handleOverview({ store, clock }, auth.uid), cors);
+      return;
+    }
+
+    if (path === "/v1/admin/reports" && req.method === "GET") {
+      send(res, 200, await handleAdminListReports({ store, clock, ids }, auth.uid, pageFrom(url)), cors);
+      return;
+    }
+
+    const reportStatus = /^\/v1\/admin\/reports\/([^/]+)\/status$/.exec(path);
+    if (reportStatus !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const next = (raw as Record<string, unknown>)["status"];
+      if (typeof next !== "string" || !REPORT_STATUSES.has(next)) {
+        send(res, 400, { error: "malformed status" }, cors);
+        return;
+      }
+      const changed = await handleSetReportStatus(
+        payoutDeps,
+        auth.uid,
+        decodeURIComponent(reportStatus[1] ?? ""),
+        next as "open" | "triaged" | "closed",
+      );
+      send(res, changed ? 200 : 404, changed ? { ok: true, status: next } : { error: "not-found" }, cors);
+      return;
+    }
+
+    const reportDelete = /^\/v1\/admin\/reports\/([^/]+)\/delete$/.exec(path);
+    if (reportDelete !== null && req.method === "POST") {
+      const removed = await handleDeleteReport(
+        payoutDeps,
+        auth.uid,
+        decodeURIComponent(reportDelete[1] ?? ""),
+      );
+      send(res, removed ? 200 : 404, removed ? { ok: true } : { error: "not-found" }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/withdrawals" && req.method === "GET") {
+      const asked = url.searchParams.get("status");
+      // An unknown status reads as "no filter" rather than as an error: the alternative is
+      // an admin screen that shows a 400 because a query string was mistyped.
+      const status = asked !== null && WITHDRAWAL_STATUSES.has(asked) ? asked : null;
+      send(
+        res,
+        200,
+        await listWithdrawals(
+          payoutDeps,
+          auth.uid,
+          status as import("./store.ts").WithdrawalStatus | null,
+          pageFrom(url),
+        ),
+        cors,
+      );
+      return;
+    }
+
+    if (path === "/v1/admin/payout-corridors" && req.method === "GET") {
+      await store.writeAudit({
+        adminUid: auth.uid,
+        action: "read-payout-corridors",
+        subjectUid: "*",
+        at: clock.now(),
+      });
+      send(res, 200, { corridors: await store.listPayoutCorridors(false) }, cors);
+      return;
+    }
+
+    const payoutCorridor = /^\/v1\/admin\/payout-corridors\/([A-Z]{2})\/([A-Z]{3})$/.exec(path);
+    if (payoutCorridor !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = raw as Record<string, unknown>;
+      const enabled = body["enabled"];
+      const requiredFields = body["requiredFields"];
+      const sourceNote = body["sourceNote"];
+      const supported = new Set<string>(PAYOUT_FIELD_KINDS);
+      if (
+        typeof enabled !== "boolean" ||
+        !Array.isArray(requiredFields) ||
+        requiredFields.length === 0 ||
+        requiredFields.some((field) => typeof field !== "string" || !supported.has(field)) ||
+        typeof sourceNote !== "string" ||
+        sourceNote.trim().length < 10 ||
+        sourceNote.trim().length > 500
+      ) {
+        send(res, 400, { error: "malformed payout corridor" }, cors);
+        return;
+      }
+      const now = clock.now();
+      const country = payoutCorridor[1] ?? "";
+      const currency = payoutCorridor[2] ?? "";
+      const record = {
+        country,
+        currency,
+        enabled,
+        requiredFields: requiredFields as import("./store.ts").PayoutFieldKind[],
+        sourceNote: sourceNote.trim(),
+        verifiedAt: enabled ? now : null,
+        updatedAt: now,
+        updatedBy: auth.uid,
+      };
+      await store.putPayoutCorridor(record);
+      await store.writeAudit({
+        adminUid: auth.uid,
+        action: `payout-corridor:${country}:${currency}:${enabled ? "enabled" : "disabled"}`,
+        subjectUid: "*",
+        at: now,
+      });
+      send(res, 200, record, cors);
+      return;
+    }
+
+    const withdrawalApprove = /^\/v1\/admin\/withdrawals\/([^/]+)\/approve$/.exec(path);
+    if (withdrawalApprove !== null && req.method === "POST") {
+      settlePayout(
+        await approveWithdrawal(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalApprove[1] ?? ""),
+        ),
+      );
+      return;
+    }
+
+    const withdrawalPaid = /^\/v1\/admin\/withdrawals\/([^/]+)\/paid$/.exec(path);
+    if (withdrawalPaid !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const providerRef = parseProviderRef(raw);
+      if (providerRef === null) {
+        // Refused rather than defaulted: the reference is the only link from this record
+        // to the transfer that actually moved the money.
+        send(res, 400, { error: "malformed providerRef" }, cors);
+        return;
+      }
+      settlePayout(
+        await markWithdrawalPaid(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalPaid[1] ?? ""),
+          providerRef,
+        ),
+      );
+      return;
+    }
+
+    /*
+     * The bank details for one request, read at the moment somebody makes the transfer.
+     *
+     * Deliberately not part of the queue. The list hands out masked summaries, so opening
+     * the admin screen no longer decrypts every account on the page - and this route's
+     * audit line names the withdrawal, which the list's never could.
+     */
+    const withdrawalDestination = /^\/v1\/admin\/withdrawals\/([^/]+)\/destination$/.exec(path);
+    if (withdrawalDestination !== null && req.method === "GET") {
+      settlePayout(
+        await readWithdrawalDestination(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalDestination[1] ?? ""),
+        ),
+      );
+      return;
+    }
+
+    /* The transfer bounced after it had been recorded as sent. */
+    const withdrawalReturned = /^\/v1\/admin\/withdrawals\/([^/]+)\/returned$/.exec(path);
+    if (withdrawalReturned !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const note = parseDecisionNote(raw);
+      if (note === null) {
+        send(res, 400, { error: "malformed note" }, cors);
+        return;
+      }
+      settlePayout(
+        await returnWithdrawal(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalReturned[1] ?? ""),
+          note,
+        ),
+      );
+      return;
+    }
+
+    const withdrawalReject = /^\/v1\/admin\/withdrawals\/([^/]+)\/reject$/.exec(path);
+    if (withdrawalReject !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const note = parseDecisionNote(raw);
+      if (note === null) {
+        send(res, 400, { error: "malformed note" }, cors);
+        return;
+      }
+      settlePayout(
+        await rejectWithdrawal(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalReject[1] ?? ""),
+          note,
+        ),
+      );
+      return;
+    }
+
+    if (path === "/v1/admin/users" && req.method === "GET") {
+      send(res, 200, await handleListUsers({ store, clock }, auth.uid, pageFrom(url)), cors);
+      return;
+    }
+
+    const userStatus = /^\/v1\/admin\/users\/([^/]+)\/status$/.exec(path);
+    if (userStatus !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const next = (raw as Record<string, unknown>)["status"];
+      if (next !== "active" && next !== "banned") {
+        send(res, 400, { error: "malformed status" }, cors);
+        return;
+      }
+      try {
+        await handleSetUserStatus(
+          { store, clock },
+          auth.uid,
+          decodeURIComponent(userStatus[1] ?? ""),
+          next,
+        );
+      } catch {
+        send(res, 404, { error: "not-found" }, cors);
+        return;
+      }
+      send(res, 200, { ok: true }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/advertisers" && req.method === "GET") {
+      const advertisers = await handleListAdvertisers({ store, clock }, auth.uid);
+      // Money is bigint in the store and a decimal string on the wire, as everywhere.
+      send(
+        res,
+        200,
+        {
+          advertisers: advertisers.map((a) => ({
+            ...a,
+            fundedMicros: a.fundedMicros.toString(),
+            reservedMicros: a.reservedMicros.toString(),
+          })),
+        },
+        cors,
+      );
+      return;
+    }
+
+    const advertiserCampaigns = /^\/v1\/admin\/advertisers\/([^/]+)\/campaigns$/.exec(path);
+    if (advertiserCampaigns !== null && req.method === "GET") {
+      const campaigns = await handleAdminCampaigns({ store, clock }, auth.uid, decodeURIComponent(advertiserCampaigns[1]!));
+      send(res, campaigns === null ? 404 : 200, campaigns === null ? { error: "not-found" } : { campaigns }, cors);
+      return;
+    }
+
+    const advertiserStatus = /^\/v1\/admin\/advertisers\/([^/]+)\/status$/.exec(path);
+    if (advertiserStatus !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const next = (raw as Record<string, unknown>)["status"];
+      if (next !== "active" && next !== "suspended") {
+        send(res, 400, { error: "malformed status" }, cors);
+        return;
+      }
+      const updated = await handleSetAdvertiserStatus(
+        { store, clock },
+        auth.uid,
+        decodeURIComponent(advertiserStatus[1] ?? ""),
+        next,
+      );
+      if (updated === null) {
+        send(res, 404, { error: "not-found" }, cors);
+        return;
+      }
+      send(res, 200, { ok: true, status: updated.status }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/notices" && req.method === "GET") {
+      send(res, 200, { notices: await handleListNotices({ store, clock }, auth.uid) }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/notices" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const input = parseNotice(raw);
+      if (input === null) {
+        send(res, 400, { error: "malformed notice" }, cors);
+        return;
+      }
+      send(res, 200, await handlePublishNotice({ store, clock, ids }, auth.uid, input), cors);
+      return;
+    }
+
+    const retractNotice = /^\/v1\/admin\/notices\/([^/]+)\/retract$/.exec(path);
+    if (retractNotice !== null && req.method === "POST") {
+      const updated = await handleRetractNotice(
+        { store, clock },
+        auth.uid,
+        decodeURIComponent(retractNotice[1] ?? ""),
+      );
+      if (updated === null) {
+        send(res, 404, { error: "not-found" }, cors);
+        return;
+      }
+      send(res, 200, updated, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/admins" && req.method === "GET") {
+      send(res, 200, { admins: await handleListAdmins({ store, clock }, auth.uid) }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/admins" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const email = parseAdminEmail(raw);
+      if (email === null) {
+        send(res, 400, { error: "malformed email" }, cors);
+        return;
+      }
+      const result = await handleAddAdmin({ store, clock }, auth.uid, email);
+      if (!result.ok) {
+        send(res, 409, { error: result.reason }, cors);
+        return;
+      }
+      send(res, 200, { admins: result.admins }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/admins/remove" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const email = parseAdminEmail(raw);
+      if (email === null) {
+        send(res, 400, { error: "malformed email" }, cors);
+        return;
+      }
+      const result = await handleRemoveAdmin({ store, clock }, auth.uid, email);
+      if (!result.ok) {
+        // 409 for both: the request was well formed and the server refused it. A 404 for
+        // "not an admin" would leak whether an address is one to anybody who can reach
+        // this route - which is only ever another admin, but the distinction costs nothing.
+        send(res, 409, { error: result.reason }, cors);
+        return;
+      }
+      send(res, 200, { admins: result.admins }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/creatives" && req.method === "GET") {
+      // Defaults to the review queue; ?status= lets the test-ad screen reach approved
+      // ones too. An unknown value falls back to pending rather than erroring.
+      const wanted = url.searchParams.get("status");
+      const creatives =
+        wanted === "approved" || wanted === "rejected"
+          ? await store.creativesByStatus(wanted)
+          : await handleReviewQueue({ store, clock }, auth.uid);
+
+      send(res, 200, { creatives }, cors);
+      return;
+    }
+
+    const creativeStatus = /^\/v1\/admin\/creatives\/([^/]+)\/status$/.exec(path);
+    if (creativeStatus !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const next = (raw as Record<string, unknown>)["status"];
+      if (next !== "approved" && next !== "rejected" && next !== "pending") {
+        send(res, 400, { error: "malformed status" }, cors);
+        return;
+      }
+      const updated = await handleSetCreativeStatus(
+        { store, clock },
+        auth.uid,
+        decodeURIComponent(creativeStatus[1] ?? ""),
+        next,
+      );
+      if (updated === null) {
+        send(res, 404, { error: "not-found" }, cors);
+        return;
+      }
+      send(res, 200, updated, cors);
+      return;
+    }
+
+    /*
+     * POST /v1/admin/rehost-assets - repair creatives whose artwork is still inline.
+     *
+     * One-shot and idempotent. Needed once, for rows written before creatives learned to
+     * store their artwork separately; those rows cannot be served at all, so this is the
+     * difference between an ad system that works and one that silently has no inventory.
+     */
+    if (path === "/v1/admin/rehost-assets" && req.method === "POST") {
+      const result = await handleRehostAssets({ store, clock }, auth.uid, requestOrigin(req));
+      send(res, 200, result, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/test-serve" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const fields = raw as Record<string, unknown>;
+      const targetUid = typeof fields["uid"] === "string" ? fields["uid"] : "";
+      const creativeId = typeof fields["creativeId"] === "string" ? fields["creativeId"] : "";
+
+      if (targetUid.length === 0 || creativeId.length === 0) {
+        send(res, 400, { error: "malformed test serve" }, cors);
+        return;
+      }
+
+      const queued = await handleQueueTestServe({ store, clock }, auth.uid, targetUid, creativeId);
+      if (!queued.ok) {
+        send(res, 404, { error: queued.error }, cors);
+        return;
+      }
+      send(res, 200, { ok: true }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/releases" && req.method === "GET") {
+      send(res, 200, { releases: await handleListReleases({ store, clock }, auth.uid) }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/releases" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+
+      const input = parseRelease(raw);
+      if (input === null) {
+        send(res, 400, { error: "malformed release" }, cors);
+        return;
+      }
+
+      send(res, 200, await handleSaveRelease({ store, clock }, auth.uid, input), cors);
+      return;
+    }
+
+    if (path === "/v1/admin/posts" && req.method === "GET") {
+      send(res, 200, { posts: await handleListPosts({ store, clock }, auth.uid) }, cors);
+      return;
+    }
+
+    if (path === "/v1/admin/posts" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const input = parsePost(raw);
+      if (input === null) {
+        send(res, 400, { error: "malformed post" }, cors);
+        return;
+      }
+      send(res, 200, await handleSavePost({ store, clock }, auth.uid, input), cors);
+      return;
+    }
+
+    /*
+     * POST /v1/admin/post-assets - one image for a blog or docs page.
+     *
+     * The editor uploads first and writes second: the bytes land on the asset host and
+     * the markdown keeps only the short URL, so post rows stay small and reads stay
+     * fast. Admin-gated like every other `/v1/admin/` route, audited like every write.
+     */
+    if (path === "/v1/admin/post-assets" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const input = parsePostAsset(raw);
+      if (input === null) {
+        send(res, 400, { error: "malformed asset" }, cors);
+        return;
+      }
+      const saved = await handleSavePostAsset(
+        { store, clock, ids },
+        auth.uid,
+        requestOrigin(req),
+        input.dataUrl,
+      );
+      if (saved === null) {
+        send(res, 400, { error: "malformed asset" }, cors);
+        return;
+      }
+      send(res, 200, saved, cors);
+      return;
+    }
+
+    /*
+     * Move a balance by hand, with a reason.
+     *
+     * The `adjustment` ledger kind existed from the first migration and nothing wrote one,
+     * so every correction that was not a withdrawal outcome meant editing the database
+     * directly - which is precisely what an append-only ledger exists to make unnecessary.
+     */
+    const adjust = ADMIN_ADJUST.exec(path);
+    if (adjust !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseAdjustment(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed adjustment" }, cors);
+        return;
+      }
+      settlePayout(
+        await adjustBalance(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(adjust[1] ?? ""),
+          body.micros,
+          body.reason,
+        ),
+      );
+      return;
+    }
+
+    const admin = ADMIN_LEDGER.exec(path);
+    if (admin !== null && req.method === "GET") {
+      const subject = decodeURIComponent(admin[1] ?? "");
+      send(res, 200, await handleAdminLedger({ store, clock }, auth.uid, subject, pageFrom(url)), cors);
+      return;
+    }
+
+    if (path === "/v1/serve" && req.method === "POST") {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await readBody(req));
+      } catch {
+        send(res, 400, { error: "malformed body" }, cors);
+        return;
+      }
+      const body = parseServeRequest(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed serve request" }, cors);
+        return;
+      }
+      // `config` is passed through rather than re-read: it is the same row the rate
+      // limiter just used, and re-reading it would cost another round trip on the
+      // path with the tightest budget. Kill-switch timing is unchanged - this config
+      // was read milliseconds ago in this same request.
+      send(res, 200, await handleServe({ store, clock, ids }, auth.uid, body, config), cors);
+      return;
+    }
+
+    if (path === "/v1/receipts" && req.method === "POST") {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await readBody(req));
+      } catch {
+        send(res, 400, { error: "malformed body" }, cors);
+        return;
+      }
+      const body = parseReceiptsRequest(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed receipts request" }, cors);
+        return;
+      }
+      send(res, 200, await handleReceipts({
+        store, clock, ids,
+        onResult: (result) => console.info("[ads:receipt]", JSON.stringify(result)),
+      }, auth.uid, body), cors);
+      return;
+    }
+
+    if (path === "/v1/reports" && req.method === "POST") {
+      let raw: unknown;
+      try {
+        raw = JSON.parse(await readBody(req));
+      } catch {
+        send(res, 400, { error: "malformed body" }, cors);
+        return;
+      }
+      const body = parseReportRequest(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed report" }, cors);
+        return;
+      }
+      send(res, 200, await handleSubmitReport({ store, clock, ids }, auth.uid, body), cors);
+      return;
+    }
+
+    /* ── Editor activity ────────────────────────────────────────────── */
+
+    if (path === "/v1/activity" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseActivity(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed activity" }, cors);
+        return;
+      }
+      await recordActivity({ store, clock }, auth.uid, body);
+      // No body worth returning: the client is reporting, not asking. `{ ok: true }`
+      // rather than 204 so the response parses the same way every other one does.
+      send(res, 200, { ok: true }, cors);
+      return;
+    }
+
+    /* ── First-session milestones ───────────────────────────────────── */
+
+    // How an editor's assistant turns ended, per model: counts only, no account attached.
+    if (path === "/v1/model-outcomes" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const items = parseModelOutcomes(raw);
+      if (items === null) {
+        send(res, 400, { error: "malformed outcomes" }, cors);
+        return;
+      }
+      await recordModelOutcomes({ store, clock }, items);
+      send(res, 200, { ok: true }, cors);
+      return;
+    }
+
+    if (path === "/v1/milestones" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const items = parseMilestones(raw);
+      if (items === null) {
+        send(res, 400, { error: "malformed milestones" }, cors);
+        return;
+      }
+      await recordMilestones({ store, clock }, auth.uid, items);
+      send(res, 200, { ok: true }, cors);
+      return;
+    }
+
+    if (path === "/v1/activity" && req.method === "GET") {
+      send(
+        res,
+        200,
+        await readActivity({ store, clock }, auth.uid, daysFrom(url, ACTIVITY_LIMITS.defaultDays)),
+        cors,
+      );
+      return;
+    }
+
+    /* ── Your invite ────────────────────────────────────────────────── */
+
+    if (path === "/v1/referrals" && (req.method === "GET" || req.method === "PATCH")) {
+      try {
+        if (req.method === "GET") {
+          send(res, 200, await readMyReferrals(referralDeps, auth.uid), cors);
+          return;
+        }
+        const raw = await jsonBodyOr400();
+        if (raw === undefined) return;
+        const showName = parseShowName(raw);
+        if (showName === null) {
+          send(res, 400, { error: "malformed change" }, cors);
+          return;
+        }
+        send(res, 200, await setShowName(referralDeps, auth.uid, showName), cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    if (path === "/v1/referrals/claim" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseClaim(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed claim" }, cors);
+        return;
+      }
+      try {
+        const outcome = await claimReferral(referralDeps, auth.uid, body);
+        if (outcome.ok) send(res, 200, outcome, cors);
+        else send(res, 409, { error: outcome.error }, cors);
+      } catch (error) {
+        if (!referralsUnavailable(error)) throw error;
+      }
+      return;
+    }
+
+    /* ── Advertiser portal ──────────────────────────────────────────── */
+
+    const advertiserDeps = { store, clock, ids };
+
+    /** Unwraps an Outcome onto the wire, mapping refusals to status codes. */
+    const settle = <T>(result: Outcome<T>): void => {
+      if (result.ok) send(res, 200, result.value, cors);
+      else send(res, ADVERTISER_STATUS[result.error], { error: result.error }, cors);
+    };
+
+    if (path === "/v1/portal/limits" && req.method === "GET") {
+      send(res, 200, PORTAL_LIMITS, cors);
+      return;
+    }
+
+    if (path === "/v1/portal/advertiser" && req.method === "GET") {
+      settle(await getMyAdvertiser(advertiserDeps, auth.uid));
+      return;
+    }
+
+    if (path === "/v1/portal/advertiser" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseCreateAdvertiser(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed advertiser" }, cors);
+        return;
+      }
+      const created = await createAdvertiser(advertiserDeps, auth.uid, body);
+      // Who brought them, if a valid invite did. Never able to fail the sign-up.
+      if (created.ok) await attributeAdvertiser(referralDeps, created.value.advertiserId, [auth.uid], body.ref);
+      settle(created);
+      return;
+    }
+
+    if (path === "/v1/portal/campaigns" && req.method === "GET") {
+      settle(await listCampaigns(advertiserDeps, auth.uid));
+      return;
+    }
+
+    if (path === "/v1/portal/series" && req.method === "GET") {
+      settle(await campaignSeries(advertiserDeps, auth.uid, daysFrom(url, 30)));
+      return;
+    }
+
+    if (path === "/v1/portal/campaigns" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseCampaign(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed campaign" }, cors);
+        return;
+      }
+      settle(await createCampaign(advertiserDeps, auth.uid, body));
+      return;
+    }
+
+    const campaignStatus = /^\/v1\/portal\/campaigns\/([^/]+)\/status$/.exec(path);
+    if (campaignStatus !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+
+      const next = (raw as Record<string, unknown>)["status"];
+      if (next !== "active" && next !== "paused" && next !== "ended") {
+        send(res, 400, { error: "malformed status" }, cors);
+        return;
+      }
+
+      settle(
+        await setCampaignStatus(
+          advertiserDeps,
+          auth.uid,
+          decodeURIComponent(campaignStatus[1] ?? ""),
+          next,
+        ),
+      );
+      return;
+    }
+
+    const budgetMove = /^\/v1\/portal\/campaigns\/([^/]+)\/move-budget$/.exec(path);
+    if (budgetMove !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseBudgetMove(decodeURIComponent(budgetMove[1] ?? ""), raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed budget move" }, cors);
+        return;
+      }
+      settle(await moveCampaignBudget(advertiserDeps, auth.uid, body));
+      return;
+    }
+
+    const campaignCreatives = /^\/v1\/portal\/campaigns\/([^/]+)\/creatives$/.exec(path);
+    if (campaignCreatives !== null && req.method === "GET") {
+      settle(
+        await listCreatives(advertiserDeps, auth.uid, decodeURIComponent(campaignCreatives[1] ?? "")),
+      );
+      return;
+    }
+
+    if (path === "/v1/portal/checkout" && req.method === "POST") {
+      if (payments === undefined) {
+        send(res, 503, { error: "payments not configured" }, cors);
+        return;
+      }
+
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const fields = raw as Record<string, unknown>;
+      const outcome = await createCreditCheckout({ store, payments, clock, ids, siteOrigin }, auth.uid, {
+        amountMicros: fields["amountMicros"],
+        billingCountry: fields["billingCountry"],
+        email: fields["email"],
+      });
+      if (!outcome.ok) {
+        send(res, outcome.status, { error: outcome.error }, cors);
+        return;
+      }
+      send(res, 200, outcome.value, cors);
+      return;
+    }
+
+    if (path === "/v1/portal/creatives" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parseCreative(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed creative" }, cors);
+        return;
+      }
+      settle(await createCreative(advertiserDeps, auth.uid, body, requestOrigin(req)));
+      return;
+    }
+
+    if (path === "/v1/notices" && req.method === "GET") {
+      const notices = await store.listNotices({ activeOnly: true });
+      send(res, 200, { notices }, cors);
+      return;
+    }
+
+    if (path === "/v1/balance" && req.method === "GET") {
+      send(res, 200, await handleBalance(store, auth.uid), cors);
+      return;
+    }
+
+    /*
+     * Cash out.
+     *
+     * One GET returns the whole screen - the rules, whether they pass, the details on
+     * file and every past request - because they are read together and a page that
+     * fetches them separately renders in four stages, each of which briefly says
+     * something untrue about whether you can be paid.
+     */
+    if (path === "/v1/payouts" && req.method === "GET") {
+      send(res, 200, await readPayouts(payoutDeps, auth.uid), cors);
+      return;
+    }
+
+    if (path === "/v1/payouts/profile" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const body = parsePayoutProfile(raw);
+      if (body === null) {
+        send(res, 400, { error: "malformed payout details" }, cors);
+        return;
+      }
+      const saved = await savePayoutProfile(payoutDeps, auth.uid, body);
+      if (saved === null) {
+        send(res, 400, { error: "payout corridor unavailable or details invalid" }, cors);
+        return;
+      }
+      send(res, 200, saved, cors);
+      return;
+    }
+
+    const withdrawalFailed = /^\/v1\/admin\/withdrawals\/([^/]+)\/failed$/.exec(path);
+    if (withdrawalFailed !== null && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const note = parseDecisionNote(raw);
+      if (note === null) {
+        send(res, 400, { error: "malformed note" }, cors);
+        return;
+      }
+      settlePayout(
+        await markWithdrawalFailed(
+          payoutDeps,
+          auth.uid,
+          decodeURIComponent(withdrawalFailed[1] ?? ""),
+          note,
+        ),
+      );
+      return;
+    }
+
+    if (path === "/v1/payout-corridors" && req.method === "GET") {
+      const corridors = await store.listPayoutCorridors(true);
+      send(
+        res,
+        200,
+        {
+          corridors: corridors.map(({ country, currency, requiredFields }) => ({
+            country,
+            currency,
+            requiredFields,
+          })),
+        },
+        cors,
+      );
+      return;
+    }
+
+    if (path === "/v1/withdrawals" && req.method === "POST") {
+      const raw = await jsonBodyOr400();
+      if (raw === undefined) return;
+      const amountMicros = parseWithdrawalAmount(raw);
+      if (amountMicros === null) {
+        send(res, 400, { error: "invalid-amount" }, cors);
+        return;
+      }
+      settlePayout(await requestWithdrawal(payoutDeps, auth.uid, amountMicros));
+      return;
+    }
+
+    const cancelRequest = /^\/v1\/withdrawals\/([^/]+)\/cancel$/.exec(path);
+    if (cancelRequest !== null && req.method === "POST") {
+      settlePayout(
+        await cancelWithdrawal(payoutDeps, auth.uid, decodeURIComponent(cancelRequest[1] ?? "")),
+      );
+      return;
+    }
+
+    if (path === "/v1/ledger" && req.method === "GET") {
+      send(res, 200, await handleLedger(store, auth.uid, pageFrom(url)), cors);
+      return;
+    }
+
+    if (path === "/v1/config" && req.method === "GET") {
+      send(res, 200, await handleConfig(store), cors);
+      return;
+    }
+
+    send(res, 404, { error: "not found" }, cors);
+  };
+
+  return handle;
+}
+
+/**
+ * The routing above, listening on a loopback socket.
+ *
+ * This is what the test suite and `cli.ts` use. It is a thin wrapper by design: anything
+ * that lives here rather than in `createRequestHandler` is behaviour the deployed service
+ * would not have.
+ */
+export async function createApiServer(options: ApiOptions = {}): Promise<ApiServer> {
+  const handle = createRequestHandler(options);
+
+  const server = createServer((req, res) => {
+    handle(req, res).catch(() => {
+      if (!res.headersSent) send(res, 500, { error: "internal" });
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(options.port ?? 0, "127.0.0.1", resolve));
+
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+
+  return {
+    url: `http://127.0.0.1:${port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}

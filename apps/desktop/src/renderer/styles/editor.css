@@ -1,0 +1,364 @@
+/*
+ * Decorations drawn into the editing surface.
+ *
+ * These sit on top of Monaco's own painting, so everything here is deliberately quiet.
+ * The code is the thing being read; a decoration that competes with it has failed even if
+ * it is technically informative.
+ */
+
+/* ── Inline error lens ────────────────────────────────────────────────── */
+
+/*
+ * Dimmed, italic, and in the margin the code is not using.
+ *
+ * The opacity is the whole design. At full strength these read as part of the program and
+ * the eye stops on them while scanning; at 62% they are legible when looked at and
+ * invisible when not, which is exactly the job.
+ */
+.error-lens {
+  font-style: italic;
+  opacity: 0.62;
+  /* Never selectable: dragging across a line must select the code, not the annotation. */
+  user-select: none;
+  pointer-events: none;
+}
+
+.error-lens-error {
+  color: var(--danger);
+}
+
+.error-lens-warning {
+  color: var(--warning);
+}
+
+/* ── TODO and friends ─────────────────────────────────────────────────── */
+
+.todo-mark {
+  border-radius: 4px;
+  padding: 0 3px;
+  font-weight: 650;
+}
+
+/*
+ * Three tones, not five.
+ *
+ * TODO and NOTE are things you meant to do; FIXME, HACK and XXX are things that are wrong.
+ * Giving each keyword its own colour would be five colours nobody can remember the meaning
+ * of - the distinction that matters is "unfinished" against "broken".
+ */
+.todo-mark-todo,
+.todo-mark-note {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--accent);
+}
+
+.todo-mark-fixme,
+.todo-mark-hack,
+.todo-mark-xxx {
+  background: color-mix(in srgb, var(--warning) 20%, transparent);
+  color: var(--warning);
+}
+
+/*
+ * Column-select mode says so.
+ *
+ * Set by `editorHost.applySettings` from Monaco's own option rather than from the setting,
+ * so it describes the editor as it actually is. Without it, dragging behaves completely
+ * differently with nothing on screen explaining why.
+ */
+[data-column-selection="true"] {
+  cursor: crosshair;
+}
+
+/* ── Breakpoints and the paused line ──────────────────────────────────── */
+
+/*
+ * A filled circle, drawn rather than a character.
+ *
+ * A glyph from a font is a glyph that is missing on some machine, and a breakpoint that
+ * silently renders as a box is worse than one that renders as nothing.
+ */
+/* A quiet target appears in the glyph margin beside the line number. It is painted on
+   Monaco's existing visible-line node, so a large file does not need one decoration per
+   line merely to explain where a breakpoint can go. */
+.monaco-editor .margin-view-overlays > div:hover::before {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  /*
+   * Centred in the glyph lane - the first 20px of the row (one line height).
+   * `left: 50%` was wrong here: these row divs span the whole margin including
+   * the line numbers, so 50% parked the ring on top of the digits. `left: 7px`
+   * erred the other way, 3px left of the lane's 10px centre. (The lane width is
+   * fixed: Monaco derives it from the line height, which is hardcoded to 20px
+   * in editorHost.ts and exposed to no setting.)
+   */
+  left: 10px;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--danger);
+  border-radius: 999px;
+  opacity: 0.68;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.monaco-editor .margin-view-overlays > div:has(.breakpoint-glyph)::before {
+  opacity: 0;
+}
+
+.breakpoint-glyph {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: pointer;
+}
+
+/*
+ * 12px in a 20px lane: 4px of air on each side. At 10px the dot read as lost in
+ * the margin, which is the "too much space" complaint - the lane itself is
+ * Monaco's (one line height, not ours to narrow), so the dot meets it halfway.
+ */
+.breakpoint-glyph::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: var(--danger);
+  transform: translate(-50%, -50%);
+}
+
+/*
+ * Where the program actually is.
+ *
+ * A whole-line band rather than a margin arrow: when execution stops, the question is
+ * "where am I", and the answer should be visible from across the room.
+ */
+.debug-paused-line {
+  background: color-mix(in srgb, var(--warning) 22%, transparent);
+}
+
+.debug-paused-glyph::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  border-style: solid;
+  border-width: 6px 0 6px 9px;
+  border-color: transparent transparent transparent var(--warning);
+  transform: translate(-50%, -50%);
+}
+
+/* ── Suggest widget ───────────────────────────────────────────────────── */
+
+/*
+ * The completion popup's surfaces, in this app's materials.
+ *
+ * Colours arrive through the `editorSuggestWidget.*` theme keys in editorHost.ts;
+ * this block only pins geometry Monaco leaves to CSS. It deliberately never sizes
+ * rows: the list positions them from `suggestLineHeight` in JS, and any CSS height,
+ * padding or margin on a row would double-count against that number and stack the
+ * rows into each other.
+ */
+.monaco-editor .suggest-widget,
+.monaco-editor .suggest-details {
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: var(--shadow-floating);
+}
+
+.monaco-editor .suggest-widget .monaco-list-row.focused {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/*
+ * Readability guard for the completion popup.
+ *
+ * The widget inherits from the workbench (`font-family: var(--font-ui)` on `body`),
+ * and any inherited italic, transform, filter, letter-spacing or ligature would land
+ * here first - turning `#id` and `--var` suggestions into the smeared, unreadable
+ * rows in the bug report. Pin the text metrics to the same 13/20 the JS lays rows
+ * out from (`suggestFontSize` / `suggestLineHeight` in editorHost.ts) and neutralise
+ * everything that distorts glyphs. Never set height, padding or margin on rows here.
+ */
+.monaco-editor .suggest-widget .monaco-list-row,
+.monaco-editor .suggest-widget .monaco-list-row .contents,
+.monaco-editor .suggest-widget .monaco-list-row .main {
+  font-family: "SF Mono", "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  line-height: 20px;
+  font-style: normal;
+  font-variant-ligatures: none;
+  letter-spacing: normal;
+  text-transform: none;
+  transform: none;
+  filter: none;
+  text-shadow: none;
+}
+
+.monaco-editor .suggest-widget .monaco-highlighted-label {
+  font-weight: 700;
+}
+
+/* ── Comment tones ────────────────────────────────────────────────────── */
+
+/*
+ * Colour, not decoration.
+ *
+ * These paint whole comments rather than the few characters a TODO badge covers, so the
+ * treatment has to be quieter than one: no background fill, no weight change, nothing that
+ * changes the metrics of a line of code somebody is reading. The existing semantic tokens
+ * are reused rather than four new ones invented - a warning comment should be the colour
+ * this app already uses for danger, in every theme, including the one where the accent
+ * inverts.
+ */
+.comment-tone-alert {
+  color: var(--danger);
+}
+
+.comment-tone-query {
+  color: var(--accent);
+}
+
+.comment-tone-highlight {
+  color: var(--success);
+}
+
+/*
+ * Commented-out code, pushed back rather than struck through.
+ *
+ * Strikethrough is what the original extension does and it is hard to read across a whole
+ * block - the point is to stop the eye landing on dead code, not to make it illegible if
+ * you do need to read it.
+ */
+.comment-tone-muted {
+  color: var(--text-secondary);
+  opacity: 0.7;
+}
+
+/* ── Spelling ─────────────────────────────────────────────────────────── */
+
+/*
+ * A wavy underline, in the colour of a hint rather than an error.
+ *
+ * `text-decoration` rather than a background or a border: a misspelling is a mark *on* a
+ * word, and anything that fills or boxes it changes how the line reads. The colour is the
+ * secondary text colour deliberately - a typo in a comment is not the same order of
+ * problem as a compile error, and painting it red would say that it was.
+ */
+.spell-misspelling {
+  text-decoration: underline wavy var(--text-secondary);
+  text-decoration-skip-ink: none;
+  text-underline-offset: 2px;
+}
+
+/* ── Ctrl+E: edit with AI, in place ───────────────────────────────────────
+   The prompt and the replaced text share one view zone above the rewrite, so
+   code is pushed down rather than covered. Green marks what the model wrote;
+   the struck red block above it is what it replaced. */
+.ai-inline-edit { box-sizing: border-box; padding: 4px 12px 4px 4px; font-family: var(--font-ui, inherit); }
+.ai-inline-edit-bar {
+  display: flex; align-items: center; gap: 8px; height: 34px; max-width: 760px; padding: 0 6px 0 8px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-md); background: var(--bg-elevated);
+  box-shadow: var(--shadow-surface);
+}
+.ai-inline-edit:focus-within .ai-inline-edit-bar { border-color: var(--accent); }
+.ai-inline-edit-mark {
+  flex: none; padding: 1px 5px; border-radius: 4px; background: var(--accent); color: var(--bg-editor);
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+}
+.ai-inline-edit-input {
+  flex: 1; min-width: 0; height: 26px; padding: 0 4px; border: 0; outline: none; background: transparent;
+  color: var(--text-primary); font: inherit; font-size: 13px;
+}
+.ai-inline-edit-input::placeholder { color: var(--text-tertiary); }
+.ai-inline-edit-status { flex: none; max-width: 40%; overflow: hidden; color: var(--text-secondary); font-size: var(--text-xs); white-space: nowrap; text-overflow: ellipsis; }
+.ai-inline-edit[data-state="working"] .ai-inline-edit-status::before {
+  content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; border: 1.5px solid currentColor;
+  border-right-color: transparent; border-radius: 50%; vertical-align: -1px; animation: ai-inline-edit-spin .8s linear infinite;
+}
+@keyframes ai-inline-edit-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .ai-inline-edit[data-state="working"] .ai-inline-edit-status::before { animation: none; } }
+.ai-inline-edit-actions { display: flex; flex: none; gap: 4px; }
+.ai-inline-edit-button {
+  height: 24px; padding: 0 10px; border: 1px solid var(--border-hairline); border-radius: 5px; background: transparent;
+  color: var(--text-primary); font: inherit; font-size: var(--text-xs); font-weight: 550; cursor: pointer;
+}
+.ai-inline-edit-button:hover { background: var(--bg-hover); }
+.ai-inline-edit-button.is-primary { border-color: var(--accent); background: var(--accent); color: var(--bg-editor); }
+.ai-inline-edit-button.is-primary:hover { opacity: .9; }
+.ai-inline-edit-button:focus-visible, .ai-inline-edit-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ai-inline-edit-removed {
+  margin-top: 6px; padding: 2px 0; overflow: hidden; border-left: 2px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  font-family: "SF Mono", "JetBrains Mono", "Cascadia Code", ui-monospace, Consolas, monospace; font-size: 13px;
+}
+.ai-inline-edit-removed[hidden] { display: none; }
+.ai-inline-edit-removed-line, .ai-inline-edit-removed-more {
+  height: 20px; padding-left: 10px; overflow: hidden; line-height: 20px; white-space: pre; text-overflow: ellipsis;
+  text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--danger) 55%, transparent); opacity: .85;
+}
+.ai-inline-edit-removed-more { color: var(--text-secondary); font-style: italic; text-decoration: none; }
+.monaco-editor .ai-inline-edit-added { background: color-mix(in srgb, var(--success) 13%, transparent); }
+.monaco-editor .ai-inline-edit-added-gutter { border-left: 3px solid var(--success); margin-left: 3px; }
+
+/* ── Image preview ────────────────────────────────────────────────────
+   Monaco edits text; images get this overlay instead. Same editor area, centred
+   figure, checkerboard behind transparency so a white PNG on a light theme is
+   still visible. */
+.image-preview {
+  position: absolute;
+  inset: 0 var(--preview-width, 0px) 0 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 24px;
+  background: var(--bg-editor);
+}
+.image-preview[hidden] { display: none; }
+.image-preview-figure {
+  display: grid;
+  gap: 12px;
+  justify-items: center;
+  max-width: 100%;
+  margin: 0;
+}
+.image-preview-img {
+  max-width: min(100%, 900px);
+  max-height: calc(100vh - 220px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  box-shadow: var(--shadow-surface);
+  background:
+    linear-gradient(45deg, #80808022 25%, transparent 25%, transparent 75%, #80808022 75%),
+    linear-gradient(45deg, #80808022 25%, transparent 25%, transparent 75%, #80808022 75%),
+    var(--bg-app);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+  object-fit: contain;
+}
+.image-preview-caption {
+  display: grid;
+  gap: 2px;
+  justify-items: center;
+  text-align: center;
+}
+.image-preview-name {
+  max-width: 60ch;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.image-preview-meta {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}

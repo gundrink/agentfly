@@ -1,0 +1,111 @@
+"use client";
+
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import { useEffect, useRef, useState } from "react";
+import { signOutNow } from "@/lib/firebase";
+import { ChainMarks } from "./ChainMarks";
+import { Mark } from "./Mark";
+import { useAuth } from "./AuthProvider";
+import { PortalActions } from "./PortalActions";
+import { ThemePicker } from "./ThemeProvider";
+import { TEAM } from "@/lib/site";
+
+export function Nav() {
+  const pathname = usePathname();
+  const { user, loading, isAdmin } = useAuth();
+  const [open, setOpen] = useState(false);
+  const [leaving, setLeaving] = useState(false);
+  const menu = useRef<HTMLDivElement>(null);
+
+  useEffect(() => setOpen(false), [pathname]);
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    const onDown = (event: MouseEvent): void => {
+      if (!menu.current?.contains(event.target as Node)) setOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open]);
+
+  const signOut = async (): Promise<void> => {
+    setLeaving(true);
+    try {
+      await signOutNow();
+    } finally {
+      setLeaving(false);
+    }
+  };
+
+  const secondaryLinks = (
+    <>
+      <Link href="/#product" className="glass-nav-link">Product</Link>
+      <a href="/#about" className="glass-nav-link">About us</a>
+      <Link href="/portal" className="glass-nav-link nav-mobile-only">Advertiser portal</Link>
+      <Link
+        href="/docs"
+        className="glass-nav-link"
+        aria-current={pathname === "/docs" || pathname.startsWith("/docs/") ? "page" : undefined}
+      >
+        Docs
+      </Link>
+      {/*
+        The comparison pages are the ones written to win "<editor> alternative" searches,
+        and a footer link was their only way in - Search Console had every one of them as
+        "discovered, not crawled". A link from every page's nav is the signal that says they
+        matter.
+      */}
+      <Link
+        href="/compare"
+        className="glass-nav-link nav-mobile-only"
+        aria-current={pathname === "/compare" || pathname.startsWith("/compare/") ? "page" : undefined}
+      >
+        Compare
+      </Link>
+      <Link href="/support" className="glass-nav-link nav-mobile-only" aria-current={pathname === "/support" ? "page" : undefined}>Support</Link>
+      <a href={TEAM.bookingUrl} className="glass-nav-link nav-team nav-mobile-only" target="_blank" rel="noopener noreferrer">Talk to the team <span aria-hidden="true">↗</span></a>
+      {/* The desktop bar has its own Download button; a second "Download" beside it split one action in two. Phones hide that button, so the sheet keeps this. */}
+      <Link href="/versions" className="glass-nav-link nav-mobile-only" aria-current={pathname === "/versions" ? "page" : undefined}>Download</Link>
+      {isAdmin && <Link href="/admin" className="glass-nav-link">Admin</Link>}
+      {!loading && (user === null ? (
+        <Link href="/dashboard" className="glass-auth-control">Sign in</Link>
+      ) : (
+        <button type="button" className="glass-auth-control" disabled={leaving} onClick={() => void signOut()}>
+          {leaving ? "Signing out…" : "Log out"}
+        </button>
+      ))}
+    </>
+  );
+
+  return (
+    <header className="marketplace-nav">
+      <div className="marketplace-wrap marketplace-nav-inner">
+        <div className="brand-cluster">
+          <Link href="/" className="marketplace-brand" aria-label="Agentfly home"><Mark /><span>Agentfly</span></Link>
+          <ChainMarks />
+        </div>
+        <nav className="glass-nav" aria-label="Main navigation">
+          <span className="glass-nav-secondary">{secondaryLinks}</span>
+          <ThemePicker />
+          <a href={TEAM.bookingUrl} className="glass-nav-link nav-team nav-team-action" target="_blank" rel="noopener noreferrer">Talk to the team <span aria-hidden="true">↗</span></a>
+          <PortalActions />
+          {/* The primary action on every page: most visitors came to get the editor. */}
+          <Link href="/versions" className="nav-download">Download</Link>
+          <div className="glass-nav-mobile" ref={menu}>
+            <button type="button" className="glass-menu-trigger" aria-label="Open navigation menu" aria-controls="glass-mobile-navigation" aria-expanded={open} onClick={() => setOpen((current) => !current)}>
+              <span /><span />
+            </button>
+            {open && <div className="glass-mobile-sheet" id="glass-mobile-navigation" onClick={(event) => { if ((event.target as Element).closest("a")) setOpen(false); }}>{secondaryLinks}</div>}
+          </div>
+        </nav>
+      </div>
+    </header>
+  );
+}

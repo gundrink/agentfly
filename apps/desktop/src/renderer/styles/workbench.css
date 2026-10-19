@@ -1,0 +1,2525 @@
+/*
+ * Workbench chrome - brief §3. Monaco is the editing surface only; the layout, activity
+ * bar, tabs, sidebar, panel, and status bar are all ours.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-rows: 36px 1fr 24px;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+select {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* ── Titlebar ─────────────────────────────────────────────────────────── */
+
+/*
+ * `z-index` here is what lets the menu's dropdown paint over the workbench.
+ *
+ * `backdrop-filter` makes an element a stacking context, and both this bar and `.sidebar`
+ * have one - which puts them on the same level, where DOM order decides. `.workbench`
+ * comes second in index.html, so the sidebar was painting over an open menu. Kept below
+ * `.quickopen` (90) and the settings overlay (100), which should still cover the bar.
+ */
+.titlebar {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  background: var(--bg-chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+/*
+ * The drag region takes the space the menu bar leaves, rather than the whole bar.
+ *
+ * It used to be `width: 100%` with the menu bar floating above it on `no-drag`, and that
+ * silently ate every menu click: draggable regions are resolved by the OS through
+ * WM_NCHITTEST, before the renderer ever sees the press, and Chromium accumulates those
+ * regions in document order - so a full-width `drag` declared after the menu bar's
+ * `no-drag` painted straight back over the carve-out. The click became a caption drag.
+ *
+ * CDP could not see any of this, because it injects input below the OS hit test, which is
+ * why the DOM looked healthy while the bar was dead to an actual mouse. Siblings that
+ * never overlap need no carve-out to survive, so the ordering rule stops mattering.
+ */
+.titlebar-drag {
+  -webkit-app-region: drag;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+/*
+ * Compact actions at the edges of the title bar.
+ *
+ * A sibling of the drag regions for the same reason the menu bar is one: anything the OS
+ * resolves as a caption drag swallows the press before the renderer sees it.
+ */
+.titlebar-action {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 22px;
+  margin-left: 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: default;
+  -webkit-app-region: no-drag;
+}
+
+.titlebar-action:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.titlebar-action[aria-pressed="true"] {
+  background: var(--bg-active);
+  color: var(--accent);
+}
+
+.titlebar-action svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/*
+ * The command centre sits between two drag regions rather than on top of one.
+ *
+ * That places it at the centre of the space the menus leave rather than at the centre of
+ * the window - a few pixels right of true centre, which is the same compromise VS Code
+ * makes. The alternative is absolute-centring it over a full-width drag region and cutting
+ * a `no-drag` hole, and that is precisely the arrangement documented on `.titlebar-drag`
+ * as having shipped a title bar no mouse could click.
+ */
+.command-centre-slot {
+  display: flex;
+  justify-content: center;
+  flex: none;
+  -webkit-app-region: no-drag;
+}
+
+.command-centre {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: clamp(200px, 34vw, 460px);
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 7px;
+  background: var(--bg-elevated);
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  font-family: var(--font-ui);
+  cursor: default;
+}
+
+.command-centre:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong, var(--border-hairline));
+  color: var(--text-secondary);
+}
+
+.command-centre:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.command-centre svg {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+}
+
+.command-centre-label {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+.command-centre-hint {
+  flex: none;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  border: 1px solid var(--border-hairline);
+  border-radius: 4px;
+  padding: 0 4px;
+  line-height: 14px;
+}
+
+/* Narrow windows lose the hint before they lose the search box. */
+@media (max-width: 900px) {
+  .command-centre-hint {
+    display: none;
+  }
+}
+
+/* ── Layout ───────────────────────────────────────────────────────────── */
+
+/*
+ * The sidebar's width is a custom property, so dragging the divider sets one value
+ * rather than rewriting the whole template - and the collapse the View menu does keeps
+ * working by overriding the column, without having to know the current width.
+ */
+.workbench {
+  position: relative;
+  display: grid;
+  grid-template-columns: 48px calc(var(--sidebar-width, 240px) + 12px) 4px 1fr;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.workbench[data-sidebar-open="false"] {
+  grid-template-columns: 48px 0 0 minmax(0, 1fr);
+}
+
+.workbench[data-sidebar-open="false"] #splitter-sidebar {
+  pointer-events: none;
+}
+
+.activitybar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding-top: 8px;
+  background: var(--bg-chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-right: 1px solid var(--border-hairline);
+}
+
+.activity {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: transform var(--duration-exit) var(--ease-sheet);
+}
+
+.activity:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.activity:active {
+  transform: scale(0.94);
+}
+
+/* The settings gear sits at the foot of the activity bar, as it does everywhere else. */
+.activity-bottom {
+  margin-top: auto;
+  margin-bottom: 8px;
+}
+
+.activity[aria-selected="true"],
+.activity[aria-pressed="true"] {
+  background: var(--bg-active);
+  color: var(--accent);
+}
+
+.activity:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/*
+ * The problems count.
+ *
+ * `.activity` gets the containing block, which it needs anyway once anything is pinned to
+ * a corner of it. The badge never renders a zero - `badgeFor` returns null instead - since
+ * a counter that sits at 0 all day is a counter the eye learns to skip, and this one has
+ * to be worth looking at on the day it is not 0.
+ */
+.activity {
+  position: relative;
+}
+
+.activity-badge {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--danger);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  pointer-events: none;
+}
+
+.activity-badge[data-tone="warning"] {
+  background: var(--warning);
+}
+
+.activity-badge[data-tone="changes"] {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.activity svg {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The Assistant is a primary action; its sparkle mark needs a little more presence. */
+.activity#ai-toggle svg {
+  width: 21px;
+  height: 21px;
+}
+
+/* ── Sidebar ──────────────────────────────────────────────────────────── */
+
+/*
+ * `min-width: 0` and `minmax(0, 1fr)` are what let the splitter mean what it says.
+ *
+ * Two separate refusals to shrink, both invisible until measured. A grid item's automatic
+ * minimum is its min-content width, so the sidebar propped the workbench column open; and
+ * this grid's own single column defaulted to `auto`, which is max-content - so the header
+ * and the tree rows kept their full width and simply overflowed the track underneath them.
+ * A long folder name therefore drew straight across the editor while the splitter reported
+ * having moved. Both children already clip or scroll, so neither needs the room.
+ */
+.sidebar {
+  display: grid;
+  grid-template-rows: 50px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  margin: 8px 4px 8px 8px;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  box-shadow: var(--shadow-surface);
+  overflow: hidden;
+}
+
+.sidebar-header {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.sidebar-focus-ribbon {
+  position: absolute;
+  inset: 9px auto 9px 0;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--accent);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
+.sidebar-heading {
+  display: grid;
+  gap: 1px;
+  flex: 1;
+  min-width: 0;
+}
+
+/*
+ * The name takes the room that is left, and gives it up first.
+ *
+ * `min-width: 0` is the whole fix for the narrow end: a flex item defaults to
+ * `min-width: auto`, which refuses to shrink below its own content - so a long folder name
+ * pushed the buttons towards the sidebar's edge instead of ellipsising, and `text-overflow`
+ * never got the chance to do anything.
+ */
+.sidebar-title {
+  min-width: 0;
+  font-size: var(--text-xs);
+  font-weight: 620;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-close {
+  flex: none;
+}
+
+/*
+ * The actions, as one group pinned to the right.
+ *
+ * The two icon buttons sit tight against each other because they are a pair - new file and
+ * new folder - and Open gets a wider gap because it is a different kind of thing.
+ */
+.sidebar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.sidebar-actions .ghost-button {
+  margin-left: 4px;
+}
+
+.ghost-button {
+  border: 0;
+  border-radius: 7px;
+  padding: 3px 9px;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 560;
+  cursor: pointer;
+  transition: transform var(--duration-exit) var(--ease-sheet);
+}
+
+.ghost-button:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.ghost-button:active {
+  transform: scale(0.95);
+}
+
+.filetree.sidebar-view {
+  /* The Explorer owns scrolling; other sidebar views scroll their inner panels. */
+  overflow: auto;
+  padding: 6px 6px 12px;
+}
+
+.sidebar-content {
+  display: grid;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* Every tool occupies the same sidebar cell and stays mounted while another is visible. */
+.sidebar-view {
+  grid-area: 1 / 1;
+  container-type: inline-size;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-view[hidden] {
+  display: none;
+}
+
+.sidebar-scrim {
+  position: absolute;
+  inset: 0 0 0 48px;
+  z-index: 20;
+  border: 0;
+  background: rgba(0, 0, 0, 0.18);
+  opacity: 1;
+}
+
+#popup-primary-host,
+#popup-dependent-host {
+  position: fixed;
+  inset: 36px 0 24px;
+  z-index: 80;
+  pointer-events: none;
+}
+
+#popup-dependent-host {
+  z-index: 90;
+}
+
+#popup-primary-host > :not(.popup-shell[data-popup-size="anchored"]),
+#popup-dependent-host > :not(.popup-shell[data-popup-size="anchored"]) {
+  pointer-events: auto;
+}
+
+@media (max-width: 819px) {
+  .workbench,
+  .workbench[data-sidebar-open="false"] {
+    grid-template-columns: 48px 0 0 minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: absolute;
+    inset: 10px auto 10px 58px;
+    z-index: 30;
+    width: min(var(--sidebar-width, 300px), calc(100% - 68px));
+    margin: 0;
+    box-shadow: var(--shadow-floating);
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-100%);
+    transition:
+      opacity var(--duration-enter) var(--ease-sheet),
+      transform var(--duration-enter) var(--ease-sheet);
+  }
+
+  .workbench[data-sidebar-open="true"] .sidebar {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0);
+  }
+
+  /* Keyboard navigation is already instantaneous feedback; spatial motion is reserved for
+     pointer-driven disclosure where it explains where the sidebar came from. */
+  .workbench[data-layout-input="keyboard"] .sidebar {
+    transition: none;
+  }
+
+  #splitter-sidebar {
+    pointer-events: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar {
+    transform: none !important;
+    transition-property: opacity;
+  }
+}
+
+:root[data-reduced-motion="true"] .sidebar {
+  transform: none !important;
+  transition-property: opacity;
+}
+
+.empty-hint {
+  margin: 12px;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: var(--density-row);
+  padding: 0 8px;
+  border-radius: 7px;
+  cursor: default;
+  user-select: none;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.tree-row[aria-selected="true"] {
+  background: var(--bg-selected);
+}
+
+/* ── Row actions and drag targets ─────────────────────────────────────── */
+
+/*
+ * New File / New Folder on the folder row itself.
+ *
+ * Revealed on hover and on keyboard focus - `:focus-within` matters, or the buttons can
+ * be tabbed to while still invisible, which is worse than not having them.
+ */
+.tree-actions {
+  display: flex;
+  gap: 1px;
+  margin-left: auto;
+  opacity: 0;
+  transition: opacity 90ms linear;
+}
+
+.tree-row:hover .tree-actions,
+.tree-row:focus-within .tree-actions {
+  opacity: 1;
+}
+
+.tree-action {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: none;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.tree-action:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.tree-action svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The row being dragged fades, so it is obvious which one is in flight. */
+.tree-row[data-dragging="true"] {
+  opacity: 0.4;
+}
+
+/* The folder that will receive the drop - outlined rather than filled, so the row's own
+   hover and selection states stay readable underneath it. */
+[data-drop-target="true"] {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  border-radius: 7px;
+  background: var(--bg-selected);
+}
+
+.filetree[data-drop-target="true"] {
+  outline-offset: -2px;
+}
+
+/* ── Inline naming ────────────────────────────────────────────────────── */
+
+/*
+ * Sits where the row it stands in for would be, so creating and renaming happen in the
+ * place the result will appear rather than in a dialog over the top of it.
+ */
+.tree-edit-row {
+  padding: 1px 8px 3px;
+}
+
+.tree-edit-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 2px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  outline: none;
+}
+
+.tree-edit-row[data-invalid="true"] .tree-edit-input {
+  border-color: var(--danger);
+}
+
+/* Under the box rather than in a toast: the name causing it is right there to fix. */
+.tree-edit-error {
+  margin-top: 3px;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--danger);
+  white-space: normal;
+}
+
+.tree-twisty {
+  width: 10px;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  flex: none;
+  transition: transform 140ms var(--ease-sheet);
+}
+
+.tree-row[data-open="true"] .tree-twisty {
+  transform: rotate(90deg);
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tree-children {
+  margin-left: 10px;
+  border-left: 1px solid var(--border-hairline);
+  padding-left: 4px;
+}
+
+/* ── Main ─────────────────────────────────────────────────────────────── */
+
+/* tabs / editor / panel divider / panel. The divider row collapses to nothing while
+   the panel is hidden, because `[hidden]` on a grid item still occupies its track. */
+.main {
+  display: grid;
+  /*
+   * Tabs, breadcrumbs, editor, splitter, panel.
+   *
+   * The editor is the only `1fr`, and the row order is positional - which is why the
+   * breadcrumb bar collapses to zero height rather than being hidden. A `hidden` grid item
+   * is `display: none` and leaves the grid entirely, so the editor would inherit an `auto`
+   * row and collapse to nothing. This cost an afternoon once; it is not worth repeating.
+   */
+  grid-template-rows: auto auto 1fr auto auto;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-editor);
+}
+
+/*
+ * The strip scrolls, and says so.
+ *
+ * It was already `overflow-x: auto`, but with the scrollbar hidden and no wheel handler
+ * there was no way to reach a tab that had slid off the end - the strip scrolled in
+ * principle and was stuck in practice. A thin bar restores the affordance; `main.ts`
+ * adds wheel-to-horizontal and keeps the active tab in view.
+ */
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-hairline) transparent;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.tabs::-webkit-scrollbar {
+  height: 6px;
+}
+
+.tabs::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.tabs::-webkit-scrollbar-thumb {
+  background: var(--border-hairline);
+  border-radius: 3px;
+}
+
+.tabs::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  /* Without this a full strip squeezes every tab toward zero width instead of
+     overflowing, so nothing scrolls and every label becomes unreadable at once. */
+  flex: none;
+  /* `max-width` caps the box, not the text. A long filename used to run straight out of
+     its own tab and across the next one's label. */
+  overflow: hidden;
+}
+
+.tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tab:hover {
+  background: var(--bg-hover);
+}
+
+.tab[aria-selected="true"] {
+  background: var(--bg-editor);
+  color: var(--text-primary);
+  font-weight: 560;
+}
+
+.tab-dirty {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+  opacity: 0;
+  transition: opacity var(--duration-exit) linear;
+}
+
+.tab[data-dirty="true"] .tab-dirty {
+  opacity: 1;
+}
+
+/*
+ * `display: grid` with `place-items: center` is what actually centres this, and it was
+ * missing. The button used to hold the character "×" and rely on `line-height: 1` plus the
+ * default `text-align`, which centres horizontally and leaves the vertical position to the
+ * font's baseline - so the mark sat high and slightly left. It is a stroked path now, and
+ * the grid centres the box it is drawn in. See `workbench/icons.ts`.
+ */
+.tab-close {
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  border-radius: 5px;
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  /* Never squeezed out by a long label - it is how the tab gets closed. */
+  flex: none;
+}
+
+.tab-close svg {
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.tab-close:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.editor-area {
+  position: relative;
+  min-height: 0;
+  min-width: 0;
+}
+
+/*
+ * The right inset is how the live preview takes its half of the area.
+ *
+ * A CSS variable rather than a class: the pane sets one number, and both the editor and
+ * the preview read it, so the two can never disagree about where the boundary is. It
+ * defaults to zero, which is the layout that existed before the preview did.
+ */
+.editor-host {
+  position: absolute;
+  inset: 0 var(--preview-width, 0px) 0 0;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity var(--duration-enter) var(--ease-sheet);
+}
+
+.preview-pane {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: var(--preview-width, 0px);
+  display: grid;
+  /*
+   * Bar, device bar, stage, inspector, output drawer. The rows are assigned explicitly
+   * below because three of the five are `display: none` most of the time: with
+   * auto-placement the stage would slide up into the device bar's row whenever it was
+   * hidden, and the layout would depend on which combination of things happened to be
+   * showing.
+   */
+  grid-template-rows: 32px auto minmax(0, 1fr) auto auto;
+  min-width: 0;
+  background: var(--bg-editor);
+  border-left: 1px solid var(--border-hairline);
+}
+
+.preview-bar {
+  grid-row: 1;
+}
+
+.device-bar {
+  grid-row: 2;
+}
+
+.preview-stage {
+  grid-row: 3;
+}
+
+.inspect-panel {
+  grid-row: 4;
+}
+
+.preview-output {
+  grid-row: 5;
+}
+
+.preview-bar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px 0 10px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+/*
+ * The dev server's status line, and the colour settles rather than snapping.
+ *
+ * This one string carries three states - starting, live, failed - and it changes without
+ * anything else on the bar moving, so a hard colour cut is easy to miss entirely if you
+ * happened to be looking at the page instead of the bar. 160ms of travel is enough to catch
+ * peripheral vision, which is the whole job of a status colour. The font-family swap in the
+ * tone rules stays discrete; there is no honest way to interpolate a typeface, and trying
+ * would only produce a reflow mid-transition.
+ */
+.preview-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  transition: color var(--duration-exit) ease;
+}
+
+.preview-url[data-tone="error"] {
+  font-family: var(--font-ui);
+  color: var(--danger);
+}
+
+/* The page address: reads like the old label until it is clicked, then edits like a URL bar. */
+.preview-address {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm, 6px);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  transition: border-color var(--duration-exit) ease, background var(--duration-exit) ease;
+}
+
+.preview-address:hover {
+  border-color: var(--border-subtle, var(--border));
+}
+
+.preview-address:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--bg-input, var(--bg-editor));
+  color: var(--text-primary);
+}
+
+.preview-address[hidden] {
+  display: none;
+}
+
+/*
+ * White, not `--bg-editor`. The frame holds the user's own page, and a preview that tints
+ * it to match the workbench is showing them something their visitors will never see.
+ */
+/*
+ * Where the frame sits.
+ *
+ * Scrolls, so a viewport wider than the pane can still be inspected at 100%. The grey is
+ * deliberately not `--bg-editor`: at a device size the area around the frame is not part
+ * of the page, and it should not look like it might be.
+ */
+.preview-stage {
+  position: relative;
+  overflow: auto;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  background: var(--bg-app);
+}
+
+/* No device size: the frame is the stage. */
+.preview-stage[data-device="off"] {
+  overflow: hidden;
+}
+
+.preview-stage[data-device="off"] .preview-frame {
+  width: 100%;
+  height: 100%;
+}
+
+/*
+ * White, not `--bg-editor`. The frame holds the user's own page, and a preview that tints
+ * it to match the workbench is showing them something their visitors will never see.
+ */
+.preview-frame {
+  border: 0;
+  background: #ffffff;
+  /* Scaling happens about the middle, so the frame stays centred as it shrinks. */
+  transform-origin: center center;
+}
+
+/* At a device size the frame gets a border, so its edges are visible against the stage. */
+.preview-stage[data-device="on"] .preview-frame {
+  border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-floating);
+}
+
+/* ── The device bar ───────────────────────────────────────────────────── */
+
+.device-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  padding: 5px 10px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border-hairline);
+  min-width: 0;
+}
+
+.device-bar[hidden] {
+  display: none;
+}
+
+/*
+ * Native `select` and `input` elements, so they get a settling border rather than a press
+ * scale: a select opens an OS menu on press and an input is clicked to place a caret, and
+ * squeezing either one fights what the control actually does.
+ */
+.device-preset,
+.device-zoom {
+  padding: 2px 6px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  min-width: 0;
+  transition: border-color 120ms ease;
+}
+
+.device-preset:hover,
+.device-zoom:hover {
+  border-color: var(--text-tertiary);
+}
+
+.device-preset {
+  flex: 1;
+  min-width: 0;
+}
+
+.device-size {
+  width: 92px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  /* Tabular figures: this field is typed into and dragged to, and proportional digits make
+     the number jitter sideways on every pixel of a resize. */
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  transition: border-color 120ms ease;
+}
+
+.device-size:hover {
+  border-color: var(--text-tertiary);
+}
+
+/* One-click sizes: the fastest route to phone / tablet / desktop. */
+.device-quick {
+  padding: 2px 8px;
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+/* A labelled dimension: W − [390] + . The label is what the bare boxes lacked. */
+.device-dim {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 4px 1px 6px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+}
+
+.device-dim-label {
+  font-size: var(--text-xs);
+  font-weight: 650;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.device-step {
+  padding: 0 5px;
+  font-size: var(--text-xs);
+  line-height: 1.4;
+}
+
+/* Explicit width / height boxes: same control language as the combined size box. */
+.device-width,
+.device-height {
+  width: 52px;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+/* Hide the native number spinners: the − / + buttons beside the box are the
+   stepper, and two steppers for one value fight each other. */
+.device-width::-webkit-inner-spin-button,
+.device-height::-webkit-inner-spin-button {
+  display: none;
+}
+
+.device-width,
+.device-height {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.device-dim:focus-within {
+  border-color: var(--text-tertiary);
+}
+
+.device-hint {
+  flex-basis: 100%;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  user-select: none;
+}
+
+/* ── Element inspector ────────────────────────────────────────────── */
+
+.inspect-panel {
+  min-height: 0;
+  max-height: 42%;
+  overflow: auto;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.inspect-panel[hidden] {
+  display: none;
+}
+
+.inspect-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.inspect-title {
+  font-size: var(--text-xs);
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.inspect-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.inspect-body {
+  padding: 8px 10px 10px;
+}
+
+.inspect-empty {
+  margin: 4px 0;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.inspect-selector {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.inspect-meta {
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* The ancestor trail: body › card › heading › span. Each level is a button
+   with its own identity, so "which is which" is answered by position. */
+.inspect-crumbs {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 4px;
+  margin-bottom: 6px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+}
+
+.inspect-crumb {
+  padding: 1px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  cursor: pointer;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspect-crumb:hover {
+  border-color: var(--text-tertiary);
+  color: var(--text-primary);
+}
+
+.inspect-crumb[data-current="true"] {
+  background: var(--bg-selected);
+  color: var(--accent);
+  cursor: default;
+}
+
+.inspect-crumb-sep {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  user-select: none;
+}
+
+.inspect-crumb-note {
+  margin: -2px 0 6px;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+
+.inspect-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 8px 0 0;
+  font-size: var(--text-xs);
+}
+
+.inspect-grid dt {
+  color: var(--text-secondary);
+}
+
+.inspect-grid dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+
+.inspect-model {
+  margin-top: 8px;
+  font-size: var(--text-xs);
+}
+
+.inspect-margin {
+  padding: 8px;
+  border: 1px dashed var(--text-tertiary);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+}
+
+.inspect-border {
+  padding: 6px;
+  border: 1px solid var(--text-tertiary);
+  border-radius: 6px;
+}
+
+.inspect-padding {
+  padding: 8px;
+  border: 1px dashed var(--text-tertiary);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.inspect-content {
+  padding: 6px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  text-align: center;
+}
+
+.inspect-model-label {
+  display: block;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.inspect-code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.inspect-code {
+  margin: 4px 0 0;
+  padding: 8px;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.inspect-tag {
+  color: var(--accent);
+}
+
+.inspect-attr {
+  color: var(--text-primary);
+}
+
+.inspect-string {
+  color: var(--success, #1a7f37);
+}
+
+.inspect-list-wrap {
+  display: grid;
+  gap: 6px;
+}
+
+.inspect-filter {
+  width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+}
+
+.inspect-list {
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.inspect-row {
+  display: grid;
+  gap: 1px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.inspect-row:hover {
+  border-color: var(--text-tertiary);
+}
+
+.inspect-row-main {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.inspect-row-sub {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.device-action {
+  padding: 2px 8px;
+  font-size: var(--text-xs);
+}
+
+/* The live size, which is the only feedback during a drag. */
+.device-readout {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* The toggle stays lit while device sizing is on. */
+.preview-bar .icon-button[data-active="true"] {
+  background: var(--bg-selected);
+  color: var(--accent);
+}
+
+/* ── Drag handles ─────────────────────────────────────────────────────── */
+
+/*
+ * Positioned from the middle out, using the frame's *drawn* size - which scaling changes.
+ * A handle placed on the frame's CSS width would sit off the edge of a scaled frame.
+ */
+.device-handle {
+  position: absolute;
+  z-index: 2;
+  touch-action: none;
+}
+
+.device-handle[hidden] {
+  display: none;
+}
+
+.device-handle-right {
+  top: 50%;
+  left: calc(50% + var(--device-drawn-width, 0px) / 2);
+  width: 10px;
+  height: 48px;
+  transform: translate(-50%, -50%);
+  cursor: ew-resize;
+}
+
+.device-handle-bottom {
+  left: 50%;
+  top: calc(50% + var(--device-drawn-height, 0px) / 2);
+  width: 48px;
+  height: 10px;
+  transform: translate(-50%, -50%);
+  cursor: ns-resize;
+}
+
+.device-handle-corner {
+  left: calc(50% + var(--device-drawn-width, 0px) / 2);
+  top: calc(50% + var(--device-drawn-height, 0px) / 2);
+  width: 14px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  cursor: nwse-resize;
+}
+
+/*
+ * Always faintly visible, strong on hover or while dragging.
+ *
+ * The handles used to be invisible until aimed at, which meant nobody found
+ * them: an undiscoverable resize is no resize at all. The faint baseline says
+ * "grab here"; hovering or dragging lights it fully.
+ */
+.device-handle::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 999px;
+  background: var(--text-tertiary);
+  opacity: 0.55;
+  transition: opacity var(--duration-exit) var(--ease-sheet);
+}
+
+.device-handle:hover::after,
+.device-handle[data-dragging="true"]::after {
+  opacity: 1;
+}
+
+.editor-host[data-ready="true"] {
+  opacity: 1;
+  visibility: visible;
+}
+
+/*
+ * The placeholder fades rather than vanishing, so it is switched with a data attribute:
+ * `hidden` now means `display: none` unconditionally, which would cut the fade short.
+ */
+.editor-placeholder {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  transition: opacity var(--duration-exit) var(--ease-sheet);
+}
+
+.editor-placeholder[data-visible="false"] {
+  opacity: 0;
+}
+
+.placeholder-inner {
+  text-align: center;
+  color: var(--text-tertiary);
+}
+
+.placeholder-inner h1 {
+  margin: 0 0 6px;
+  font-size: var(--text-2xl);
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  color: var(--text-secondary);
+}
+
+.placeholder-inner p {
+  margin: 0 0 20px;
+  font-size: var(--text-sm);
+}
+
+.shortcuts {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  font-size: var(--text-xs);
+}
+
+.shortcuts > div {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+.shortcuts dt {
+  color: var(--text-tertiary);
+  min-width: 64px;
+  text-align: right;
+}
+
+.shortcuts dd {
+  margin: 0;
+  display: flex;
+  gap: 3px;
+}
+
+kbd {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+/* ── Panel ────────────────────────────────────────────────────────────── */
+
+.panel {
+  container-type: inline-size;
+  display: grid;
+  grid-template-rows: 32px 1fr;
+  height: var(--panel-height, 260px);
+  margin: 0 8px 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: var(--bg-app);
+  box-shadow: var(--shadow-surface);
+  overflow: hidden;
+}
+
+.main[data-panel-maximized="true"] {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.main[data-panel-maximized="true"] > :not(.panel) {
+  display: none;
+}
+
+.main[data-panel-maximized="true"] > .panel {
+  margin: 8px;
+  height: auto;
+  min-height: 0;
+  border-radius: 14px;
+}
+
+.panel[hidden] {
+  display: none;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border-bottom: 1px solid var(--border-hairline);
+  user-select: none;
+}
+
+.panel-maximize[aria-pressed="true"] {
+  color: var(--text-primary);
+  background: var(--bg-active);
+}
+
+.panel-maximize svg[hidden] {
+  display: none;
+}
+
+.panel-title {
+  font-size: var(--text-xs);
+  font-weight: 620;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  margin-right: auto;
+}
+
+/*
+ * The split button: "+" opens the default shell, the chevron picks one.
+ *
+ * A hairline between the halves rather than a gap, so it reads as one control with two
+ * actions rather than two buttons that happen to be adjacent.
+ */
+.split-button {
+  display: flex;
+  align-items: center;
+  flex: none;
+  border-radius: 6px;
+}
+
+.split-button:hover {
+  background: var(--bg-hover);
+}
+
+.split-button .icon-button:hover {
+  background: transparent;
+  color: var(--text-primary);
+}
+
+/*
+ * `padding-right` balances the `border-left`.
+ *
+ * The border is inside the 16px box, so it leaves a 15px content area offset one pixel to
+ * the right - and `place-items: center` faithfully centres the chevron in *that*, half a
+ * pixel right of the button's own middle. A matching pixel on the other side makes the
+ * content area symmetric again. Half a pixel is invisible alone and is not invisible sitting
+ * next to the icon button it shares a control with.
+ */
+.icon-button-chevron {
+  width: 16px;
+  border-left: 1px solid transparent;
+  padding-right: 1px;
+}
+
+.split-button:hover .icon-button-chevron {
+  border-left-color: var(--border-hairline);
+}
+
+.icon-button-chevron svg {
+  width: 11px;
+  height: 11px;
+}
+
+.icon-button-chevron[aria-expanded="true"] {
+  color: var(--text-primary);
+}
+
+.terminal-host {
+  min-height: 0;
+  padding: 6px 8px;
+  overflow: hidden;
+}
+
+/* ── Status bar ───────────────────────────────────────────────────────── */
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 12px;
+  background: var(--bg-chrome);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-top: 1px solid var(--border-hairline);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.status-spacer {
+  margin-left: auto;
+}
+
+/*
+ * A long path is shortened in script, not here - see `shortenPath` in `main.ts`.
+ *
+ * CSS can only ellipsise the *end* of a string, and the end of a path is the only part
+ * worth keeping: trimmed that way every row would read "E:\Users\user\Documents\…".
+ * The `direction: rtl` trick moves the ellipsis but reorders the neutral characters a
+ * path is full of, so `E:\` can end up on the wrong side of it. This is left as a
+ * backstop for a path that is one enormous unbroken segment.
+ */
+.status-path {
+  max-width: 42ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.status-version {
+  color: var(--text-tertiary);
+}
+
+.status-item {
+  white-space: nowrap;
+}
+
+#status-dirty {
+  color: var(--accent);
+  font-weight: 560;
+}
+
+/*
+ * Go Live / Run, in the bottom-right corner.
+ *
+ * The negative margins let it fill the bar's full height and reach the right edge, so the
+ * whole corner is the target - which is where Live Server has trained everyone to throw the
+ * pointer without aiming. The bar's own `gap` still keeps it clear of the item before it.
+ */
+.status-slot {
+  display: flex;
+  align-items: stretch;
+  align-self: stretch;
+  margin-right: -12px;
+}
+
+.status-action {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.status-action:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* Running: the one control in the bar that is worth noticing out of the corner of an eye. */
+.status-action[data-state="live"] {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.status-action[data-state="live"]:hover {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+.status-action svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The run triangle and the stop square read as solid shapes, not outlines. */
+.status-action[data-state="idle"] svg path[d^="M5 3.5"],
+.status-action svg path[d^="M4.5 4.5"] {
+  fill: currentColor;
+}
+
+/* Scrollbars, matched to the chrome rather than the platform default. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-hairline);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+  background-clip: content-box;
+}
+
+/* ── Brand mark ───────────────────────────────────────────────────────── */
+
+.placeholder-mark {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 14px;
+  /* Dimmer than the heading: the mark introduces the app, it does not shout at someone
+     who has not opened anything yet. */
+  color: var(--text-tertiary);
+}
+
+.brand-mark {
+  display: block;
+}
+
+/* In the About card the mark replaces the outcome badge, so the badge's own circular
+   plate and fill have to get out of its way. */
+.result-badge:has(.brand-mark) {
+  width: auto;
+  height: auto;
+  background: none;
+  color: var(--text-primary);
+}
+
+/* ── Splitters ────────────────────────────────────────────────────────── */
+
+/*
+ * The divider is a 4px track, but the grab area is wider than it looks.
+ *
+ * A hairline that is only as tall as it is visible is a hairline nobody can hit, so the
+ * `::before` extends the hit area a few pixels either side without moving the layout.
+ */
+.splitter {
+  position: relative;
+  background: transparent;
+  z-index: 5;
+}
+
+.splitter[data-axis="x"] {
+  cursor: col-resize;
+}
+
+.splitter[data-axis="y"] {
+  cursor: row-resize;
+  height: 4px;
+}
+
+.splitter::before {
+  content: "";
+  position: absolute;
+  /* Overhangs the 4px track by 3px on each side: an 10px target for a 4px divider. */
+  inset: 0 -3px;
+}
+
+.splitter[data-axis="y"]::before {
+  inset: -3px 0;
+}
+
+/* The line itself, drawn on hover and while dragging rather than always - a resting
+   workbench should not be criss-crossed with accent-coloured rules. */
+.splitter::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: transparent;
+  transition: background 110ms linear;
+}
+
+.splitter:hover::after,
+.splitter:focus-visible::after,
+.splitter[data-dragging="true"]::after {
+  background: var(--accent);
+}
+
+.splitter:focus-visible {
+  outline: none;
+}
+
+/*
+ * While a divider is being dragged, nothing anywhere is selectable.
+ *
+ * The pointer crosses the tree and the editor on its way, and without this the drag
+ * leaves a selection behind it that the user never asked for. Set on the body because the
+ * drag is not confined to the element that started it.
+ */
+body[data-resizing] {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body[data-resizing="x"] {
+  cursor: col-resize;
+}
+
+body[data-resizing="y"] {
+  cursor: row-resize;
+}
+
+/* ── Live preview: engine badge and output drawer ─────────────────────── */
+
+/*
+ * Which engine is running, and a click to change it.
+ *
+ * It reads as a label rather than a button until hovered, because it is information first
+ * and a control second - most users never need to switch, and the ones who do need to
+ * discover that they can.
+ */
+.preview-engine {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--border-hairline);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.preview-engine:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.preview-url[data-tone="pending"] {
+  font-family: var(--font-ui);
+  color: var(--text-tertiary);
+}
+
+/*
+ * The drawer takes its height from the frame rather than overlaying it. A dev server's
+ * output is read while looking at the page it produced, and a panel that covers the page
+ * makes the two impossible to compare.
+ */
+.preview-pane[data-log="shown"] {
+  grid-template-rows: 32px auto minmax(0, 1fr) 40%;
+}
+
+/*
+ * ── The undocked preview ────────────────────────────────────────────────────
+ *
+ * The same element as the docked column, positioned differently. Nothing is reparented,
+ * because moving an iframe in the DOM reloads its document - see `previewPane.ts` for why
+ * that ruled the implementation. So this is the whole of "undock": a position, a shadow,
+ * and a corner radius.
+ *
+ * `width` and `height` arrive as inline styles from the drag handlers and win over the
+ * `var(--preview-width)` above, which is why that declaration is left alone here.
+ */
+.preview-pane[data-placement="floating"] {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: auto;
+  bottom: auto;
+  /* Above the floating panels (32+), below the Vibe drawer and notifications. */
+  z-index: 40;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  /* The same lift as every other floating surface, and it already adapts to dark mode. */
+  box-shadow: var(--shadow-floating);
+  overflow: hidden;
+}
+
+/* The header becomes a drag handle, so it should not select text under the pointer. */
+.preview-pane[data-placement="floating"] .preview-bar {
+  cursor: grab;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.preview-pane[data-placement="floating"] .preview-bar:active {
+  cursor: grabbing;
+}
+
+/*
+ * Resize handles on every edge. `resize: both` is not an option: it does not work on a grid
+ * container holding an iframe, and it draws a grip that matches nothing else in the window.
+ */
+.preview-edge { position: absolute; z-index: 2; touch-action: none; }
+.preview-edge[data-edge="n"] { top: -3px; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.preview-edge[data-edge="s"] { bottom: -3px; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+.preview-edge[data-edge="e"] { right: -3px; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.preview-edge[data-edge="w"] { left: -3px; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+.preview-edge[data-edge="ne"] { top: -3px; right: -3px; width: 12px; height: 12px; cursor: nesw-resize; }
+.preview-edge[data-edge="sw"] { bottom: -3px; left: -3px; width: 12px; height: 12px; cursor: nesw-resize; }
+.preview-edge[data-edge="nw"] { top: -3px; left: -3px; width: 12px; height: 12px; cursor: nwse-resize; }
+.preview-edge[data-edge="se"] { bottom: -3px; right: -3px; width: 12px; height: 12px; cursor: nwse-resize; }
+.preview-pane[data-maximised="true"] .preview-edge { display: none; }
+.preview-pane[data-maximised="true"] .preview-bar { cursor: default; }
+
+/* A narrow window has no room to float: the preview becomes a full-window sheet. */
+@media (max-width: 819px) {
+  .preview-pane[data-placement="floating"]:not([hidden]) {
+    inset: 0;
+    width: auto !important;
+    height: auto !important;
+    transform: none !important;
+    border-radius: 0;
+  }
+  .preview-pane .preview-edge { display: none; }
+}
+
+.preview-output {
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-top: 1px solid var(--border-hairline);
+  background: var(--bg-app);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/*
+ * ── The live session button ─────────────────────────────────────────────────
+ *
+ * Its own states rather than reusing the run button's `live`, because they mean different
+ * things: the run button is live when a preview is serving on loopback, and this one is live
+ * when other people can read and change these files. Conflating them in CSS would be one
+ * rename away from the status bar telling a comfortable lie.
+ *
+ * Hosting is the accent colour, deliberately. It is the state where a port on this machine is
+ * reachable from the network, and the one thing the user must never be unaware of.
+ */
+#status-collab[data-state="hosting"] {
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+#status-collab[data-state="hosting"]:hover {
+  background: var(--accent);
+  filter: brightness(1.08);
+}
+
+/* Joined: in someone else's session, so nothing of ours is published. Present, not loud. */
+#status-collab[data-state="joined"] {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+#status-collab[data-state="connecting"] {
+  color: var(--text-tertiary);
+}
+
+/*
+ * ── The welcome screen ──────────────────────────────────────────────────────
+ *
+ * The placeholder this replaces was decorative, so `pointer-events: none` on the container was
+ * right: it sits `position: absolute; inset: 0` over the editor and stays in the DOM when
+ * hidden, so letting it take clicks would swallow every press aimed at the editor underneath -
+ * the exact "hidden overlay made the window unclickable" bug this repository has already
+ * shipped once and now has a smoke check for.
+ *
+ * The screen now has buttons, so it needs clicks. Both properties are therefore set on
+ * different elements: the container stays transparent to the pointer, only the card inside it
+ * accepts one, and `visibility: hidden` takes the whole thing out of hit-testing while it is
+ * faded out - so there is no state in which an invisible welcome screen can absorb a click.
+ */
+.editor-placeholder[data-visible="false"] {
+  opacity: 0;
+  visibility: hidden;
+  /* Visibility flips only after the fade, or the screen vanishes instead of fading. */
+  transition:
+    opacity var(--duration-exit) var(--ease-sheet),
+    visibility 0s linear var(--duration-exit);
+}
+
+.welcome-inner {
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 22px;
+  width: min(560px, 84%);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 24px 8px;
+  text-align: center;
+}
+
+.welcome-identity {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.welcome-mark {
+  margin-bottom: 8px;
+  line-height: 0;
+}
+
+.welcome-title {
+  margin: 0;
+  font-size: var(--text-2xl);
+  font-weight: 680;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.welcome-tagline {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* The thing people are asked for when reporting a bug, so it is legible rather than hidden. */
+.welcome-version {
+  margin: 2px 0 0;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Start ───────────────────────────────────────────────────────────────── */
+
+.welcome-start {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+
+.welcome-action {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+  transition: transform var(--duration-exit) var(--ease-sheet);
+}
+
+.welcome-action:hover {
+  background: var(--bg-hover);
+}
+
+.welcome-action:active {
+  transform: scale(0.99);
+}
+
+/* Opening a folder is what this editor is for, so it is the one that looks like the answer. */
+.welcome-action-primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.welcome-action-primary:hover {
+  background: var(--accent);
+  filter: brightness(1.06);
+}
+
+.welcome-action svg {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.welcome-action-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.welcome-action-text strong {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.welcome-action-text small {
+  font-size: var(--text-xs);
+  opacity: 0.75;
+}
+
+/* ── Recent ──────────────────────────────────────────────────────────────── */
+
+.welcome-recent {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  text-align: left;
+}
+
+.welcome-heading {
+  margin: 0 0 2px;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+}
+
+.welcome-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.welcome-recent-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 7px;
+}
+
+.welcome-recent-row:hover {
+  background: var(--bg-hover);
+}
+
+.welcome-recent-open {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.welcome-recent-name {
+  flex: none;
+  font-size: var(--text-sm);
+  font-weight: 560;
+}
+
+/* The containing directory, dimmed: two projects called `src` are told apart by where they are. */
+.welcome-recent-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  direction: rtl;
+  text-align: left;
+}
+
+/* Grid-centred and drawn as a path, like every other close button. See `icons.ts`. */
+.welcome-recent-forget {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  margin-right: 6px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  opacity: 0;
+}
+
+/* Revealed on hover or focus - focus included, or it is unreachable from the keyboard. */
+.welcome-recent-row:hover .welcome-recent-forget,
+.welcome-recent-forget:focus-visible {
+  opacity: 1;
+}
+
+.welcome-recent-forget:hover {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.welcome-recent-forget svg {
+  width: 9px;
+  height: 9px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+/* ── Account, on the welcome screen ─────────────────────────────────────── */
+
+/*
+ * One quiet row between the wordmark and the actions. §8.4 promises no wall on first
+ * launch, so this recommends and never blocks - it must not read as a step before Open
+ * Folder, which is why it carries no background of its own.
+ */
+.welcome-account {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: -6px 0 22px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.welcome-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--bg-active);
+}
+
+.welcome-account-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+
+/* ── The account button and its panel ───────────────────────────────────── */
+
+#account-photo {
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+/*
+ * Anchored to the button in fixed position rather than nested inside the title bar: the
+ * bar is a fixed-height flex row and a child tall enough to hold this would either be
+ * clipped or would stretch the bar.
+ */
+.account-panel {
+  position: fixed;
+  z-index: 60;
+  width: 268px;
+  display: grid;
+  gap: 8px;
+  padding: 14px 15px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-floating);
+  font-family: var(--font-ui);
+  -webkit-app-region: no-drag;
+}
+
+.account-panel-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.account-panel-body {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.account-panel-actions {
+  display: grid;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.account-provider {
+  padding: 8px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: 520;
+  cursor: pointer;
+}
+
+.account-provider:hover {
+  background: var(--bg-hover);
+}
+
+.account-provider:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/*
+ * The GitHub device code.
+ *
+ * Large and monospaced because it is about to be typed into another window, from memory,
+ * in the second or two it takes to switch to the browser. A sentence containing the code
+ * is not the same thing as showing the code.
+ */
+.account-device-code {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+
+.account-device-code-value {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  color: var(--text-primary);
+  user-select: all;
+}
+
+.account-device-code-copy {
+  padding: 5px 10px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-base);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.account-device-code-copy:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.account-device-code-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  word-break: break-all;
+}
+
+/* Escape hatches. Quieter than the provider buttons - neither is the thing you came for. */
+.account-cancel,
+.account-signout {
+  padding: 7px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.account-cancel:hover,
+.account-signout:hover {
+  border-color: var(--border-hairline);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.account-signout:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.account-panel-foot {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+/*
+ * The recommended way out of a refused link.
+ *
+ * Filled with the accent rather than sharing `.account-provider`'s neutral chrome: when
+ * it is showing, it sits directly above the two buttons whose attempt just failed, and a
+ * third identical button is read as a third identical option rather than as the answer.
+ */
+.account-signin-instead {
+  margin-bottom: 2px;
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.account-signin-instead:hover {
+  /* The accent is already the loudest thing in the panel; lifting it further reads as a
+     different colour rather than a hover. Dimming keeps it recognisably the same button. */
+  background: color-mix(in srgb, var(--accent) 88%, var(--bg-elevated));
+}

@@ -1,0 +1,443 @@
+/*
+ * The in-window menu bar and the terminal panel's tab strip.
+ *
+ * Both exist because the shell owns its chrome (§3): a hidden title bar leaves no room
+ * for a native menu, and one terminal per window is not a terminal people can work in.
+ */
+
+/* ── Menu bar ─────────────────────────────────────────────────────────── */
+
+/*
+ * An in-flow flex item, not an overlay.
+ *
+ * Overlaying it on the drag region and relying on `no-drag` to carve a hole did not
+ * survive contact with a real mouse - see the note on `.titlebar-drag`. Sitting beside
+ * the drag region instead of on top of it means there is no hole to carve.
+ */
+.menubar-slot {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: 100%;
+  padding-left: 8px;
+  /* Still declared: it keeps the buttons clickable if the bar is ever nested inside a
+     draggable ancestor again, and costs nothing when nothing overlaps. */
+  -webkit-app-region: no-drag;
+}
+
+.menubar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  height: 100%;
+}
+
+.menubar-item {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  padding: 4px 9px;
+  cursor: default;
+  white-space: nowrap;
+}
+
+.menubar-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.menubar-item[aria-expanded="true"] {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+.menu-panel {
+  position: absolute;
+  top: 32px;
+  min-width: 260px;
+  max-height: 78vh;
+  overflow-y: auto;
+  padding: 5px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-floating);
+  z-index: 120;
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  text-align: left;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: default;
+}
+
+/*
+ * Mnemonic underlines.
+ *
+ * Drawn only once the bar has been reached from the keyboard, which is the only time they
+ * mean anything - the bar sets `data-mnemonics` when Alt focuses it and clears it on the
+ * next pointer press. Windows has drawn them this way for thirty years, and a permanently
+ * underlined letter in every label reads as damage rather than as an affordance.
+ */
+.menubar u {
+  text-decoration: none;
+}
+
+.menubar[data-mnemonics="true"] u {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* The arrow on a row that opens a submenu. */
+.menu-item-chevron {
+  color: var(--text-tertiary);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.menu-item:hover .menu-item-chevron,
+.menu-item:focus .menu-item-chevron {
+  color: color-mix(in srgb, var(--text-on-accent) 80%, transparent);
+}
+
+/*
+ * Where a recent folder lives, in the slot an accelerator would use.
+ *
+ * Already shortened in script - see `pathLabel.ts` - because the end of the parent path
+ * is what tells two folders of the same name apart, and `text-overflow` can only trim the
+ * end. The `max-width` here is a backstop for a single enormous segment.
+ */
+.menu-item-detail {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  min-width: 0;
+  max-width: 30ch;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.menu-item:hover .menu-item-detail,
+.menu-item:focus .menu-item-detail {
+  color: color-mix(in srgb, var(--text-on-accent) 75%, transparent);
+}
+
+/*
+ * The right-click menu shares this panel rather than restyling a second one.
+ *
+ * `fixed` because it is anchored to the pointer, not to a bar: the tree scrolls, and an
+ * absolutely positioned panel would ride along with it while the row it describes moved
+ * out from under it.
+ */
+.menu-panel[data-context="true"] {
+  position: fixed;
+  top: 0;
+  left: 0;
+  min-width: 210px;
+}
+
+.menu-item:disabled {
+  color: var(--text-tertiary);
+  cursor: default;
+}
+
+.menu-item:disabled:hover {
+  background: transparent;
+}
+
+.menu-item[data-danger="true"] {
+  color: var(--danger);
+}
+
+/* Still white on the accent fill: a red-on-blue row is unreadable in both themes. */
+.menu-item[data-danger="true"]:hover,
+.menu-item[data-danger="true"]:focus {
+  background: var(--danger);
+  color: #fff;
+}
+
+/*
+ * `--text-on-accent`, not white.
+ *
+ * White was right while every theme had a blue accent. The Midnight theme's accent is
+ * near-white, which made this white text on a white row - the menu was still there and
+ * completely unreadable. The token exists precisely so the pairing survives a palette it
+ * was not written for.
+ */
+.menu-item:hover,
+.menu-item:focus {
+  background: var(--accent);
+  color: var(--text-on-accent);
+  outline: none;
+}
+
+.menu-item:hover .menu-item-accelerator,
+.menu-item:focus .menu-item-accelerator {
+  color: var(--text-on-accent);
+  opacity: 0.8;
+}
+
+.menu-item-label {
+  flex: 1;
+  white-space: nowrap;
+}
+
+.menu-item-accelerator {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.menu-heading {
+  padding: 6px 10px 3px;
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+}
+
+.menu-separator {
+  height: 1px;
+  margin: 5px 8px;
+  background: var(--border-hairline);
+}
+
+/* ── Terminal tabs ────────────────────────────────────────────────────── */
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 22px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  flex: none;
+}
+
+.icon-button:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.icon-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/*
+ * The list of open terminals, down the right-hand side.
+ *
+ * A fixed width rather than one that follows the longest shell name: a rail that changes
+ * width when you open `powershell` after `cmd` moves every terminal underneath it, and
+ * xterm has to re-fit each time. The names ellipsize instead.
+ */
+.terminal-tabs {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  width: 150px;
+  padding: 4px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  border-left: 1px solid var(--border-hairline);
+}
+
+.terminal-tabs[hidden] {
+  display: none;
+}
+
+.terminal-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.terminal-tab {
+  display: flex;
+  align-items: center;
+  /* The name takes the room, the close button keeps its size at the end. */
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  padding: 4px 6px 4px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+  text-align: left;
+}
+
+/* Long shell names ellipsize rather than widening the rail. */
+.terminal-tab > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.terminal-tab:hover {
+  background: var(--bg-hover);
+}
+
+.terminal-tab[aria-selected="true"] {
+  background: var(--bg-active);
+  color: var(--text-primary);
+}
+
+/* Grid-centred and drawn as a path, for the reason given in `workbench/icons.ts`. */
+.terminal-tab-close {
+  display: grid;
+  place-items: center;
+  flex: none;
+  border: 0;
+  background: transparent;
+  color: var(--text-tertiary);
+  border-radius: 4px;
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+}
+
+.terminal-tab-close svg {
+  width: 8px;
+  height: 8px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+}
+
+.terminal-tab-close:hover {
+  background: var(--bg-selected);
+  color: var(--text-primary);
+}
+
+.terminal-surface {
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.terminal-tab-body {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  gap: 1px;
+  padding: 6px 8px;
+}
+
+/* Split panes divide the width evenly, with a hairline between them. */
+.terminal-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.terminal-tab-body[data-panes]:not([data-panes="1"]) .terminal-pane + .terminal-pane {
+  border-left: 1px solid var(--border-hairline);
+  padding-left: 8px;
+}
+
+@container (max-width: 520px) {
+  .terminal-tabs {
+    flex-direction: row;
+    width: auto;
+    max-width: none;
+    border-top: 1px solid var(--border-hairline);
+    border-left: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .terminal-tab {
+    min-width: 120px;
+  }
+
+  .terminal-tab-body {
+    flex-direction: column;
+  }
+
+  .terminal-tab-body[data-panes]:not([data-panes="1"]) .terminal-pane + .terminal-pane {
+    border-top: 1px solid var(--border-hairline);
+    border-left: 0;
+    padding-top: 6px;
+    padding-left: 0;
+  }
+}
+
+/* ── File icons ───────────────────────────────────────────────────────── */
+
+.file-icon {
+  width: 17px;
+  height: 17px;
+  flex: none;
+}
+
+/* In tabs the icon sits between the dirty dot and the label. */
+.tab .file-icon {
+  width: 15px;
+  height: 15px;
+}
+
+.quickopen-row .file-icon,
+.search-group-title .file-icon {
+  vertical-align: -3px;
+  margin-right: 6px;
+}
+
+/* ── Command palette rows ─────────────────────────────────────────────── */
+
+.palette-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-family: var(--font-ui);
+}
+
+.palette-row > span:first-child {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.palette-id {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.quickopen-row[aria-selected="true"] .palette-id {
+  color: var(--text-secondary);
+}
+
+/* The sidebar can be collapsed from the View menu. */
+.workbench[data-sidebar="hidden"] {
+  grid-template-columns: 48px 0 1fr;
+}

@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ADCode</title>
+  </head>
+  <body>
+    <!--
+      Left to right: the menus, then the command centre floating between two drag regions.
+      The spacers are siblings of the centre rather than a single drag region
+      underneath it, for the reason spelled out on `.titlebar-drag` - a draggable rect over
+      a control is resolved by the OS before the renderer ever sees the press.
+    -->
+    <div id="titlebar" class="titlebar">
+      <div class="menubar-slot" id="menubar-slot"></div>
+      <div class="titlebar-drag"></div>
+      <div class="command-centre-slot" id="command-centre-slot"></div>
+      <button class="titlebar-action" id="report-toggle" type="button" title="Send feedback" aria-label="Send feedback">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 12.2a7.7 7.7 0 0 1-8.5 7.6 9 9 0 0 1-2.2-.35L4.6 21.1l1.5-4.1A7.5 7.5 0 0 1 3.5 11.6 7.7 7.7 0 0 1 12 4a7.7 7.7 0 0 1 8.5 8.2z"/><path d="M8.6 10.2h6.8M8.6 13.6h4.2"/></svg>
+      </button>
+      <!--
+        The account, immediately after feedback.
+
+        Two shapes in one button: a bust-and-shoulders outline while anonymous, replaced
+        by the provider's photo once linked. The photo is an <img> that starts hidden, so a
+        CDN that fails leaves the outline rather than a broken image.
+      -->
+      <button class="titlebar-action" id="account-toggle" type="button" title="Sign in" aria-label="Sign in" aria-haspopup="dialog" aria-expanded="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true" id="account-glyph"><circle cx="12" cy="8.4" r="3.9"/><path d="M4.8 20.2a7.2 7.2 0 0 1 14.4 0"/></svg>
+        <img id="account-photo" alt="" hidden />
+      </button>
+      <div class="titlebar-drag"></div>
+    </div>
+
+    <div id="workbench" class="workbench">
+      <aside class="activitybar" id="activitybar">
+        <button class="activity" data-view="explorer" data-sidebar-view="explorer" title="Explorer" aria-label="Explorer" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h3.4c.5 0 1 .2 1.4.6l1.1 1.1c.2.2.4.3.7.3h6.4A2.5 2.5 0 0 1 21 8.5v9A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z"/></svg>
+        </button>
+        <button class="activity" data-view="search" data-sidebar-view="search" title="Search (Ctrl+Shift+F)" aria-label="Search" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+        </button>
+        <!--
+          Structure, directly under Search.
+
+          No `data-view`, like the earnings button below and for the same reason: this one
+          opens a popup rather than swapping the sidebar. The activity-bar router admits
+          only Explorer and Search to structural sidebar state, so launching this popup
+          cannot leave Explorer looking unselected while it is still on screen.
+
+          It sits here, beside the other two things you do to the file you are in, rather
+          than down with earnings. The icon is a bracket tree: three rows each joined to the
+          spine on their left, which is what the popup itself draws.
+        -->
+        <button class="activity" id="open-structure" data-sidebar-view="structure" title="Structure (Ctrl+Shift+U)" aria-label="Structure" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4v14.5M5 8h5M5 13h5M5 18h5"/><circle cx="12.5" cy="8" r="1.6"/><circle cx="12.5" cy="13" r="1.6"/><circle cx="12.5" cy="18" r="1.6"/><path d="M15 8h4M15 13h4M15 18h4"/></svg>
+        </button>
+        <button class="activity" data-view="scm" data-sidebar-view="scm" title="Source control (Ctrl+Shift+G)" aria-label="Source control" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="6" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="12" r="2.5"/><path d="M7 8.5v7M9.5 6h3a2 2 0 0 1 2 2v2"/></svg>
+          <span class="activity-badge" id="git-badge" data-tone="changes" aria-hidden="true" hidden></span>
+        </button>
+        <!--
+          The badge is this feature's whole discoverability answer: it is visible without
+          the user knowing what the icon means, and it is the only thing in the activity
+          bar that ever changes on its own.
+        -->
+        <button class="activity" data-view="problems" title="Problems (Ctrl+Shift+M)" aria-label="Problems" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4.5l8 14.5H4z"/><path d="M12 10v4M12 16.6v.4"/></svg>
+          <span class="activity-badge" id="problems-badge" hidden></span>
+        </button>
+        <!--
+          Earnings, directly under Problems.
+
+          No `data-view`, unlike every button above it, and that is deliberate rather than an
+          omission: this one opens a popover instead of swapping the sidebar. The structural
+          router ignores its popup id, keeping the Explorer or Search selection unchanged.
+        -->
+        <button class="activity" id="open-earnings" data-sidebar-view="earnings" title="Earnings" aria-label="Earnings" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <!--
+            A dollar sign, drawn rather than typed.
+
+            The obvious implementation is the character "$", and it is wrong here for the same
+            reason "×" was wrong on the close buttons: a glyph is positioned by font metrics, so
+            it sits on a baseline and cannot be centred in a square button by any amount of CSS.
+            This path has 180° rotational symmetry about (12, 12), so it is centred by
+            construction - see `workbench/icons.ts` for the full reasoning.
+          -->
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 9.1C15.5 7.5 13.9 6.5 12 6.5S8.5 7.5 8.5 9.1c0 1.8 1.8 2.4 3.5 2.9s3.5 1.1 3.5 2.9c0 1.6-1.6 2.6-3.5 2.6s-3.5-1-3.5-2.6"/><path d="M12 4.5v15"/></svg>
+        </button>
+        <!--
+          All Features opens a library popup and therefore deliberately has no `data-view`:
+          the Explorer or Search sidebar stays exactly where it was. Four drawn cells read
+          as a library of capabilities without depending on a font.
+        -->
+        <button class="activity" id="open-features" data-sidebar-view="features" type="button" title="All Features" aria-label="All Features" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="4.5" y="4.5" width="6" height="6" rx="1.2"/>
+            <rect x="13.5" y="4.5" width="6" height="6" rx="1.2"/>
+            <rect x="4.5" y="13.5" width="6" height="6" rx="1.2"/>
+            <rect x="13.5" y="13.5" width="6" height="6" rx="1.2"/>
+          </svg>
+        </button>
+        <!-- The Assistant is a primary workspace tool, beside the other primary tools. -->
+        <button class="activity" id="ai-toggle" type="button" title="AI Assistant (Ctrl+I)" aria-label="AI Assistant" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3.25 13.8 8.2 18.75 10 13.8 11.8 12 16.75 10.2 11.8 5.25 10 10.2 8.2Z"/>
+            <path d="m18.25 14.75.75 2.05 2.05.75-2.05.75-.75 2.05-.75-2.05-2.05-.75 2.05-.75Z"/>
+          </svg>
+        </button>
+        <button class="activity activity-bottom" id="open-settings" data-sidebar-view="settings" title="Settings (Ctrl+,)" aria-label="Settings" aria-haspopup="dialog" aria-pressed="false" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.34 5.3L10.67 2.8L13.33 2.8L13.66 5.3A6.9 6.9 0 0 1 16.2 6.53L18.37 5.22L20.03 7.3L18.27 9.12A6.9 6.9 0 0 1 18.9 11.88L21.27 12.75L20.68 15.35L18.16 15.1A6.9 6.9 0 0 1 16.4 17.32L17.19 19.72L14.79 20.87L13.41 18.75A6.9 6.9 0 0 1 10.59 18.75L9.21 20.87L6.81 19.72L7.6 17.32A6.9 6.9 0 0 1 5.84 15.1L3.32 15.35L2.73 12.75L5.1 11.88A6.9 6.9 0 0 1 5.73 9.12L3.97 7.3L5.63 5.22L7.8 6.53A6.9 6.9 0 0 1 10.34 5.3Z"/><circle cx="12" cy="12" r="3.1"/></svg>
+        </button>
+      </aside>
+
+      <aside class="sidebar" id="sidebar" aria-labelledby="sidebar-title">
+        <header class="sidebar-header">
+          <span class="sidebar-focus-ribbon" aria-hidden="true"></span>
+          <div class="sidebar-heading">
+            <span class="sidebar-title" id="sidebar-title">Explorer</span>
+            <span class="sidebar-subtitle" id="sidebar-subtitle">No folder opened</span>
+          </div>
+          <!--
+            The folder's name on the left, everything that acts on it grouped on the right.
+
+            Grouped rather than spread. The header used to be four flex children under
+            `space-between`, which distributes the *free* space between them - so the wider
+            the sidebar got, the further the three controls drifted apart, until they read
+            as three unrelated things rather than one set of actions. In a group they stay
+            together at the right edge whatever the sidebar is doing, and the name gets all
+            the room that is left.
+
+            New file and new folder first: the tree's own row actions create *inside a
+            folder row*, so creating something at the top level meant finding a row to hover
+            first. These act on the folder named beside them, and are disabled with none
+            open, because there is nowhere to put a file.
+          -->
+          <div class="sidebar-actions" id="sidebar-actions-explorer">
+            <button class="tree-action" id="new-root-file" type="button" title="New File" aria-label="New File" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9 1.75H4.5a1.25 1.25 0 0 0-1.25 1.25v10a1.25 1.25 0 0 0 1.25 1.25h7a1.25 1.25 0 0 0 1.25-1.25V5.5z"/><path d="M9 1.75V5.5h3.75"/><path d="M8 8v3.5M6.25 9.75h3.5"/></svg>
+            </button>
+            <button class="tree-action" id="new-root-folder" type="button" title="New Folder" aria-label="New Folder" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 4.25A1.5 1.5 0 0 1 3.25 2.75h2.1c.3 0 .6.12.83.34l.72.72c.22.22.52.34.83.34h4.02a1.5 1.5 0 0 1 1.5 1.5v6.1a1.5 1.5 0 0 1-1.5 1.5H3.25a1.5 1.5 0 0 1-1.5-1.5z"/><path d="M8 7.25v3.5M6.25 9h3.5"/></svg>
+            </button>
+            <button class="ghost-button" id="open-folder">Open</button>
+          </div>
+          <button class="icon-button sidebar-close" id="sidebar-close" type="button" title="Close side bar" aria-label="Close side bar">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+          </button>
+        </header>
+        <div class="sidebar-content" id="sidebar-content">
+          <nav class="filetree sidebar-view" id="filetree" data-sidebar-view="explorer" aria-label="Files">
+            <p class="empty-hint">Open a folder to get started.</p>
+          </nav>
+          <div class="sidebar-view" id="view-search" data-sidebar-view="search" hidden></div>
+        </div>
+      </aside>
+
+      <div class="splitter" id="splitter-sidebar"></div>
+
+      <main class="main">
+        <div class="tabs" id="tabs" role="tablist"></div>
+
+        <section class="editor-area" id="editor-area">
+          <div class="editor-host" id="editor-host"></div>
+          <!--
+            The welcome screen. Built by `workbench/welcomeView.ts`, which replaces whatever is
+            here - so this element is left empty rather than duplicating the markup in two
+            places where only one of them would get updated.
+          -->
+          <div class="editor-placeholder" id="editor-placeholder"></div>
+        </section>
+
+        <div class="splitter" id="splitter-panel" hidden></div>
+
+        <!--
+          The bottom panel: five surfaces behind one strip of tabs.
+
+          The tab buttons are built by `panels/bottomPanel.ts` rather than written here,
+          because that module owns which one is showing and a hand-written strip would be a
+          second, disagreeing source of that truth. What is here is the per-tab header
+          controls: exactly one `.panel-tab-actions` group is visible at a time.
+        -->
+        <section class="panel" id="panel" hidden>
+          <header class="panel-header">
+            <div class="panel-tabs" id="panel-tabs" role="tablist" aria-label="Panel"></div>
+            <span class="panel-spacer"></span>
+
+            <div class="panel-tab-actions" id="actions-terminal">
+              <!--
+                The shell's name. With one terminal the tab strip hides itself, so this is
+                the only thing left that says whether it is cmd or Git Bash.
+              -->
+              <span class="panel-title" id="panel-title">Terminal</span>
+              <!-- Split button: the plus opens the current default shell, the chevron picks one. -->
+              <div class="split-button">
+                <button class="icon-button" id="terminal-new" title="New terminal (Ctrl+Shift+`)" aria-label="New terminal">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3.5v9M3.5 8h9"/></svg>
+                </button>
+                <button class="icon-button icon-button-chevron" id="terminal-profiles" title="New terminal with profile" aria-label="New terminal with profile" aria-haspopup="menu" aria-expanded="false">
+                  <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 6.5L8 10l3.5-3.5"/></svg>
+                </button>
+              </div>
+              <button class="icon-button" id="terminal-split" title="Split terminal (Ctrl+Shift+5)" aria-label="Split terminal">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3h11v10h-11z M8 3v10"/></svg>
+              </button>
+              <button class="icon-button" id="terminal-kill" title="Kill terminal" aria-label="Kill terminal">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 6.5v5M8 6.5v5M10.5 6.5v5M3 4h10M6 4V2.5h4V4M4.5 4l.6 9.5h5.8L11.5 4"/></svg>
+              </button>
+            </div>
+
+            <div class="panel-tab-actions" id="actions-ports" hidden>
+              <button class="ghost-button" id="ports-refresh">Refresh</button>
+            </div>
+
+            <button class="icon-button panel-maximize" id="panel-maximize" title="Maximize panel" aria-label="Maximize panel" aria-pressed="false">
+              <svg class="panel-maximize-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6V3.5H6M10 3.5h2.5V6M12.5 10v2.5H10M6 12.5H3.5V10"/></svg>
+              <svg class="panel-restore-icon" viewBox="0 0 16 16" aria-hidden="true" hidden><path d="M6 3.5v2.25H3.75M10 3.5v2.25h2.25M6 12.5v-2.25H3.75M10 12.5v-2.25h2.25"/></svg>
+            </button>
+            <button class="icon-button" id="panel-close" title="Close panel (Ctrl+J)" aria-label="Close panel">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+            </button>
+          </header>
+
+          <!--
+            Every body stays mounted while hidden. Removing one would throw away terminal
+            scrollback, the Output view's scroll position, and the debug console's history
+            every time somebody glanced at another tab.
+          -->
+          <div class="panel-bodies" id="panel-bodies">
+            <div class="panel-body panel-body-terminal" id="panel-body-terminal">
+              <div class="terminal-surface" id="terminal-surface"></div>
+              <!--
+                The open terminals, as a column beside them rather than a strip above.
+
+                It was in the panel header until the header also had to hold the five panel
+                tabs. Two horizontal scrolling tab strips cannot share one 32px row: the
+                terminal list grows with every shell you open and squeezes the panel tabs,
+                which is a layout that gets worse the more you use it. A column grows
+                downwards, where there is room, and stops competing.
+              -->
+              <div class="terminal-tabs" id="terminal-tabs" role="tablist" aria-orientation="vertical" aria-label="Open terminals" hidden></div>
+            </div>
+            <div class="panel-body" id="panel-body-problems" hidden></div>
+            <div class="panel-body" id="panel-body-output" hidden></div>
+            <div class="panel-body" id="panel-body-debug" hidden></div>
+            <div class="panel-body" id="panel-body-ports" hidden></div>
+          </div>
+        </section>
+      </main>
+
+      <button class="sidebar-scrim" id="sidebar-scrim" type="button" aria-label="Close side bar" tabindex="-1" hidden></button>
+    </div>
+    <div id="popup-primary-host"></div>
+    <div id="popup-dependent-host"></div>
+
+    <footer class="statusbar" id="statusbar">
+      <!--
+        Where you are, and what you are running it in.
+
+        The full path rather than the folder name: two checkouts of one project is the
+        normal state of affairs, and this is the only corner with room to say which of
+        them this window has open. The version sits after it because it answers a
+        different question - one asked far less often, and never urgently.
+      -->
+      <span class="status-item status-path" id="status-workspace">No folder</span>
+      <span class="status-item status-version" id="status-version"></span>
+      <!--
+        The update, when there is one: "Updating 42%" while it downloads, then "Restart to
+        update" - a button, because restarting into it is the one useful thing to do from
+        here. Hidden the rest of the time; being up to date is not news.
+      -->
+      <button class="status-item status-update" id="status-update" type="button" hidden></button>
+      <!--
+        Who this window's earnings belong to.
+
+        After the version because it answers the same *kind* of question - what is this
+        build, whose is it - and because a machine that has never signed in shows nothing
+        here at all rather than an empty slot with a gap around it. It is a button: the one
+        useful thing to do from here is open the account panel that put the address there.
+      -->
+      <button class="status-item status-account" id="status-account" type="button" hidden aria-haspopup="dialog"></button>
+      <span class="status-spacer"></span>
+      <span class="status-item" id="status-position">Ln 1, Col 1</span>
+      <span class="status-item" id="status-language"></span>
+      <span class="status-item" id="status-earnings"></span>
+      <!--
+        The live session control.
+
+        A button rather than a label, because it is how a session is started as well as how it
+        is inspected. It sits in the status bar next to the other things that describe the
+        current state of the window, and it is the only one of them that reports something
+        reaching outside this machine - so when a session is running it says so in words rather
+        than with an icon alone.
+      -->
+      <button class="status-action" id="status-collab" type="button" title="Live session" aria-label="Live session" aria-haspopup="dialog" aria-expanded="false">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="5.5" cy="6" r="2"/><circle cx="11" cy="6" r="1.6"/><path d="M2 13c0-2 1.6-3.2 3.5-3.2S9 11 9 13M9.6 9.9c1.6.1 2.9 1.2 2.9 3.1"/></svg>
+        <span id="status-collab-label">Share</span>
+      </button>
+      <span class="status-item" id="status-dirty"></span>
+      <!--
+        Last, so it sits in the bottom-right corner where Live Server has trained everyone
+        to look for it. The button is built in `run/runButton.ts` and mounted here.
+      -->
+      <span class="status-slot" id="status-run-slot"></span>
+    </footer>
+
+    <div class="toast-layer" id="toast-layer" aria-live="polite"></div>
+
+    
+
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>

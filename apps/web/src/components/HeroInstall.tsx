@@ -1,0 +1,282 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useState } from "react";
+import { detectPlatform, installCommand, installRoute, LINUX_DOWNLOADS, MICROSOFT_STORE, type Platform } from "@/lib/platform";
+import { installLinkFor, SEND_SUBJECT, SEND_TEXT, sendInstallLink } from "@/lib/sendToDesktop";
+import { GITHUB_REPO, SITE } from "@/lib/site";
+import { trackWebsiteEvent } from "@/lib/websiteAnalytics";
+import { inviteLine } from "@/lib/invite";
+
+/**
+ * Puts the invite on the clipboard as the download starts, where the editor's welcome
+ * looks for it. Fire and forget: a blocked clipboard must never block the download, and
+ * the page shows the code to paste either way.
+ */
+function carryInvite(invite: string | undefined): void {
+  if (invite === undefined) return;
+  try {
+    void navigator.clipboard?.writeText(inviteLine(invite)).catch(() => undefined);
+  } catch {
+    // No clipboard API: the code on the page is the fallback.
+  }
+}
+
+/**
+ * The one thing the page asks a visitor to do, chosen for the machine they are on.
+ *
+ * - **Windows** gets one button: the Microsoft Store's web installer. The Store package is
+ *   signed by Microsoft, so the download raises no SmartScreen dialog, and the Store keeps
+ *   Agentfly updated. After the click the button turns into the three steps that remain,
+ *   because a download that finished in a tray nobody looked at is where installs are lost.
+ * - **Linux** gets the .deb and the AppImage as direct downloads.
+ * - **Phones** - most of the visitors a post brings - cannot run a desktop editor, so they
+ *   get a way to send the link to their computer instead of a page of commands.
+ * - **macOS** gets the truth: notarisation is pending.
+ *
+ * The terminal command is still one click away on Windows and Linux for people who prefer
+ * it. Before hydration it renders the neutral choice, so first paint is honest and only
+ * gets more specific once JavaScript runs.
+ */
+export function HeroInstall({ source = "hero", advertise = true, tour, invite }: { source?: string; advertise?: boolean; tour?: string; invite?: string }) {
+  const [platform, setPlatform] = useState<Platform>("unknown");
+  useEffect(() => setPlatform(detectPlatform(navigator.userAgent, navigator.maxTouchPoints)), []);
+
+  const route = installRoute(platform);
+  const trackAdvertise = (): void => trackWebsiteEvent("advertise_click", 0, undefined, source);
+  /*
+   * With a tour, the button beside the install is "See how it works" and advertising gets
+   * its own pill under the buttons. The hero used to put "Advertise to developers" there: 30
+   * days of home-page visits (to 2026-10-07) produced 11 advertiser clicks against 7 install
+   * clicks, from a page whose job is to install the editor, and a median visit of under five
+   * seconds has no time to choose between two audiences beside one button.
+   *
+   * It then shrank to a line of small print, and advertisers said they could not find it.
+   * So it is a real control again, but a different kind: Download stays the one filled
+   * button, and the advertiser pill is labelled for its audience and drawn in the money
+   * colour, so each reader sees which one is theirs.
+   */
+  const secondary = tour !== undefined ? (
+    <a href={tour} className="marketplace-secondary">See how it works</a>
+  ) : advertise ? (
+    <a href="/#advertise" className="marketplace-secondary" data-tracked onClick={trackAdvertise}>
+      Advertise to developers <span aria-hidden="true">↘</span>
+    </a>
+  ) : null;
+  const advertiseNote = advertise && tour !== undefined ? <AdvertisePill onClick={trackAdvertise} /> : null;
+
+  if (route === "store") return <WindowsInstall source={source} secondary={secondary} advertiseNote={advertiseNote} invite={invite} />;
+  if (route === "download") return <LinuxInstall source={source} secondary={secondary} advertiseNote={advertiseNote} invite={invite} />;
+  if (route === "send") return <SendToDesktop source={source} advertise={advertise} invite={invite} />;
+
+  if (route === "soon") {
+    return (
+      <div className="hero-install">
+        <div className="marketplace-hero-actions">
+          <Link href="/versions" className="marketplace-primary is-soon">Agentfly for macOS is coming soon</Link>
+          {secondary}
+        </div>
+        <p className="hero-install-note">
+          macOS builds are waiting on Apple notarisation. Agentfly installs on Windows and Linux
+          today. See <Link href="/versions">every install option</Link>.
+        </p>
+        {advertiseNote}
+      </div>
+    );
+  }
+
+  return (
+    <div className="hero-install">
+      <div className="marketplace-hero-actions">
+        <Link href="/versions" className="marketplace-primary install-cta">
+          Download Agentfly <span aria-hidden="true">↓</span>
+        </Link>
+        {secondary}
+      </div>
+      {advertiseNote}
+    </div>
+  );
+}
+
+/** The advertiser's way in: one link, labelled for its audience, with the price on it. */
+function AdvertisePill({ onClick }: { onClick: () => void }) {
+  return (
+    <a href="/#advertise" className="hero-advertise" data-tracked onClick={onClick}>
+      <span className="hero-advertise-label">For advertisers</span>
+      <span className="hero-advertise-text">Reach developers while they build</span>
+      <span className="hero-advertise-cta">Start a campaign from $1 <span aria-hidden="true">→</span></span>
+    </a>
+  );
+}
+
+function WindowsLogo() {
+  return (
+    <svg className="install-cta-logo" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M0 2.2 6.5 1.3v6.2H0zM7.3 1.2 16 0v7.5H7.3zM0 8.3h6.5v6.3L0 13.7zM7.3 8.3H16V16l-8.7-1.2z" fill="currentColor" />
+    </svg>
+  );
+}
+
+function WindowsInstall({ source, secondary, advertiseNote, invite }: { source: string; secondary: React.ReactNode; advertiseNote: React.ReactNode; invite: string | undefined }) {
+  const [started, setStarted] = useState(false);
+  const [terminal, setTerminal] = useState(false);
+
+  return (
+    <div className="hero-install" data-started={started}>
+      <div className="marketplace-hero-actions">
+        <a
+          href={MICROSOFT_STORE.installerUrl(source)}
+          className="marketplace-primary install-cta"
+          data-tracked
+          onClick={() => {
+            carryInvite(invite);
+            trackWebsiteEvent("download_click", 0, undefined, source);
+            setStarted(true);
+          }}
+        >
+          <WindowsLogo />
+          <span className="install-cta-label">
+            Download for Windows
+            <small>Free · Microsoft Store</small>
+          </span>
+        </a>
+        {secondary}
+      </div>
+
+      {started ? (
+        <ol className="install-next" aria-live="polite">
+          <li><span><strong>Open the installer</strong> from your browser&apos;s downloads.</span></li>
+          <li><span><strong>Click Install.</strong> The Microsoft Store downloads Agentfly and keeps it updated.</span></li>
+          <li><span><strong>Agentfly opens.</strong> Open a folder and build. You earn from the first sponsored card, no account needed.</span></li>
+          <li className="install-next-fallback">
+            Download didn&apos;t start? <a href={MICROSOFT_STORE.appUrl}>Open Agentfly in the Microsoft Store app</a> or <a href={MICROSOFT_STORE.pageUrl} target="_blank" rel="noreferrer">the Store website</a>.
+          </li>
+        </ol>
+      ) : (
+        <p className="hero-install-note">
+          Signed by Microsoft, so Windows installs it without a warning. Windows 10 and 11.{" "}
+          <button type="button" className="install-link-button" aria-expanded={terminal} onClick={() => setTerminal((open) => !open)}>
+            {terminal ? "Hide the terminal command" : "Prefer a terminal?"}
+          </button>
+        </p>
+      )}
+
+      {terminal && !started && <TerminalCommand platform="windows" source={source} />}
+      {advertiseNote}
+    </div>
+  );
+}
+
+function LinuxInstall({ source, secondary, advertiseNote, invite }: { source: string; secondary: React.ReactNode; advertiseNote: React.ReactNode; invite: string | undefined }) {
+  const [terminal, setTerminal] = useState(false);
+  const downloads = LINUX_DOWNLOADS(GITHUB_REPO);
+  return (
+    <div className="hero-install">
+      <div className="marketplace-hero-actions">
+        <a href={downloads.deb} className="marketplace-primary install-cta" data-tracked onClick={() => { carryInvite(invite); trackWebsiteEvent("download_click", 0, undefined, source); }}>
+          <span className="install-cta-label">
+            Download for Ubuntu / Debian
+            <small>Free · .deb · x86_64</small>
+          </span>
+        </a>
+        {secondary}
+      </div>
+      <p className="hero-install-note">
+        Another distribution? <a href={downloads.appImage} data-tracked onClick={() => { carryInvite(invite); trackWebsiteEvent("download_click", 0, undefined, source); }}>Download the AppImage</a>.{" "}
+        <button type="button" className="install-link-button" aria-expanded={terminal} onClick={() => setTerminal((open) => !open)}>
+          {terminal ? "Hide the terminal command" : "Prefer a terminal?"}
+        </button>
+      </p>
+      {terminal && <TerminalCommand platform="linux" source={source} />}
+      {advertiseNote}
+    </div>
+  );
+}
+
+/**
+ * A phone cannot install a desktop editor, so it gets a way to send the link to the
+ * reader's computer - share sheet or clipboard (sendToDesktop.ts), or email.
+ *
+ * Counted when it worked - the sheet was used or the link copied - not when the button was
+ * pressed, so a dismissed sheet or a blocked clipboard is not a sent link. The email link
+ * counts on the click: whether the message went is the mail app's to know.
+ */
+function SendToDesktop({ source, advertise, invite }: { source: string; advertise: boolean; invite: string | undefined }) {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  // An invite has to survive the hop from phone to computer, so the link sent is the invite.
+  const link = invite === undefined ? installLinkFor(SITE.origin) : `${SITE.origin}/i/${invite}?utm_source=send-to-desktop`;
+  const body = `${SEND_TEXT}\n\nInstall it here: ${link}`;
+
+  async function send(): Promise<void> {
+    const outcome = await sendInstallLink(navigator, link);
+    if (outcome === "shared" || outcome === "copied") trackWebsiteEvent("send_to_desktop", 0, undefined, source);
+    if (outcome === "copied" || outcome === "failed") setState(outcome);
+  }
+
+  return (
+    <div className="hero-install">
+      <div className="marketplace-hero-actions">
+        <button type="button" className="marketplace-primary install-cta" onClick={() => void send()}>
+          <span className="install-cta-label">
+            {state === "copied" ? "Link copied" : "Send to my computer"}
+            <small>Agentfly runs on Windows and Linux</small>
+          </span>
+        </button>
+        <a
+          className="marketplace-secondary"
+          href={`mailto:?subject=${encodeURIComponent(SEND_SUBJECT)}&body=${encodeURIComponent(body)}`}
+          onClick={() => trackWebsiteEvent("send_to_desktop", 0, undefined, source)}
+        >
+          Email me the link
+        </a>
+      </div>
+      {state === "failed" && <p className="hero-install-note" role="status">Sharing was blocked. The link is {link}</p>}
+      {advertise && <AdvertisePill onClick={() => trackWebsiteEvent("advertise_click", 0, undefined, source)} />}
+    </div>
+  );
+}
+
+function TerminalCommand({ platform, source }: { platform: "windows" | "linux"; source: string }) {
+  const command = installCommand(platform, SITE.origin)!;
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const isWindows = platform === "windows";
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  async function copy(): Promise<void> {
+    setFailed(false);
+    try {
+      await navigator.clipboard.writeText(command);
+      trackWebsiteEvent("install_copy", 0, undefined, source);
+      setCopied(true);
+    } catch {
+      // A denied clipboard permission. The command is selectable either way.
+      setFailed(true);
+    }
+  }
+
+  return (
+    <div className="hero-quick-install">
+      <div className="hero-quick-install-card">
+        <div className="hero-install-command">
+          <span className="hero-install-prompt" aria-hidden="true">{isWindows ? "PS>" : "$"}</span>
+          <code>{command}</code>
+          <button type="button" onClick={() => void copy()} aria-label={`Copy ${isWindows ? "PowerShell" : "terminal"} install command`} aria-live="polite" data-copied={copied}>
+            <span aria-hidden="true" className="hero-install-copy-icon">{copied ? "✓" : "⧉"}</span>
+            {copied ? "Copied" : "Copy"}
+          </button>
+        </div>
+      </div>
+      {failed && <p className="hero-install-note" role="status">Copy was blocked. Select the command above and copy it manually.</p>}
+      <p className="hero-install-note">
+        Paste into {isWindows ? "PowerShell" : "your shell"} and press <kbd>Enter</kbd>. It verifies the
+        download against its published checksum. <Link href="/docs/installing-adcode">What this does</Link>
+      </p>
+    </div>
+  );
+}

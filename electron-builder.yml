@@ -1,0 +1,243 @@
+# Packaging ADCode into something a person can double-click.
+#
+# The desktop package is the app manifest. Dependencies are still installed in the root
+# node_modules because this FAT32-compatible repository cannot use npm workspaces. The
+# explicit file sets below stage only the dependencies declared by apps/desktop/package.json.
+
+appId: com.adcode.ide
+productName: ADCode
+copyright: Copyright 2026 Bluethenics
+
+# node-pty ships N-API prebuilds, which are ABI-stable across Node and Electron versions.
+# The hook stages dependencies through explicit file sets below and returns false so the
+# installed electron-builder does not fall back to the shared root lockfile and traverse
+# unrelated web/server dependencies.
+beforeBuild: ./scripts/electron-builder-before-build.mjs
+
+directories:
+  app: apps/desktop
+  output: release
+  buildResources: build
+
+extraMetadata:
+  main: out/main/index.js
+  # Windows Task Manager shows a process under its executable's FileDescription, which
+  # electron-builder takes from `description`. The repo's own description is a sentence
+  # about what ADCode is, which would read as a paragraph in a process list - so the
+  # packaged copy gets the name on its own.
+  description: ADCode
+
+files:
+  - out/**/*
+  # The MCP bundle is built under out/ but ships through `extraResources` below. Inside the
+  # asar it would be a second copy that nothing outside Electron can read.
+  - "!out/mcp{,/**/*}"
+  - package.json
+  # The main process reads this at runtime for the window icon, so it has to be inside the
+  # asar. `buildResources` above only feeds the installer and the executable's own embedded
+  # icon; it puts nothing where a running app can read it, which is why the packaged build
+  # logged "Failed to load image from path ...app.asar\build\icon.png" on every launch.
+  - from: ../..
+    to: .
+    filter:
+      - build/icon.png
+  - from: ../../node_modules/node-pty
+    to: node_modules/node-pty
+    filter:
+      - "**/*"
+  - from: ../../node_modules/node-addon-api
+    to: node_modules/node-addon-api
+    filter:
+      - "**/*"
+
+# node-pty resolves its native binary by building a path at runtime, which cannot be read
+# from inside an asar archive.
+asarUnpack:
+  - "**/node_modules/node-pty/**"
+  # Builder trims the app-directory prefix length from external file-set source paths.
+  # For our root node_modules mapping that removes node_modules/ from the match path.
+  - "**/node-pty/**"
+
+# The licence, the notice and the third-party notices, beside the app rather than inside
+# the asar, so they can be read without unpacking anything. Apache-2.0 section 4 requires
+# the licence to travel with the binary. `scripts/third-party-notices.mjs` stages this
+# directory, and `main/licencePaths.ts` reads it back for Help > Open Source Licences.
+extraResources:
+  - from: build/licenses
+    to: licenses
+
+# The project-memory MCP server, as a plain Node program beside the asar.
+#
+# Settings > "Connect an external agent" hands out a `node "<script>"` command, and the
+# process that runs it is the user's own `node`, started by their agent. That rules out the
+# asar, which only Electron can read, and - with `runAsNode` fused off below - it rules out
+# running the script with ADCode's own executable. So it is one self-contained file, built
+# by `scripts/build-mcp.mjs` and copied here. The `package.json` beside it says
+# `"type": "module"`, which is what lets Node load a `.js` file as the ES module it is.
+#
+# The command does not name this copy. The portable build, an AppImage and the Store
+# package all lose their resources folder when the app closes or updates, so the app copies
+# both files to `~/.adcode/mcp/` and names that instead (`main/mcpInstall.ts`).
+#
+# `from` is relative to this file, not to `directories.app`. A source that does not exist
+# is only a warning to electron-builder, so `scripts/package.mjs` and `package-store.mjs`
+# build it first, and `apps/desktop/test/mcpBundle.test.ts` pins this entry to the path
+# `main/memory.ts` asks for.
+  - from: apps/desktop/out/mcp
+    to: mcp
+    filter:
+      - adcode-mcp.js
+      - package.json
+
+# Electron fuses: flags flipped in the binary itself, so they cannot be turned back on by
+# an environment variable or a command-line argument.
+#
+# None of this hides the JavaScript - asar is an archive, not encryption, and anyone can
+# unpack it. What these do is close the shortcuts that turn a shipped Electron app into a
+# general-purpose way to run code as that app:
+#
+#   runAsNode                          ELECTRON_RUN_AS_NODE=1 adcode.exe evil.js
+#   enableNodeOptionsEnvironmentVariable  NODE_OPTIONS=--require=evil.js
+#   enableNodeCliInspectArguments      --inspect, to attach a debugger and read memory
+#   onlyLoadAppFromAsar                swapping the asar for an unpacked directory
+#
+# The valuable logic is on the server for exactly the reason these fuses cannot fix: the
+# renderer's code is on the user's machine and always will be.
+electronFuses:
+  runAsNode: false
+  enableCookieEncryption: true
+  enableNodeOptionsEnvironmentVariable: false
+  enableNodeCliInspectArguments: false
+  onlyLoadAppFromAsar: true
+
+# Where updates come from. electron-updater reads this same block at runtime to find the
+# feed, so the app and the installer always agree on where releases live.
+#
+# The repo below is the real one and matches `git remote -v`. It also has to match three
+# other files - `apps/web/public/install.ps1`, `install.sh` and `apps/web/.env.production` -
+# so a fork or a rename changes all four together. Publishing to the wrong repo produces
+# installers that check an update feed nobody publishes to, and they never update again.
+publish:
+  provider: github
+  owner: bluethenics
+  repo: adcode
+
+win:
+  # Code signing is not declared here. `scripts/package.mjs` appends `win.azureSignOptions`
+  # when the ADCODE_AZURE_* identifiers and AZURE_* credentials are all present (see
+  # `scripts/azure-sign-args.mjs`), and the release workflow supplies them from repository
+  # Variables and secrets. Anything less than the full set builds exactly as before:
+  # CSC_LINK file signing, or unsigned with a warning.
+  icon: build/icon.ico
+  # The name of the .exe itself, and so the name in Task Manager's Details tab. It defaults
+  # to productName, but stating it means a later change to productName cannot silently
+  # rename the binary the installers and the auto-updater look for.
+  executableName: ADCode
+  target:
+    - target: nsis
+      arch: [x64]
+    # A portable build for anyone who would rather not run an installer.
+    - target: portable
+      arch: [x64]
+
+# The Microsoft Store build.
+#
+# Deliberately NOT in `win.target` above: every field below that identifies the app has to
+# match a reservation in Partner Center exactly, and a build made with the wrong identity
+# is rejected on upload rather than at build time. So the Store package is produced only by
+# `npm run package:store`, which fills these in from the environment and refuses to run
+# without them - a normal `npm run package` is unchanged and still produces nsis + portable.
+#
+# Why the Store at all: Microsoft signs what it distributes. That removes the SmartScreen
+# warning without a code-signing certificate, and because nobody downloads an .exe from a
+# browser it also sidesteps Chrome's Safe Browsing scan entirely. It costs a one-time
+# Partner Center registration rather than a few hundred dollars a year.
+#
+# `identityName`, `publisher` and `publisherDisplayName` are placeholders here on purpose:
+# they read as obviously-not-real so a package built without the wrapper cannot be mistaken
+# for a submittable one.
+appx:
+  identityName: PLACEHOLDER.SetByPackageStore
+  publisher: CN=PLACEHOLDER-SET-BY-PACKAGE-STORE
+  publisherDisplayName: PLACEHOLDER
+  # Alphanumeric, must start with a letter, and no dots - Store rules, not ours.
+  applicationId: ADCode
+  displayName: ADCode
+  # The tiles are drawn from build/icon.svg by `npm run icons`, so they cannot drift from
+  # the icon everything else uses.
+  backgroundColor: transparent
+  showNameOnTiles: true
+  languages:
+    - en-US
+  artifactName: ADCode-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ADCode
+  # A stable filename, not "ADCode Setup 1.2.3.exe": the terminal install scripts
+  # fetch releases/latest/download/<name>, which only works while the name never changes.
+  artifactName: ADCode-Setup-${arch}.${ext}
+
+# The portable build gets its own stable name for the same reason.
+portable:
+  artifactName: ADCode-Portable-${arch}.${ext}
+
+dmg:
+  artifactName: ADCode-${arch}.${ext}
+
+mac:
+  icon: build/icon.png
+  target: [dmg]
+  category: public.app-category.developer-tools
+
+linux:
+  icon: build/icon.png
+  # Without this the binary is named from the app package's `name`, which is
+  # `@adcode/desktop` - and electron-builder sanitises that to `@adcodedesktop`, which it
+  # then refuses because `@` cannot appear in a Linux file path. Windows never hit it
+  # because `win.executableName` below is set explicitly; Linux had no equivalent.
+  executableName: ADCode
+  # Name the installed .desktop file from `desktopName` in apps/desktop/package.json, and
+  # write `StartupWMClass` from the same string.
+  #
+  # This is what makes a pinned ADCode and a running ADCode the same application to GNOME.
+  # Three names have to agree: Electron's `app_id`, taken from `desktopName` at startup;
+  # the filename in /usr/share/applications, taken from `executableName` by default; and
+  # `StartupWMClass` inside that file. Left to the defaults they do not - the first is
+  # `@adcode/desktop` and the others are `ADCode` - so the dock shows the pin and the open
+  # window as two unrelated icons. `main/pinPrompt.ts` offers to create that pin, which is
+  # why this is set here rather than left for a later Linux bug report.
+  syncDesktopName: true
+  # Required, and only on Linux.
+  #
+  # .deb and AppImage both carry a Debian maintainer field, and electron-builder refuses to
+  # package without one: "Please specify author email in the application package.json". The
+  # root package.json has `author: ADCode` as a bare string with no address, which is fine
+  # for Windows and macOS and fatal here - which is exactly why the first CI run built
+  # Windows and failed Linux.
+  #
+  # Stated here rather than as an author email in package.json so the published address is
+  # the support one people already have from the terms, not a personal mailbox.
+  maintainer: ADCode <adcode.support@gmail.com>
+  # AppImage runs anywhere without a package manager; .deb is what most people expect on
+  # Debian and Ubuntu. Both are produced, and the install script picks between them.
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  category: Development
+  synopsis: An ad-supported, AI-native IDE
+  desktop:
+    entry:
+      Name: ADCode
+      Categories: Development;IDE;
+
+appImage:
+  artifactName: ADCode-${arch}.AppImage
+deb:
+  artifactName: ADCode-${arch}.${ext}

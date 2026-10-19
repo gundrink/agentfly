@@ -1,0 +1,242 @@
+/**
+ * The documentation site.
+ *
+ * Two sources, merged: the generated seed in `docsSeed.ts` - every feature Agentfly has,
+ * taken from the same text the editor shows behind each `?` - and pages the admin has
+ * written, which arrive through the same `/v1/posts` endpoint as the blog and are marked
+ * for the docs surface.
+ *
+ * An admin page wins over a seeded one with the same slug. That is what "the admin can
+ * edit the docs however they like" means in practice: the generated page is a starting
+ * point, not a thing that fights you when you try to replace it.
+ */
+import { allPosts, type Post } from "./posts";
+import { DOC_SECTIONS, DOC_SEED } from "./docsSeed";
+import { DOC_GUIDES, SECTION_COMPARISONS } from "./docsGuides";
+
+export interface DocPage {
+  slug: string;
+  title: string;
+  section: string;
+  description: string;
+  /** Markdown. Assembled from the help text for a seeded page. */
+  body: string;
+  related: string[];
+  /** Sort key within a section. */
+  order: number;
+  /** True when a person wrote it, false when it came out of the generator. */
+  authored: boolean;
+  /** ISO day the piece was published. Only authored pages have one. */
+  published?: string;
+  /** ISO day, for `dateModified`. Absent on seeded pages, which ship with the build. */
+  updated?: string;
+}
+
+/**
+ * The seed text arrives as prose; a guide wants steps. Sentences become list items, and
+ * the leading "On by default" line - true and useful, but not a step - is lifted out and
+ * set above the list instead.
+ */
+function stepsFromHow(how: string): { note: string | null; steps: string[] } {
+  const sentences = how
+    .split(/(?<=[.!?])\s+(?=[A-Z"`])/)
+    .map((one) => one.trim())
+    .filter((one) => one.length > 0);
+
+  const first = sentences[0] ?? "";
+  const isDefaultNote = /^(on|off) by default\b/i.test(first);
+  const rest = isDefaultNote ? sentences.slice(1) : sentences;
+
+  return {
+    note: isDefaultNote ? first : null,
+    steps: rest.length > 0 ? rest : [first],
+  };
+}
+
+/**
+ * Public docs name actions the way the interface names them. Internal command and setting
+ * identifiers help Agentfly wire controls together, but they do not help someone use the
+ * product and make the documentation read like an implementation reference.
+ */
+function userFacingText(text: string): string {
+  return text
+    .replace(/\s+\((?:command|setting):[^)]+\)/gi, "")
+    .replace(/Settings\s*→\s*adcode\.[a-z0-9_.-]+/gi, "Settings")
+    .replace(/CmdOrCtrl/gi, "Ctrl/Cmd");
+}
+
+function userFacingAccess(access: readonly string[]): string[] {
+  return [...new Set(
+    access
+      .filter((route) => !/^Developer tools\b/i.test(route))
+      .map((route) => userFacingText(route).trim()),
+  )];
+}
+
+function userFacingMarkdown(body: string): string {
+  return userFacingText(
+    body
+      .split("\n")
+      .filter((line) => !/Developer tools(?:\s+\(command:[^)]+\))?/i.test(line))
+      .join("\n"),
+  );
+}
+
+/**
+ * A seeded page's body.
+ *
+ * Every page reads as a guide, not a stub: what it is for, the concrete benefits, numbered
+ * steps, and a straight answer to "why this over what I use now". Steps and comparison
+ * copy come from `docsGuides.ts` where a feature has earned its own; everything else
+ * derives honest steps from the seed's own text and uses the section-level argument. The
+ * description is not repeated here - it renders as the standfirst above the body.
+ */
+function bodyFromSeed(seed: (typeof DOC_SEED)[number]): string {
+  const guide = DOC_GUIDES[seed.slug];
+  const parts: string[] = [];
+
+  parts.push("## When you would want it", "", seed.why, "");
+
+  parts.push("## Where to find it", "");
+  for (const route of userFacingAccess(seed.access)) parts.push(`- ${route}`);
+  parts.push("");
+
+  if (guide?.benefits !== undefined && guide.benefits.length > 0) {
+    parts.push("## What you get out of it", "");
+    for (const benefit of guide.benefits) parts.push(`- ${benefit}`);
+    parts.push("");
+  }
+
+  parts.push("## How to use it, step by step", "");
+  const { note, steps } =
+    guide?.steps !== undefined && guide.steps.length > 0
+      ? { note: null, steps: [...guide.steps] }
+      : stepsFromHow(seed.how);
+
+  if (note !== null) parts.push(`${note}`, "");
+  steps.forEach((step, index) => parts.push(`${index + 1}. ${step}`));
+  parts.push("");
+
+  const comparison = guide?.betterThan ?? SECTION_COMPARISONS[seed.section];
+  if (comparison !== undefined) {
+    parts.push("## Why this beats the usual way", "", comparison, "");
+  }
+
+  if (seed.shortcut !== undefined) {
+    parts.push("## Shortcut", "", `\`${userFacingText(seed.shortcut)}\``, "");
+  }
+
+  parts.push(
+    "## Find it in Universal Search",
+    "",
+    seed.keywords.map((keyword) => `\`${keyword}\``).join(" · "),
+    "",
+  );
+
+  return parts.join("\n").trimEnd();
+}
+
+const seeded = (): DocPage[] =>
+  DOC_SEED.map((seed, index) => ({
+    slug: seed.slug,
+    title: seed.title,
+    section: seed.section,
+    description: seed.description,
+    body: bodyFromSeed(seed),
+    related: [...seed.related],
+    order: index,
+    authored: false,
+  }));
+
+const fromPost = (post: Post): DocPage => ({
+  slug: post.slug,
+  title: post.title,
+  section: post.section ?? "Guides",
+  description: post.description,
+  body: userFacingMarkdown(post.body),
+  related: [...(post.related ?? [])],
+  order: post.order ?? 0,
+  authored: true,
+  published: post.published,
+  ...(post.updated === undefined ? {} : { updated: post.updated }),
+});
+
+/** Every documentation page, seeded and authored, with authored pages winning on slug. */
+export async function allDocs(): Promise<DocPage[]> {
+  const pages = new Map(seeded().map((page) => [page.slug, page]));
+
+  /*
+   * Every post, whatever its surface. There is no blog index any more - `/blog/<slug>`
+   * redirects permanently to `/docs/<slug>` - so a post marked blog-only that the docs
+   * left out would be a published page whose only address is a 404.
+   */
+  for (const post of await allPosts()) {
+    pages.set(post.slug, fromPost(post));
+  }
+
+  return [...pages.values()];
+}
+
+export async function getDoc(slug: string): Promise<DocPage | null> {
+  return (await allDocs()).find((page) => page.slug === slug) ?? null;
+}
+
+/**
+ * The newest authored pages, newest first.
+ *
+ * Seeded reference pages have no publication date - they shipped with the build - so
+ * only written pieces can be "new". An admin page from the API carries its own date
+ * and joins in on equal terms, which is what makes this stay correct without edits.
+ */
+export async function recentDocs(limit = 4): Promise<Array<DocPage & { published: string }>> {
+  const pages = await allDocs();
+  return pages
+    .filter(
+      (page): page is DocPage & { published: string } =>
+        page.authored && page.published !== undefined,
+    )
+    .sort(
+      (a, b) => b.published.localeCompare(a.published) || a.title.localeCompare(b.title),
+    )
+    .slice(0, Math.max(0, limit));
+}
+
+export interface DocSection {
+  title: string;
+  pages: DocPage[];
+}
+
+/**
+ * The sidebar: pages grouped by section, in the generator's order.
+ *
+ * Sections the admin invents appear after the generated ones, alphabetically. Interleaving
+ * them would mean a new page could silently push "Editing" down the sidebar.
+ */
+export async function docsBySection(): Promise<DocSection[]> {
+  const pages = await allDocs();
+  const groups = new Map<string, DocPage[]>();
+
+  for (const page of pages) {
+    const existing = groups.get(page.section);
+    if (existing === undefined) groups.set(page.section, [page]);
+    else existing.push(page);
+  }
+
+  const known = DOC_SECTIONS.filter((title) => groups.has(title));
+  const extra = [...groups.keys()].filter((title) => !DOC_SECTIONS.includes(title)).sort();
+
+  return [...known, ...extra].map((title) => ({
+    title,
+    pages: (groups.get(title) ?? []).sort(
+      (a, b) => a.order - b.order || a.title.localeCompare(b.title),
+    ),
+  }));
+}
+
+/** Resolve a page's related slugs to the pages themselves, dropping any that vanished. */
+export async function relatedPages(page: DocPage): Promise<DocPage[]> {
+  const all = await allDocs();
+  return page.related
+    .map((slug) => all.find((one) => one.slug === slug))
+    .filter((one): one is DocPage => one !== undefined);
+}

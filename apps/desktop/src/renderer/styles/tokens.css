@@ -1,0 +1,299 @@
+/*
+ * Design tokens - brief §3.
+ *
+ * One semantic set, defined once. Light and dark follow the OS. Only `transform` and
+ * `opacity` are ever animated (§1): both are GPU-composited, and animating anything
+ * else forces layout every frame while the user is typing, which surfaces as input
+ * latency in the one application where latency is unforgivable.
+ */
+
+/*
+ * `hidden` is this app's visibility switch, and the rule that implements it lives in the
+ * user-agent stylesheet at zero specificity - so any `.thing { display: flex }` silently
+ * outranks it and the element stays on screen. That is not a cosmetic bug: a `position:
+ * fixed` overlay that never leaves swallows every click in the window, and the app looks
+ * perfectly rendered while being completely unusable.
+ *
+ * One declaration, at the top of the first stylesheet, makes the attribute mean what it
+ * says everywhere. Anything that needs to fade rather than vanish animates a data
+ * attribute instead - `hidden` is not a transition hook.
+ */
+[hidden] {
+  display: none !important;
+}
+
+/*
+ * The user agent gives every `<button>` `padding: 1px 6px`, and that padding is why the
+ * icons in this app were off centre.
+ *
+ * It is worth spelling out, because the symptom points at the wrong cause. Every icon button
+ * here already said `display: grid; place-items: center`, and every one of them honoured it
+ * exactly: they centred the icon inside the *content box*. With `box-sizing: border-box` and
+ * twelve pixels of horizontal padding, a 16px close button has a **4px** content box - so a
+ * 9px icon does not fit in the area it is being centred in, and an overflowing grid item
+ * overflows one way, to the right. The measured error was 2.5px on `.tab-close` and 3px on
+ * `.tree-action`, and it was horizontal-only, which is the fingerprint: the vertical padding
+ * is 1px and symmetric, so it does no damage, while the horizontal 6px does.
+ *
+ * That made it look like a per-button problem and it never was. Resetting it once is the
+ * whole fix, and it is safe to do globally because every button in this app that wants
+ * padding declares its own - the ones that do not are precisely the fixed-size icon controls
+ * that must not have any. `npm run smoke` asserts the result geometrically, on every button
+ * in a real window, because that is the only place a laid-out box exists to measure.
+ */
+button {
+  padding: 0;
+}
+
+:root {
+  /* Type - SF Pro on macOS, Inter elsewhere; SF Mono / JetBrains Mono for code. */
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", "Cascadia Code", ui-monospace, "Consolas", monospace;
+
+  /* Scale: 11 / 13 / 15 / 17 / 22 / 28 */
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+
+  /* Shape - continuous-curvature radii, not circles. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-panel: 6px;
+  --border-subtle: color-mix(in srgb, var(--text-primary) 14%, transparent);
+  --border-strong: color-mix(in srgb, var(--text-primary) 22%, transparent);
+  --bg-workbench: var(--bg-app);
+  --bg-panel: var(--bg-elevated);
+  --shadow-surface: 0 1px 3px color-mix(in srgb, var(--text-primary) 5%, transparent);
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --control-height: 34px;
+  --surface-control: color-mix(in srgb, var(--bg-elevated) 90%, var(--text-secondary));
+  --surface-control-hover: color-mix(in srgb, var(--surface-control) 88%, var(--text-primary));
+  --surface-selected: color-mix(in srgb, var(--bg-elevated) 72%, var(--text-secondary));
+  --surface-sheen: linear-gradient(180deg, color-mix(in srgb, var(--text-primary) 4%, transparent), transparent);
+  --fill-primary: var(--accent);
+  --fill-danger: var(--danger);
+  --shadow-control: inset 0 1px 0 color-mix(in srgb, var(--text-primary) 7%, transparent), 0 2px 4px rgb(0 0 0 / 0.12);
+  --focus-ring: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent);
+
+  /* Motion */
+  --ease-sheet: cubic-bezier(0.32, 0.72, 0, 1);
+  --ease-toast: cubic-bezier(0.16, 1, 0.3, 1);
+  --duration-enter: 220ms;
+  --duration-exit: 160ms;
+
+  /* Density - `comfortable` by default; §3 makes this a setting, not a decision. */
+  --density-row: 26px;
+  --density-gap: 8px;
+
+  /*
+   * Light palette: warm paper to match the dark side's charcoal. The accent is
+   * a warm near-black — off-white cannot carry a button on paper — so primary
+   * actions read as dark pills with white text, the inverse of dark mode.
+   */
+  --bg-app: #f3f1ec;
+  --bg-chrome: #f3f1ec;
+  --bg-elevated: #fbfaf7;
+  --bg-editor: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.04);
+  --bg-active: rgba(0, 0, 0, 0.08);
+  --bg-selected: rgba(35, 32, 28, 0.1);
+
+  --text-primary: #24231f;
+  --text-secondary: #69665f;
+  --text-tertiary: #77736b;
+  --text-on-accent: #ffffff;
+
+  --border-hairline: #ddd9d0;
+  --accent: #26241f;
+  --danger: #c24836;
+  --success: #3f8f62;
+  --warning: #b7791f;
+
+  --shadow-floating: 0 8px 24px rgb(36 35 31 / .12);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] { color-scheme: light; }
+
+/*
+ * Dark is the warm charcoal the Assistant introduced, now the app's own ground:
+ * near-black brown-grey surfaces, hairline borders, and an off-white accent.
+ * Monochrome like a professional IDE — colour is spent only on meaning
+ * (green success, red errors, amber warnings). Midnight below is untouched.
+ */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg-app: #151515;
+    --bg-chrome: rgba(16, 15, 12, 0.78);
+    --bg-elevated: #1c1b19;
+    --bg-editor: #151515;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-active: rgba(255, 255, 255, 0.12);
+    --bg-selected: rgba(236, 233, 226, 0.14);
+
+    --text-primary: #ebe8e1;
+    --text-secondary: #8f8c85;
+    --text-tertiary: #5f5d58;
+    --text-on-accent: #1a1917;
+
+    --border-hairline: #2d2b28;
+    --accent: #ece9e2;
+    --danger: #e0685c;
+    --success: #6fb98f;
+    --warning: #d9a03f;
+
+    --shadow-floating: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg-app: #151515;
+  --bg-chrome: rgba(16, 15, 12, 0.78);
+  --bg-elevated: #1c1b19;
+  --bg-editor: #151515;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.12);
+  --bg-selected: rgba(236, 233, 226, 0.14);
+
+  --text-primary: #ebe8e1;
+  --text-secondary: #8f8c85;
+  --text-tertiary: #5f5d58;
+  --text-on-accent: #1a1917;
+
+  --border-hairline: #2d2b28;
+  --accent: #ece9e2;
+  --danger: #e0685c;
+  --success: #6fb98f;
+  --warning: #d9a03f;
+
+  --shadow-floating: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+/*
+ * Midnight - the website's palette, in the editor.
+ *
+ * The third theme, and the only one that is not the operating system's idea of light or
+ * dark. It is the identity adcode.dev wears: true black, greyscale chrome, and green
+ * spent on nothing but money.
+ *
+ * The accent inverts here, and that is the part worth stating. In Light and Dark the
+ * accent is systemBlue and `--text-on-accent` is white. On a true-black ground the accent
+ * *is* the light element - a near-white fill with near-black text on it - so the pair
+ * swaps. Everything that paints `var(--accent)` and sets `var(--text-on-accent)` keeps
+ * working; anything that hardcoded white on the accent did not, which is why the menu
+ * rows were changed to use the token (see menubar.css).
+ *
+ * `--success` is the money green. On the website that colour appears only where a real
+ * currency figure appears, and the same rule holds here: the earnings popover and the
+ * ledger, and nothing else.
+ */
+:root[data-theme="midnight"] {
+  color-scheme: dark;
+
+  --bg-app: #000000;
+  --bg-chrome: rgba(6, 8, 9, 0.78);
+  --bg-elevated: #131719;
+  --bg-editor: #08090b;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.1);
+  /* A light wash rather than a blue one: there is no blue in this theme to select with. */
+  --bg-selected: rgba(255, 255, 255, 0.14);
+
+  --text-primary: #f1f3f3;
+  --text-secondary: #9aa4a6;
+  --text-tertiary: #899597;
+  --text-on-accent: #0a0c0d;
+
+  --border-hairline: rgba(255, 255, 255, 0.11);
+  --accent: #f1f3f3;
+  --danger: #ff453a;
+  --success: #30d158;
+  --warning: #ffb340;
+
+  --shadow-floating: 0 18px 48px rgba(0, 0, 0, 0.72), 0 2px 10px rgba(0, 0, 0, 0.5);
+}
+
+:root[data-density="compact"] {
+  --control-height: 28px;
+  --density-row: 22px;
+  --density-gap: 5px;
+}
+
+/* §1: reduce-motion is honored everywhere, following the OS setting. */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --duration-enter: 100ms;
+    --duration-exit: 100ms;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 100ms !important;
+  }
+}
+
+:root[data-reduced-motion="true"] * {
+  transition-duration: 100ms !important;
+  animation-duration: 0.01ms !important;
+}
+
+/*
+ * Reduced transparency - the setting this app had sixteen translucent surfaces and no
+ * answer for.
+ *
+ * `prefers-reduced-transparency` is a real accessibility preference, not a theme: people
+ * turn it on because blurred chrome with content moving underneath is genuinely hard to
+ * read, and every `backdrop-filter` here made a bar whose contrast depends on whatever
+ * happens to be scrolling behind it. Apple's own rule is that the material gets frostier
+ * and more opaque rather than disappearing, so the layer still reads as a layer.
+ *
+ * Two moves cover almost everything. `--bg-chrome` is a token, so making it opaque fixes
+ * the title bar, the activity rail, the sidebar and the preview bar at once; and dropping
+ * `backdrop-filter` everywhere removes the blur that the opacity was hiding behind. The
+ * handful of surfaces that mix their own translucency with `color-mix(…, transparent)`
+ * declare their own opaque fallback next to their own rule, where it can be read.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  /* Light is the base, exactly as above - the dark value is not applied unconditionally,
+     or a light window would take dark chrome the moment the setting was switched on. */
+  :root {
+    --bg-chrome: #f6f6f8;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg-chrome: #100f0c;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg-chrome: #100f0c;
+  }
+
+  :root[data-theme="midnight"] {
+    --bg-chrome: #060809;
+  }
+
+  *,
+  *::before,
+  *::after {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}

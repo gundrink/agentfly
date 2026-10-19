@@ -1,0 +1,1143 @@
+/**
+ * The source control view.
+ *
+ * Brief §4's Git group: stage/unstage/commit UI, branch switcher, file timeline. The
+ * plumbing the user asked for directly - init, clone, push, pull - lives on the same
+ * surface, because a source-control panel that cannot push is a diff viewer.
+ */
+import type { GitOutcome, GitStatusView } from "../../shared/api.ts";
+import { githubRepositoryUrl, type GitHubDestination } from "../../shared/githubRepository.ts";
+import type { GitResult } from "../dialogs/resultDialog.ts";
+import { askGitIdentity } from "../dialogs/gitIdentityDialog.ts";
+import { createCommitBrowser, type CommitBrowserDeps } from "./commitBrowser.ts";
+import { ICON, createIcon } from "../workbench/icons.ts";
+import {
+  CHECKS,
+  conflictFindings,
+  outcomeFor,
+  type CheckFinding,
+  type CheckOutcome,
+} from "../checks/checkReport.ts";
+
+export interface SourceControlPanel {
+  readonly element: HTMLElement;
+  refresh(): Promise<void>;
+  /** The file whose history the timeline shows; null hides it. */
+  setActiveFile(path: string | null): void;
+  /** §4: the timeline is a setting, so the shell can switch it off. */
+  setTimelineEnabled(enabled: boolean): void;
+  /** Put the cursor in the commit box - where staging from the tree hands over to. */
+  focusCommitMessage(): void;
+  /** Re-read the commit list, discarding cached commit details. */
+  refreshHistory(): Promise<void>;
+  /*
+   * What the Git menu runs.
+   *
+   * The menu drives the panel rather than calling `window.adcode.git` itself, so a commit
+   * made from the menu reports its outcome, refreshes the list, and captures the state it
+   * acted on in exactly the way one made from the button does. Two paths to the same
+   * action that report differently is how a UI starts lying about what happened.
+   */
+  pull(): Promise<void>;
+  push(): Promise<void>;
+  fetch(): Promise<void>;
+  stageAll(): Promise<void>;
+  unstageAll(): Promise<void>;
+  /** Submits what is in the commit box. False when it is empty and there is nothing to do. */
+  commit(): boolean;
+  switchBranch(): Promise<void>;
+  createBranch(): Promise<void>;
+  initRepository(): Promise<void>;
+  /**
+   * Answer "do I have merge conflicts?" out loud.
+   *
+   * The resolver has always worked; it drew Keep yours / Keep theirs over the markers in
+   * any conflicted file you happened to open. Nothing in the window could tell you whether
+   * such a file existed, so the feature was findable only by accident. Returns the outcome
+   * so the caller can put its sentence - including "none" - in the status line.
+   */
+  checkConflicts(): Promise<CheckOutcome>;
+}
+
+export interface SourceControlDrawerStateInput {
+  readonly state: "inactive" | "setup" | "repo";
+  readonly changesMediaMatches: boolean;
+  readonly historyMediaMatches: boolean;
+  readonly changesOpen: boolean;
+  readonly historyOpen: boolean;
+}
+
+export interface SourceControlDrawerState {
+  readonly changesToggleable: boolean;
+  readonly historyToggleable: boolean;
+  readonly changesExpanded: boolean;
+  readonly historyExpanded: boolean;
+  readonly changesInert: boolean;
+  readonly historyInert: boolean;
+}
+
+/** Setup guidance is primary content, never a drawer that can be visually present but inert. */
+export function resolveSourceControlDrawers(
+  input: SourceControlDrawerStateInput,
+): SourceControlDrawerState {
+  const inRepository = input.state === "repo";
+  const changesToggleable = inRepository && input.changesMediaMatches;
+  const historyToggleable = inRepository && input.historyMediaMatches;
+  const changesExpanded = !changesToggleable || input.changesOpen;
+  const historyExpanded = !historyToggleable || input.historyOpen;
+  return {
+    changesToggleable,
+    historyToggleable,
+    changesExpanded,
+    historyExpanded,
+    changesInert: !changesExpanded,
+    historyInert: !historyExpanded,
+  };
+}
+
+export interface SourceControlDeps {
+  readonly onStatus?: (status: GitStatusView | null) => void;
+  /** Dismisses the workspace shell through the owning layer. */
+  readonly onRequestClose: () => void;
+  readonly openFile: (path: string) => void;
+  readonly workspaceRoot: () => string | null;
+  readonly notify: (message: string) => void;
+  /**
+   * Report a heavyweight action's outcome somewhere the user will actually look.
+   *
+   * `notify` writes to a corner of the status bar and erases itself after four seconds,
+   * which is the right weight for staging a file and the wrong weight for a push that
+   * talked to a remote and may have failed.
+   */
+  readonly reportResult: (result: GitResult) => void;
+  /**
+   * Ask the user for a line of text.
+   *
+   * Injected rather than imported so the panel does not own a dialog, and because
+   * `window.prompt` - which this replaces - throws in Electron.
+   */
+  readonly promptFor: (request: {
+    title: string;
+    body?: string;
+    value?: string;
+    placeholder?: string;
+    confirmLabel?: string;
+    suggestions?: readonly string[];
+  }) => Promise<string | null>;
+  /** Show a file as it was at a revision, read-only. */
+  readonly openRevision: (path: string, ref: string, shortHash: string) => void;
+  /** Show a locally kept version of a file, read-only. §4's local file history. */
+  readonly openLocalVersion: (path: string, id: string, savedAt: string) => void;
+  /** The absolute path of the open file, which local history is keyed by. */
+  readonly absolutePath: (relative: string) => string;
+  /** Show one file's changes within one commit, read-only. */
+  readonly openCommitDiff: CommitBrowserDeps["openCommitDiff"];
+  /** Put a file back as it was at a commit, after asking. */
+  readonly restoreFile: CommitBrowserDeps["restoreFile"];
+}
+
+const CHANGE_LABEL: Readonly<Record<string, string>> = {
+  added: "A",
+  modified: "M",
+  deleted: "D",
+  renamed: "R",
+  untracked: "U",
+  none: "",
+};
+
+export function createSourceControlPanel(deps: SourceControlDeps): SourceControlPanel {
+  const element = document.createElement("div");
+  element.className = "scm-panel";
+  element.dataset["scmState"] = "inactive";
+
+  const workspaceHeader = document.createElement("header");
+  workspaceHeader.className = "scm-workspace-header";
+  const workspaceTitle = document.createElement("h2");
+  workspaceTitle.textContent = "Source Control";
+  const workspaceSummary = document.createElement("p");
+  workspaceSummary.className = "scm-workspace-summary";
+  workspaceHeader.append(workspaceTitle, workspaceSummary);
+  element.append(workspaceHeader);
+
+  const changesRegion = document.createElement("section");
+  changesRegion.className = "scm-changes-region";
+  changesRegion.id = "scm-changes-region";
+  changesRegion.setAttribute("aria-label", "Changes");
+
+  const commitRegion = document.createElement("section");
+  commitRegion.className = "scm-commit-region";
+  commitRegion.setAttribute("aria-label", "Commit workspace");
+  commitRegion.hidden = true;
+
+  const historyRegion = document.createElement("section");
+  historyRegion.className = "scm-history-region";
+  historyRegion.id = "scm-history-region";
+  historyRegion.setAttribute("aria-label", "History and timeline");
+  historyRegion.hidden = true;
+
+  const header = document.createElement("div");
+  header.className = "scm-header";
+
+  const branchButton = document.createElement("button");
+  branchButton.className = "ghost-button scm-branch";
+  branchButton.title = "Switch branch";
+
+  const syncLabel = document.createElement("span");
+  syncLabel.className = "scm-sync";
+
+  header.append(branchButton, syncLabel);
+
+  const actions = document.createElement("div");
+  actions.className = "scm-actions";
+
+  /** The last status rendered, so an action can report the state it acted on. */
+  let lastStatus: GitStatusView | null = null;
+
+  type Detail = readonly [label: string, value: string];
+
+  const branchDetails = (before: GitStatusView | null): Detail[] => [
+    ["Branch", before?.branch ?? "detached"],
+    ["Upstream", before?.upstream ?? "none"],
+  ];
+
+  /**
+   * Run one git action, refresh, and report what happened.
+   *
+   * Separated from the button so the Git menu can run the same thing. The button is then
+   * only the part that greys itself out while it waits.
+   */
+  async function runAction(
+    label: string,
+    run: () => Promise<GitOutcome>,
+    details: (before: GitStatusView | null) => Detail[],
+  ): Promise<void> {
+    // Captured before the action, because the action is what changes it: reporting
+    // "3 commits pushed" needs the count from before the push zeroed it.
+    const before = lastStatus;
+
+    const outcome = await run().then(
+      (result): GitOutcome => result,
+      // A rejection used to disappear here. `.then` with no `.catch` meant a thrown
+      // IPC or network error skipped the reporting branch entirely, leaving an
+      // unhandled rejection in a console the user does not have open - the exact
+      // case where they most need to be told something went wrong.
+      (error: unknown): GitOutcome => ({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+
+    // The redraw is worth attempting and not worth losing the report over.
+    try {
+      await api.refresh();
+    } catch {
+      /* refresh failing is its own problem; the outcome still gets reported */
+    }
+
+    deps.reportResult({ action: label, ok: outcome.ok, message: outcome.message, details: details(before) });
+  }
+
+  function actionButton(
+    label: string,
+    title: string,
+    pendingLabel: string,
+    run: () => Promise<GitOutcome>,
+    details: (before: GitStatusView | null) => Detail[],
+  ): HTMLButtonElement {
+    const button = document.createElement("button");
+    button.className = "ghost-button";
+    button.textContent = label;
+    button.title = title;
+
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      button.textContent = pendingLabel;
+
+      void runAction(label, run, details).finally(() => {
+        button.disabled = false;
+        button.textContent = label;
+      });
+    });
+
+    return button;
+  }
+
+  /**
+   * Ask for a repository URL and connect it.
+   *
+   * The name is `origin` without asking. It is the convention every hosting service's own
+   * instructions assume, and a first remote called anything else makes every piece of advice
+   * the user will ever read slightly wrong. A second remote is a real choice and this is not
+   * the surface for it.
+   */
+  async function offerRemote(): Promise<void> {
+    const url = await deps.promptFor({
+      title: "Connect to GitHub",
+      body: "Paste the repository URL. On GitHub this is the green Code button - the HTTPS one.",
+      placeholder: "https://github.com/owner/repo.git",
+      confirmLabel: "Connect",
+    });
+    if (url === null || url.trim().length === 0) return;
+
+    const result = await window.adcode.git.addRemote("origin", url.trim());
+    deps.notify(result.message);
+    await api.refresh();
+  }
+
+  /**
+   * "Connect to GitHub", shown only while the repository has no remote.
+   *
+   * Hidden rather than disabled once one exists: a permanently greyed-out button is a question
+   * the user keeps re-asking, and the answer here is simply that the job is done.
+   */
+  /*
+   * Not an `actionButton`: those run a git command that either succeeds or fails, and
+   * report through the result dialog. This asks a question, and the answer - including
+   * "none" - belongs in the panel where the files would have been listed.
+   */
+  const conflictsButton = document.createElement("button");
+  conflictsButton.className = "ghost-button";
+  conflictsButton.textContent = "Check Conflicts";
+  conflictsButton.title = "List the files where both sides changed the same lines";
+  conflictsButton.addEventListener("click", () => {
+    conflictsButton.disabled = true;
+    conflictsButton.textContent = "Checking…";
+
+    void checkConflicts()
+      .then((outcome) => deps.notify(outcome.message))
+      .finally(() => {
+        conflictsButton.disabled = false;
+        conflictsButton.textContent = "Check Conflicts";
+      });
+  });
+
+  const connectButton = document.createElement("button");
+  connectButton.className = "ghost-button";
+  connectButton.textContent = "Connect to GitHub";
+  connectButton.title = "Add the repository URL to push to";
+  connectButton.hidden = true;
+  connectButton.addEventListener("click", () => void offerRemote());
+
+  /**
+   * Start tracking this folder, then offer it somewhere to push.
+   *
+   * The remote is offered straight after initialising, because that is the moment the
+   * question makes sense and the only moment it is obvious. `git init` produces a
+   * repository with nowhere to push, and until this existed nothing in the window could
+   * change that: Push answered "No configured push destination" and advised
+   * `git remote add`, a command the window cannot run. Declining is free, since the
+   * button in the panel offers it again for as long as there is no remote.
+   */
+  async function initRepository(): Promise<void> {
+    const result = await window.adcode.git.init();
+    deps.notify(result.message);
+    await api.refresh();
+
+    if (result.ok) await offerRemote();
+  }
+
+  async function syncRemoteButton(): Promise<void> {
+    const root = deps.workspaceRoot();
+    try {
+      const remotes = await window.adcode.git.remotes();
+      if (root !== deps.workspaceRoot()) return;
+      connectButton.hidden = remotes.length > 0;
+      const selected = githubRemote.value;
+      githubRemote.replaceChildren();
+      for (const remote of remotes) {
+        const url = githubRepositoryUrl(remote.url, "code");
+        if (url === null) continue;
+        const option = document.createElement("option");
+        option.value = remote.name;
+        option.textContent = `${remote.name} · ${url.slice("https://github.com/".length)}`;
+        githubRemote.append(option);
+      }
+      if ([...githubRemote.options].some((option) => option.value === selected)) githubRemote.value = selected;
+      else if ([...githubRemote.options].some((option) => option.value === "origin")) githubRemote.value = "origin";
+      githubRemote.hidden = githubRemote.options.length === 0;
+      githubLinks.hidden = githubRemote.hidden;
+      githubHint.textContent = githubRemote.hidden
+        ? "Connect a github.com remote to access your repository online."
+        : "Opens in your browser using your GitHub account and repository permissions.";
+    } catch {
+      connectButton.hidden = true;
+      githubRemote.hidden = true;
+      githubLinks.hidden = true;
+      githubHint.textContent = "Could not read remotes. Refresh to try again.";
+    }
+  }
+
+  /**
+   * Draw the conflicted files, or say there are none.
+   *
+   * The empty state is the reason the button exists. A reader who presses "Check conflicts"
+   * and sees the section stay hidden has learned nothing about their repository and
+   * something unflattering about the editor.
+   */
+  function renderConflicts(findings: readonly CheckFinding[]): void {
+    conflictsList.replaceChildren();
+    conflicts.hidden = false;
+
+    if (findings.length === 0) {
+      const none = document.createElement("p");
+      none.className = "empty-hint";
+      none.textContent = "No merge conflicts.";
+      conflictsList.append(none);
+      return;
+    }
+
+    for (const finding of findings) {
+      const row = document.createElement("button");
+      row.className = "scm-row scm-conflict-row";
+      row.type = "button";
+      row.title = finding.message;
+
+      const status = document.createElement("span");
+      status.className = "scm-status";
+      status.textContent = "!";
+
+      const name = document.createElement("span");
+      name.className = "scm-path";
+      name.textContent = finding.path;
+
+      row.append(status, name);
+      row.addEventListener("click", () => deps.openFile(finding.path));
+      conflictsList.append(row);
+    }
+  }
+
+  /** Re-read status and report. Shared by the button and the Git menu. */
+  async function checkConflicts(): Promise<CheckOutcome> {
+    await api.refresh();
+    const findings = conflictFindings(lastStatus?.entries ?? []);
+    renderConflicts(findings);
+    return outcomeFor(CHECKS.conflicts, findings);
+  }
+
+
+  actions.append(
+    actionButton("Pull", "Fetch and fast-forward", "Pulling…", () => window.adcode.git.pull(), (before) => [
+      ...branchDetails(before),
+      ["Commits behind", String(before?.behind ?? 0)],
+    ]),
+    actionButton("Push", "Push the current branch", "Pushing…", () => window.adcode.git.push(), (before) => [
+      ...branchDetails(before),
+      ["Commits ahead", String(before?.ahead ?? 0)],
+    ]),
+    actionButton("Fetch", "Fetch all remotes", "Fetching…", () => window.adcode.git.fetch(), branchDetails),
+    conflictsButton,
+    connectButton,
+  );
+
+  const newBranch = document.createElement("button");
+  newBranch.className = "ghost-button";
+  newBranch.textContent = "New branch";
+  newBranch.addEventListener("click", () => void api.createBranch());
+  const refreshButton = document.createElement("button");
+  refreshButton.className = "ghost-button";
+  refreshButton.textContent = "Refresh";
+  refreshButton.addEventListener("click", () => {
+    refreshButton.disabled = true;
+    void api.refresh().catch(() => deps.notify("Could not refresh source control. Try again."))
+      .finally(() => { refreshButton.disabled = false; });
+  });
+  actions.append(newBranch, refreshButton);
+
+  const githubSection = document.createElement("section");
+  githubSection.className = "scm-github";
+  const githubTitle = document.createElement("h3");
+  githubTitle.textContent = "GitHub";
+  const githubHint = document.createElement("p");
+  githubHint.textContent = "Loading repository connections…";
+  const githubRemote = document.createElement("select");
+  githubRemote.className = "scm-github-remote";
+  githubRemote.setAttribute("aria-label", "GitHub repository");
+  githubRemote.hidden = true;
+  const githubLinks = document.createElement("div");
+  githubLinks.className = "scm-github-links";
+  githubLinks.hidden = true;
+  const destinations: readonly (readonly [GitHubDestination, string])[] = [
+    ["new-pull-request", "New pull request"], ["new-issue", "New issue"],
+    ["code", "Code"], ["pulls", "Pull requests"], ["issues", "Issues"],
+    ["actions", "Actions"], ["projects", "Projects"], ["discussions", "Discussions"],
+    ["releases", "Releases"], ["wiki", "Wiki"], ["security", "Security"],
+    ["insights", "Insights"], ["settings", "Settings"],
+  ];
+  for (const [destination, label] of destinations) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost-button";
+    button.textContent = label;
+    button.title = `${label} on GitHub (opens in browser)`;
+    button.addEventListener("click", () => {
+      button.disabled = true;
+      void window.adcode.git.openGitHub(githubRemote.value, destination)
+        .then((result) => deps.notify(result.message))
+        .catch(() => deps.notify("Could not open GitHub. Try again."))
+        .finally(() => { button.disabled = false; });
+    });
+    githubLinks.append(button);
+  }
+  githubSection.append(githubTitle, githubHint, githubRemote, githubLinks);
+
+  const commitBox = document.createElement("form");
+  commitBox.className = "scm-commit";
+
+  const commitToolbar = document.createElement("div");
+  commitToolbar.className = "scm-drawer-actions";
+
+  const changesToggle = document.createElement("button");
+  changesToggle.className = "ghost-button scm-drawer-toggle";
+  changesToggle.type = "button";
+  changesToggle.textContent = "Changes";
+  changesToggle.setAttribute("aria-controls", changesRegion.id);
+
+  const historyToggle = document.createElement("button");
+  historyToggle.className = "ghost-button scm-drawer-toggle";
+  historyToggle.type = "button";
+  historyToggle.textContent = "History";
+  historyToggle.setAttribute("aria-controls", historyRegion.id);
+
+  commitToolbar.append(changesToggle, historyToggle);
+
+  const message = document.createElement("textarea");
+  message.className = "scm-message";
+  message.rows = 2;
+  message.placeholder = "Commit message";
+  message.setAttribute("aria-label", "Commit message");
+
+  const commitButton = document.createElement("button");
+  commitButton.className = "chat-send";
+  commitButton.type = "submit";
+  commitButton.textContent = "Commit";
+
+  commitBox.append(commitToolbar, message, commitButton);
+
+  commitBox.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const text = message.value.trim();
+    if (text.length === 0) {
+      /*
+       * The dialog, not the status bar.
+       *
+       * Git's own "nothing is staged" refusal already lands here, because it comes back
+       * as a failed result. This one is caught before git is asked, and used to report to
+       * an 11px span in the corner that erases itself - so the same gesture, refused for
+       * two different reasons, answered in two different places and one of them was
+       * invisible. A refused action says so where the eye already is.
+       */
+      deps.reportResult({ action: "Commit", ok: false, message: "A commit needs a message." });
+      return;
+    }
+
+    const before = lastStatus;
+    const staged = before?.entries.filter((entry) => entry.staged !== "none").length ?? 0;
+
+    commitButton.disabled = true;
+    commitButton.textContent = "Committing…";
+
+    const commitOnce = (): Promise<GitOutcome> =>
+      window.adcode.git.commit(text).then(
+        (result): GitOutcome => result,
+        (error: unknown): GitOutcome => ({
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+        }),
+      );
+
+    void commitOnce()
+      // Git does not know who is committing: ask here, save it, and commit again.
+      .then(async (outcome) =>
+        !outcome.ok && outcome.reason === "identity" &&
+        (await askGitIdentity({ reason: "Git records a name and email with every commit, and it does not have yours yet." }))
+          ? commitOnce()
+          : outcome,
+      )
+      .then(async (outcome) => {
+        // Only clear the box on success. Losing a written message to a failed commit is
+        // the kind of small betrayal that teaches people to draft somewhere else first.
+        if (outcome.ok) message.value = "";
+
+        try {
+          await api.refresh();
+        } catch {
+          /* the outcome still gets reported */
+        }
+
+        deps.reportResult({
+          action: "Commit",
+          ok: outcome.ok,
+          message: outcome.message,
+          details: [...branchDetails(before), ["Files staged", String(staged)]],
+        });
+      })
+      .finally(() => {
+        commitButton.disabled = false;
+        commitButton.textContent = "Commit";
+      });
+  });
+
+  // Ctrl+Enter commits - the convention every source-control box uses.
+  message.addEventListener("keydown", (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+      event.preventDefault();
+      commitBox.requestSubmit();
+    }
+  });
+
+  const list = document.createElement("div");
+  list.className = "scm-list";
+
+  const empty = document.createElement("p");
+  empty.className = "empty-hint";
+
+  /*
+   * §4: merge-conflict resolution, made askable.
+   *
+   * Above the change list rather than below it, because a conflicted tree is not a normal
+   * one: nothing else in the panel is worth reading until the conflict is dealt with. The
+   * section is hidden until a check has run, so a clean repository is not permanently
+   * carrying a heading about conflicts it does not have.
+   */
+  const conflicts = document.createElement("div");
+  conflicts.className = "scm-section scm-conflicts";
+  conflicts.hidden = true;
+
+  const conflictsTitle = document.createElement("div");
+  conflictsTitle.className = "scm-section-title";
+  conflictsTitle.textContent = "Merge conflicts";
+
+  const conflictsList = document.createElement("div");
+  conflicts.append(conflictsTitle, conflictsList);
+
+  /* §4: file timeline. The history of whatever is open, not of the whole repository -
+     "what happened to this file" is the question people actually ask. */
+  const timeline = document.createElement("div");
+  timeline.className = "scm-section scm-timeline";
+  timeline.hidden = true;
+
+  const timelineTitle = document.createElement("div");
+  timelineTitle.className = "scm-section-title";
+
+  const timelineList = document.createElement("div");
+  timeline.append(timelineTitle, timelineList);
+
+  /* §4's Git group, GitHub-shaped: what happened, and putting one file back. */
+  const history = createCommitBrowser({
+    openCommitDiff: deps.openCommitDiff,
+    restoreFile: deps.restoreFile,
+    notify: deps.notify,
+  });
+
+  changesRegion.append(header, actions, conflicts, list, empty);
+  const commitHeading = document.createElement("div");
+  commitHeading.className = "scm-commit-heading";
+  const commitTitle = document.createElement("h3");
+  commitTitle.textContent = "Commit changes";
+  const commitHint = document.createElement("p");
+  commitHint.textContent = "Stage your files, then describe what changed.";
+  commitHeading.append(commitTitle, commitHint);
+  commitRegion.append(commitHeading, commitBox, githubSection);
+  historyRegion.append(timeline, history.element);
+  element.append(changesRegion, commitRegion, historyRegion);
+
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "icon-button scm-close";
+  close.title = "Close (Esc)";
+  close.setAttribute("aria-label", "Close Source Control");
+  close.append(createIcon(ICON.close));
+  close.addEventListener("click", deps.onRequestClose);
+  element.append(close);
+
+  let activeFile: string | null = null;
+  let timelineEnabled = true;
+  let timelineGeneration = 0;
+  const historyDrawerMedia = window.matchMedia("(max-width: 980px)");
+  const changesDrawerMedia = window.matchMedia("(max-width: 720px)");
+  let historyDrawerToggleable = false;
+  let changesDrawerToggleable = false;
+  let historyDrawerOpen = true;
+  let changesDrawerOpen = true;
+
+  function syncResponsiveDrawers(reset = false): void {
+    const state = (element.dataset["scmState"] ?? "inactive") as
+      | "inactive"
+      | "setup"
+      | "repo";
+    const next = resolveSourceControlDrawers({
+      state,
+      changesMediaMatches: changesDrawerMedia.matches,
+      historyMediaMatches: historyDrawerMedia.matches,
+      changesOpen: changesDrawerOpen,
+      historyOpen: historyDrawerOpen,
+    });
+    const nextHistoryToggleable = next.historyToggleable;
+    const nextChangesToggleable = next.changesToggleable;
+
+    if (reset || nextHistoryToggleable !== historyDrawerToggleable) {
+      historyDrawerToggleable = nextHistoryToggleable;
+      historyDrawerOpen = !historyDrawerToggleable;
+    }
+
+    if (reset || nextChangesToggleable !== changesDrawerToggleable) {
+      changesDrawerToggleable = nextChangesToggleable;
+      changesDrawerOpen = !changesDrawerToggleable;
+    }
+
+    if (!historyDrawerToggleable) historyDrawerOpen = true;
+    if (!changesDrawerToggleable) changesDrawerOpen = true;
+
+    const resolved = resolveSourceControlDrawers({
+      state,
+      changesMediaMatches: changesDrawerMedia.matches,
+      historyMediaMatches: historyDrawerMedia.matches,
+      changesOpen: changesDrawerOpen,
+      historyOpen: historyDrawerOpen,
+    });
+    const changesExpanded = resolved.changesExpanded;
+    const historyExpanded = resolved.historyExpanded;
+
+    element.dataset["changesOpen"] = String(changesExpanded);
+    element.dataset["historyOpen"] = String(historyExpanded);
+    element.dataset["changesToggleable"] = String(changesDrawerToggleable);
+    element.dataset["historyToggleable"] = String(historyDrawerToggleable);
+
+    changesToggle.hidden = !changesDrawerToggleable || commitRegion.hidden;
+    historyToggle.hidden = !historyDrawerToggleable || historyRegion.hidden;
+    changesToggle.disabled = !changesDrawerToggleable;
+    historyToggle.disabled = !historyDrawerToggleable;
+    changesToggle.setAttribute("aria-expanded", String(changesExpanded));
+    historyToggle.setAttribute("aria-expanded", String(historyExpanded));
+    changesToggle.setAttribute("aria-pressed", String(changesExpanded));
+    historyToggle.setAttribute("aria-pressed", String(historyExpanded));
+    const changesHidden = !changesExpanded || changesRegion.hidden;
+    const historyHidden = !historyExpanded || historyRegion.hidden;
+    changesRegion.inert = changesHidden;
+    historyRegion.inert = historyHidden;
+    changesRegion.setAttribute("aria-hidden", String(changesHidden));
+    historyRegion.setAttribute("aria-hidden", String(historyHidden));
+  }
+
+  changesToggle.addEventListener("click", () => {
+    if (!changesDrawerToggleable) return;
+    const next = !changesDrawerOpen;
+    if (next && historyDrawerToggleable) historyDrawerOpen = false;
+    changesDrawerOpen = next;
+    syncResponsiveDrawers();
+  });
+
+  historyToggle.addEventListener("click", () => {
+    if (!historyDrawerToggleable) return;
+    const next = !historyDrawerOpen;
+    if (next && changesDrawerToggleable) changesDrawerOpen = false;
+    historyDrawerOpen = next;
+    syncResponsiveDrawers();
+  });
+
+  historyDrawerMedia.addEventListener("change", () => syncResponsiveDrawers());
+  changesDrawerMedia.addEventListener("change", () => syncResponsiveDrawers());
+  syncResponsiveDrawers(true);
+
+  async function renderTimeline(): Promise<void> {
+    const mine = ++timelineGeneration;
+
+    if (!timelineEnabled || activeFile === null) {
+      timeline.hidden = true;
+      timelineList.replaceChildren();
+      return;
+    }
+
+    const commits = await window.adcode.git.fileHistory(activeFile);
+    // A file opened, closed, and reopened while the history was loading must not end up
+    // showing the previous file's commits.
+    if (mine !== timelineGeneration) return;
+
+    const file = activeFile;
+    timelineTitle.textContent = `Timeline · ${file.split("/").pop() ?? file}`;
+
+    timelineList.replaceChildren();
+
+    if (commits.length === 0) {
+      const none = document.createElement("p");
+      none.className = "empty-hint";
+      none.textContent = "No commits touch this file yet.";
+      timelineList.append(none);
+      timeline.hidden = false;
+      return;
+    }
+
+    for (const commit of commits) {
+      const row = document.createElement("button");
+      row.className = "timeline-row";
+      row.type = "button";
+      row.title = `${commit.hash}\n${commit.author}\n${commit.date}`;
+
+      const subject = document.createElement("span");
+      subject.className = "timeline-subject";
+      subject.textContent = commit.subject;
+
+      const meta = document.createElement("span");
+      meta.className = "timeline-meta";
+      meta.textContent = `${commit.shortHash} · ${commit.author} · ${formatDate(commit.date)}`;
+
+      row.append(subject, meta);
+      row.addEventListener("click", () => deps.openRevision(file, commit.hash, commit.shortHash));
+      timelineList.append(row);
+    }
+
+    timeline.hidden = false;
+  }
+
+  function fileRow(entry: GitStatusView["entries"][number], staged: boolean): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "scm-row";
+    if (entry.isConflicted) row.dataset["conflicted"] = "true";
+
+    const status = document.createElement("span");
+    status.className = "scm-status";
+    status.textContent = entry.isConflicted
+      ? "!"
+      : (CHANGE_LABEL[staged ? entry.staged : entry.worktree] ?? "");
+    status.dataset["kind"] = staged ? entry.staged : entry.worktree;
+
+    const name = document.createElement("span");
+    name.className = "scm-path";
+    name.textContent = entry.path;
+    name.title = entry.path;
+    name.addEventListener("click", () => deps.openFile(entry.path));
+
+    const action = document.createElement("button");
+    action.className = "scm-stage";
+    // Paths, not "+" and "−". See `workbench/icons.ts` on why a maths operator cannot be
+    // centred in a square button.
+    action.replaceChildren(createIcon(staged ? ICON.minus : ICON.plus));
+    action.title = staged ? "Unstage" : "Stage";
+    // The icon is `aria-hidden`, so without this the button loses the accessible name that
+    // the "+" character used to provide and announces as "button".
+    action.ariaLabel = `${action.title} ${entry.path}`;
+    action.addEventListener("click", () => {
+      const call = staged
+        ? window.adcode.git.unstage([entry.path])
+        : window.adcode.git.stage([entry.path]);
+
+      void call.then(() => api.refresh());
+    });
+
+    row.append(status, name, action);
+    return row;
+  }
+
+  function section(title: string, entries: GitStatusView["entries"], staged: boolean): HTMLElement | null {
+    if (entries.length === 0) return null;
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "scm-section";
+
+    const heading = document.createElement("div");
+    heading.className = "scm-section-title";
+    heading.textContent = `${title} (${entries.length})`;
+
+    const bulk = document.createElement("button");
+    bulk.className = "ghost-button";
+    bulk.textContent = staged ? "Unstage all" : "Stage all";
+    bulk.addEventListener("click", () => {
+      const paths = entries.map((entry) => entry.path);
+      const call = staged ? window.adcode.git.unstage(paths) : window.adcode.git.stage(paths);
+      void call.then(() => api.refresh());
+    });
+
+    heading.append(bulk);
+    wrapper.append(heading);
+    for (const entry of entries) wrapper.append(fileRow(entry, staged));
+
+    return wrapper;
+  }
+
+  /**
+   * Switch to an existing branch, or create one by typing a name that is not in the list.
+   *
+   * This used to call `window.prompt`, which throws outright in Electron - "prompt() is
+   * not supported." - inside a `void`-ed async function, so the rejection was swallowed
+   * and clicking the branch name did nothing whatsoever.
+   */
+  async function showBranchSwitcher(): Promise<void> {
+    const branches = await window.adcode.git.branches().catch(() => []);
+    if (branches.length === 0) {
+      deps.reportResult({
+        action: "Switch branch",
+        ok: false,
+        message: "No branches yet - make a commit first.",
+      });
+      return;
+    }
+
+    const current = branches.find((branch) => branch.current);
+
+    const chosen = await deps.promptFor({
+      title: "Switch branch",
+      body: "Pick a branch, or type a new name to create one from here.",
+      value: current?.name ?? "",
+      placeholder: "Branch name",
+      confirmLabel: "Switch",
+      suggestions: branches.map((branch) => branch.name),
+    });
+    if (chosen === null) return;
+
+    if (current !== undefined && chosen === current.name) return;
+
+    const exists = branches.some((branch) => branch.name === chosen);
+    const action = exists ? "Switch branch" : "Create branch";
+
+    const result = await (exists
+      ? window.adcode.git.checkout(chosen)
+      : window.adcode.git.createBranch(chosen)
+    ).catch(
+      (error: unknown): GitOutcome => ({
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      }),
+    );
+
+    try {
+      await api.refresh();
+    } catch {
+      /* the outcome still gets reported */
+    }
+
+    deps.reportResult({
+      action,
+      ok: result.ok,
+      message: result.message,
+      details: [
+        ["From", current?.name ?? "detached"],
+        ["To", chosen],
+      ],
+    });
+  }
+
+  branchButton.addEventListener("click", () => void showBranchSwitcher());
+
+  /** Every path in the status that is staged, or every one that is not. */
+  const pathsWhere = (staged: boolean): string[] =>
+    (lastStatus?.entries ?? [])
+      .filter((entry) => (staged ? entry.staged !== "none" : entry.worktree !== "none"))
+      .map((entry) => entry.path);
+
+  const api: SourceControlPanel = {
+    element,
+
+    focusCommitMessage() {
+      message.focus();
+    },
+
+    pull: () => runAction("Pull", () => window.adcode.git.pull(), (before) => [
+      ...branchDetails(before),
+      ["Commits behind", String(before?.behind ?? 0)],
+    ]),
+
+    push: () => runAction("Push", () => window.adcode.git.push(), (before) => [
+      ...branchDetails(before),
+      ["Commits ahead", String(before?.ahead ?? 0)],
+    ]),
+
+    fetch: () => runAction("Fetch", () => window.adcode.git.fetch(), branchDetails),
+
+    checkConflicts,
+
+    /*
+     * Acts on the status last rendered, so a refresh has to come first - from the menu
+     * there is no panel visible to have refreshed it, and staging the contents of a
+     * status read ten minutes ago is not what "Stage All Changes" means.
+     */
+    async stageAll() {
+      await api.refresh();
+      const paths = pathsWhere(false);
+      if (paths.length === 0) {
+        deps.reportResult({ action: "Stage all", ok: false, message: "Nothing to stage." });
+        return;
+      }
+
+      await runAction("Stage all", () => window.adcode.git.stage(paths), (before) => [
+        ...branchDetails(before),
+        ["Files staged", String(paths.length)],
+      ]);
+    },
+
+    async unstageAll() {
+      await api.refresh();
+      const paths = pathsWhere(true);
+      if (paths.length === 0) {
+        deps.reportResult({ action: "Unstage all", ok: false, message: "Nothing to unstage." });
+        return;
+      }
+
+      await runAction("Unstage all", () => window.adcode.git.unstage(paths), (before) => [
+        ...branchDetails(before),
+        ["Files unstaged", String(paths.length)],
+      ]);
+    },
+
+    commit() {
+      if (message.value.trim().length === 0) return false;
+
+      commitBox.requestSubmit();
+      return true;
+    },
+
+    switchBranch: () => showBranchSwitcher(),
+
+    async createBranch() {
+      const name = await deps.promptFor({
+        title: "Create branch",
+        body: "The new branch starts from where you are now.",
+        placeholder: "Branch name",
+        confirmLabel: "Create",
+      });
+      if (name === null || name.trim().length === 0) return;
+
+      await runAction("Create branch", () => window.adcode.git.createBranch(name.trim()), branchDetails);
+    },
+
+    initRepository: () => initRepository(),
+
+    refreshHistory() {
+      history.invalidate();
+      return history.refresh();
+    },
+
+
+    async refresh(): Promise<void> {
+      const requestedRoot = deps.workspaceRoot();
+      if (requestedRoot === null) {
+        deps.onStatus?.(null);
+        element.dataset["scmState"] = "inactive";
+        timeline.hidden = true;
+        timelineList.replaceChildren();
+        historyRegion.hidden = true;
+        commitRegion.hidden = true;
+        conflicts.hidden = true;
+        conflictsList.replaceChildren();
+        list.replaceChildren();
+        empty.textContent = "Open a folder to use source control.";
+        empty.hidden = false;
+        header.hidden = true;
+        actions.hidden = true;
+        commitBox.hidden = true;
+        syncResponsiveDrawers();
+        return;
+      }
+
+      const status = await window.adcode.git.status();
+      if (requestedRoot !== deps.workspaceRoot()) return;
+      deps.onStatus?.(status);
+      workspaceSummary.textContent = status.isRepo
+        ? `${status.branch ?? "Detached HEAD"} · ${status.entries.length} changed files · ${status.ahead} ahead · ${status.behind} behind`
+        : "Track this project and connect a remote repository";
+      lastStatus = status;
+      history.element.hidden = !status.isRepo;
+      historyRegion.hidden = !status.isRepo;
+
+      if (!status.isRepo) {
+        element.dataset["scmState"] = "setup";
+        timeline.hidden = true;
+        timelineList.replaceChildren();
+        list.replaceChildren();
+        header.hidden = true;
+        actions.hidden = true;
+        commitBox.hidden = true;
+        commitRegion.hidden = true;
+        conflicts.hidden = true;
+        conflictsList.replaceChildren();
+
+        empty.replaceChildren();
+        const text = document.createElement("span");
+        text.textContent =
+          "This folder is not a git repository. Start tracking changes here, then connect it to GitHub when you want a copy online. ";
+
+        const init = document.createElement("button");
+        init.className = "ghost-button";
+        init.textContent = "Initialise";
+        init.addEventListener("click", () => void initRepository());
+
+        empty.append(text, init);
+        empty.hidden = false;
+        syncResponsiveDrawers();
+        return;
+      }
+
+      element.dataset["scmState"] = "repo";
+      header.hidden = false;
+      actions.hidden = false;
+      commitBox.hidden = false;
+      commitRegion.hidden = false;
+      historyRegion.hidden = false;
+      void syncRemoteButton();
+
+      branchButton.textContent = status.branch ?? "detached";
+      syncLabel.textContent =
+        status.ahead === 0 && status.behind === 0
+          ? status.upstream === null
+            ? "no upstream"
+            : "up to date"
+          : `↑${status.ahead} ↓${status.behind}`;
+
+      const staged = status.entries.filter((entry) => entry.staged !== "none" && !entry.isConflicted);
+      const changed = status.entries.filter((entry) => entry.worktree !== "none" && !entry.isConflicted);
+      const conflicted = status.entries.filter((entry) => entry.isConflicted);
+
+      list.replaceChildren();
+      for (const node of [
+        section("Merge conflicts", conflicted, false),
+        section("Staged", staged, true),
+        section("Changes", changed, false),
+      ]) {
+        if (node !== null) list.append(node);
+      }
+
+      empty.textContent = status.isClean ? "No changes." : "";
+      empty.hidden = !status.isClean;
+
+      syncResponsiveDrawers();
+      // History can take much longer than status in a large repository. Neither history
+      // request should delay conflict checks or refreshing the stage/unstage controls.
+      void renderTimeline().catch(() => {});
+      void history.refresh();
+    },
+
+    setActiveFile(path) {
+      if (path === activeFile) return;
+      activeFile = path;
+      void renderTimeline();
+    },
+
+    setTimelineEnabled(enabled) {
+      timelineEnabled = enabled;
+      void renderTimeline();
+    },
+  };
+
+  return api;
+}
+
+/** A commit date, short enough for a sidebar. */
+function formatDate(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+
+  return parsed.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+/** Local history is fine-grained enough that the time is what identifies a version. */
+function formatTime(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+
+  return parsed.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}

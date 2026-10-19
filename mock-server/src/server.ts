@@ -1,0 +1,533 @@
+/**
+ * Local implementation of the serving contract (brief §10).
+ *
+ * Imports nothing from `packages/` - see `contract.ts` for why, and
+ * `.dependency-cruiser.cjs` for the rule that enforces it.
+ *
+ * Node 24 runs this directly with no build step, so it avoids enums, namespaces, and
+ * parameter properties, which type stripping cannot erase.
+ */
+import { randomBytes } from "node:crypto";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import type {
+  BalanceResponseBody,
+  CadenceName,
+  ConfigResponseBody,
+  ReceiptsResponseBody,
+  ServeResponseBody,
+  ServedCreative,
+  SubmittedReceipt,
+} from "./contract.ts";
+
+/** Micros credited per valid impression. The server owns this; the client never computes it. */
+const MICROS_PER_IMPRESSION = 1_500n;
+const MICROS_PER_CLICK = 25_000n;
+
+/** A 1x1 transparent PNG - enough for the asset cache to have real bytes to store. */
+const PNG_1X1 = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+const THEMES = new Set(["light", "dark"]);
+const OUTCOMES = new Set(["impression", "click", "dismissed"]);
+
+/**
+ * The hostname creatives advertise their assets on.
+ *
+ * Brief §1 requires creative assets to be `https` only from an allowlisted host, and
+ * the client's validator enforces exactly that. A mock listening on plain
+ * `http://127.0.0.1` therefore cannot advertise its own address - every creative would
+ * be rejected before a test could assert anything, and the https rule would be
+ * untestable rather than tested.
+ *
+ * So the mock *advertises* https URLs on this host and *serves* bytes on localhost. The
+ * injected `HttpTransport` bridges the two, which is precisely what having it as a port
+ * is for. Nothing weakens: the validator still sees https, still checks the hostname by
+ * exact equality, and still rejects everything else.
+ */
+export const PUBLIC_ASSET_HOST = "cdn.adcode.test";
+
+export interface MockServer {
+  readonly url: string;
+  /** Where assets are really served: `http://127.0.0.1:<port>/assets`. */
+  readonly assetOrigin: string;
+  /** Where creatives *say* their assets live: `https://cdn.adcode.test/assets`. */
+  readonly publicAssetOrigin: string;
+  /** The bare hostname, for the client's allowlist. */
+  readonly assetHost: string;
+  close(): Promise<void>;
+  /** Replace the inventory with an exact list, so a test is not at the mercy of rotation. */
+  seed(creatives: ServedCreative[]): void;
+  setKillSwitch(on: boolean): void;
+  receiptCount(): number;
+  /**
+   * What the last `/v1/serve` request actually asked for.
+   *
+   * The only way to prove from outside the client that targeting is alive. An editor that
+   * never answers the ad client's `IdeSignals` port still serves ads perfectly well - it
+   * just serves untargeted ones - and no assertion on the *response* can tell the two
+   * apart. This is an assertion on the request.
+   */
+  lastServe(): { readonly tags: readonly string[]; readonly themeKind: string } | null;
+  /**
+   * How many serve requests have arrived.
+   *
+   * A client that has stopped asking is indistinguishable from one that is asking and being
+   * refused if all you can see is the last request. Counting is what tells them apart.
+   */
+  serveCount(): number;
+  /**
+   * How many anonymous accounts the Firebase Auth emulator routes have created.
+   *
+   * A smoke run expects exactly one. Zero means the app still signed up in production; two
+   * means one install became two accounts, which is how 181 of the first 633 happened.
+   */
+  signUpCount(): number;
+  /** Fail the next `count` requests with `status`, for backoff tests. */
+  failNext(count: number, status: number): void;
+  /** Return unparseable bytes for the next `count` requests. */
+  corruptNext(count: number): void;
+  /** Delay the next `count` requests by `ms`, for timeout tests. */
+  hangNext(count: number, ms: number): void;
+  /**
+   * Invite claims this mock has accepted, in order. The smoke run puts an invite line on the
+   * clipboard and reads this to prove the app sent exactly that code and nothing else.
+   */
+  claims(): { code: string; how: string }[];
+  /** Another live code, with the first name its invite page shows. */
+  seedInvite(code: string, inviterName: string): void;
+}
+
+interface State {
+  receipts: Map<string, SubmittedReceipt>;
+  availableMicros: bigint;
+  lifetimeMicros: bigint;
+  killSwitch: boolean;
+  seeded: ServedCreative[] | null;
+  lastServe: { tags: string[]; themeKind: string } | null;
+  serveCount: number;
+  /** Anonymous accounts, by the tokens issued to them. */
+  refreshTokens: Map<string, string>;
+  idTokens: Map<string, string>;
+  signUps: number;
+  failures: { remaining: number; status: number };
+  corruptions: number;
+  hangs: { remaining: number; ms: number };
+  /** Live codes and the first name each shows. One account per mock, so one claim. */
+  invites: Map<string, string>;
+  claim: { code: string; how: string } | null;
+  claims: { code: string; how: string }[];
+  showName: boolean;
+}
+
+function freshState(): State {
+  return {
+    receipts: new Map(),
+    availableMicros: 0n,
+    lifetimeMicros: 0n,
+    killSwitch: false,
+    seeded: null,
+    lastServe: null,
+    serveCount: 0,
+    refreshTokens: new Map(),
+    idTokens: new Map(),
+    signUps: 0,
+    failures: { remaining: 0, status: 500 },
+    corruptions: 0,
+    hangs: { remaining: 0, ms: 0 },
+    invites: new Map([["smoke-invite", "Sam"]]),
+    claim: null,
+    claims: [],
+    showName: true,
+  };
+}
+
+/** The mock's invite code: one account per mock server, so one code. */
+const MY_CODE = "mylocal";
+const INVITE_LINE = /^adcode invite:\s*([a-z0-9-]+)$/i;
+const INVITE_LINK = /^(?:https?:\/\/)?(?:www\.)?adcode\.bluethenics\.com\/i\/([a-z0-9-]+)\/?(?:[?#].*)?$/i;
+
+/** Written from the contract, not imported from the service: see this file's header. */
+function inviteCode(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const text = raw.trim();
+  const found = INVITE_LINE.exec(text)?.[1] ?? INVITE_LINK.exec(text)?.[1] ?? (/^[a-z0-9-]+$/i.test(text) ? text : null);
+  const code = found?.toLowerCase() ?? null;
+  return code !== null && /^[a-z0-9][a-z0-9-]{2,31}$/.test(code) ? code : null;
+}
+
+function defaultInventory(assetOrigin: string): ServedCreative[] {
+  const advertisers = [
+    ["sentry", "Sentry", "catch errors before your users do"],
+    ["linear", "Linear", "issue tracking built for speed"],
+    ["fly", "Fly.io", "run your app close to your users"],
+    ["neon", "Neon", "serverless Postgres with branching"],
+    ["resend", "Resend", "email for developers"],
+  ];
+
+  return advertisers.map(([slug, advertiser, headline], index) => ({
+    creativeId: `cr-${slug}-${index}`,
+    advertiser: advertiser!,
+    headline: headline!,
+    body: null,
+    clickUrl: `https://${slug}.example/`,
+    logoLight: `${assetOrigin}/${slug}-light.png`,
+    logoDark: `${assetOrigin}/${slug}-dark.png`,
+    ttlMs: 600_000,
+  }));
+}
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk: string) => {
+      data += chunk;
+      if (data.length > 1_000_000) reject(new Error("body too large"));
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+function send(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(payload);
+}
+
+/** Firebase's error shape, `{ error: { message } }`, which is what the client reads. */
+function refuse(res: ServerResponse, message: string): void {
+  send(res, 400, { error: { code: 400, message } });
+}
+
+/** Random and URL-safe. 21 bytes is 28 characters, the length of a real Firebase uid. */
+const randomToken = (bytes: number): string => randomBytes(bytes).toString("base64url");
+
+function hasBearer(req: IncomingMessage): boolean {
+  const header = req.headers.authorization;
+  if (typeof header !== "string") return false;
+  if (!header.startsWith("Bearer ")) return false;
+  return header.slice("Bearer ".length).trim().length > 0;
+}
+
+function validReceipt(value: unknown): value is SubmittedReceipt {
+  if (typeof value !== "object" || value === null) return false;
+  const r = value as Record<string, unknown>;
+  return (
+    typeof r["receiptId"] === "string" &&
+    r["receiptId"].length > 0 &&
+    typeof r["creativeId"] === "string" &&
+    typeof r["shownAt"] === "number" &&
+    typeof r["dwellMs"] === "number" &&
+    typeof r["themeKind"] === "string" &&
+    THEMES.has(r["themeKind"]) &&
+    typeof r["outcome"] === "string" &&
+    OUTCOMES.has(r["outcome"])
+  );
+}
+
+export async function createMockServer(options: { port?: number } = {}): Promise<MockServer> {
+  const state = freshState();
+
+  const server = createHttpServer((req, res) => {
+    void handle(req, res).catch(() => {
+      if (!res.headersSent) send(res, 500, { error: "internal" });
+    });
+  });
+
+  let assetOrigin = "";
+  const publicAssetOrigin = `https://${PUBLIC_ASSET_HOST}/assets`;
+
+  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const url = new URL(req.url ?? "/", `http://127.0.0.1`);
+    const path = url.pathname;
+
+    if (path === "/__test__/reset" && req.method === "POST") {
+      Object.assign(state, freshState());
+      send(res, 200, { ok: true });
+      return;
+    }
+
+    if (path.startsWith("/assets/")) {
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "max-age=600" });
+      res.end(PNG_1X1);
+      return;
+    }
+
+    /*
+     * Firebase Auth, at the paths its emulator uses: `<origin>/identitytoolkit.googleapis.com/...`.
+     *
+     * Only what an anonymous account needs - sign up, refresh, look up. Linking stays
+     * unanswered, because there is no provider here to link to. Outside `/v1/`, so no bearer
+     * token: these are the calls that obtain one.
+     */
+    if (path === "/identitytoolkit.googleapis.com/v1/accounts:signUp" && req.method === "POST") {
+      const uid = randomToken(21);
+      const refreshToken = `mock-refresh-${randomToken(24)}`;
+      const idToken = `mock-id-${randomToken(24)}`;
+      state.signUps += 1;
+      state.refreshTokens.set(refreshToken, uid);
+      state.idTokens.set(idToken, uid);
+      send(res, 200, { idToken, refreshToken, localId: uid, expiresIn: "3600" });
+      return;
+    }
+
+    if (path === "/securetoken.googleapis.com/v1/token" && req.method === "POST") {
+      const form = new URLSearchParams(await readBody(req));
+      const refreshToken = form.get("refresh_token") ?? "";
+      const uid = state.refreshTokens.get(refreshToken);
+      if (form.get("grant_type") !== "refresh_token" || uid === undefined) {
+        refuse(res, "INVALID_REFRESH_TOKEN");
+        return;
+      }
+
+      const idToken = `mock-id-${randomToken(24)}`;
+      state.idTokens.set(idToken, uid);
+      send(res, 200, { id_token: idToken, refresh_token: refreshToken, user_id: uid, expires_in: "3600" });
+      return;
+    }
+
+    if (path === "/identitytoolkit.googleapis.com/v1/accounts:lookup" && req.method === "POST") {
+      const parsed: unknown = JSON.parse((await readBody(req)) || "{}");
+      const idToken = (parsed as Record<string, unknown>)["idToken"];
+      const uid = typeof idToken === "string" ? state.idTokens.get(idToken) : undefined;
+      if (uid === undefined) {
+        refuse(res, "INVALID_ID_TOKEN");
+        return;
+      }
+
+      // No `providerUserInfo`: still anonymous, as every account here is.
+      send(res, 200, { users: [{ localId: uid }] });
+      return;
+    }
+
+    if (!path.startsWith("/v1/")) {
+      send(res, 404, { error: "not found" });
+      return;
+    }
+
+    // Public in the real service too: an invite page is read by someone with no account.
+    const inviteLookup = /^\/v1\/invite\/([^/]+)$/.exec(path);
+    if (inviteLookup !== null && req.method === "GET") {
+      const code = inviteCode(decodeURIComponent(inviteLookup[1] ?? ""));
+      const name = code === null ? undefined : state.invites.get(code);
+      send(res, 200, name === undefined ? { valid: false, inviterName: null, kind: null } : { valid: true, inviterName: name, kind: "user" });
+      return;
+    }
+
+    if (!hasBearer(req)) {
+      send(res, 401, { error: "missing bearer token" });
+      return;
+    }
+
+    // Fault injection, applied before any real work so it models a server that is down
+    // rather than one that answered incorrectly.
+    if (state.hangs.remaining > 0) {
+      state.hangs.remaining -= 1;
+      await new Promise((resolve) => setTimeout(resolve, state.hangs.ms));
+    }
+
+    if (state.failures.remaining > 0) {
+      state.failures.remaining -= 1;
+      send(res, state.failures.status, { error: "injected failure" });
+      return;
+    }
+
+    if (state.corruptions > 0) {
+      state.corruptions -= 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"availableMicros": NOT VALID JSON');
+      return;
+    }
+
+    if (path === "/v1/serve" && req.method === "POST") {
+      const parsed: unknown = JSON.parse((await readBody(req)) || "{}");
+      const body = parsed as Record<string, unknown>;
+
+      if (
+        !Array.isArray(body["tags"]) ||
+        typeof body["themeKind"] !== "string" ||
+        !THEMES.has(body["themeKind"]) ||
+        typeof body["count"] !== "number"
+      ) {
+        send(res, 400, { error: "malformed serve request" });
+        return;
+      }
+
+      // Recorded after validation, so what is kept is a request the contract accepted.
+      state.serveCount += 1;
+      state.lastServe = {
+        tags: (body["tags"] as unknown[]).filter((t): t is string => typeof t === "string"),
+        themeKind: body["themeKind"],
+      };
+
+      const inventory = state.seeded ?? defaultInventory(publicAssetOrigin);
+      const count = Math.max(0, Math.min(Math.floor(body["count"]), inventory.length));
+      const payload: ServeResponseBody = { creatives: inventory.slice(0, count) };
+      send(res, 200, payload);
+      return;
+    }
+
+    if (path === "/v1/receipts" && req.method === "POST") {
+      const parsed: unknown = JSON.parse((await readBody(req)) || "{}");
+      const list = (parsed as Record<string, unknown>)["receipts"];
+
+      if (!Array.isArray(list) || !list.every(validReceipt)) {
+        send(res, 400, { error: "malformed receipts" });
+        return;
+      }
+
+      const acked: string[] = [];
+      for (const receipt of list) {
+        // Idempotent by receipt ID: a client that retries after flaky wifi must not be
+        // paid twice, and must not lose the earning either.
+        if (!state.receipts.has(receipt.receiptId)) {
+          state.receipts.set(receipt.receiptId, receipt);
+          const credit =
+            receipt.outcome === "impression"
+              ? MICROS_PER_IMPRESSION
+              : receipt.outcome === "click"
+                ? MICROS_PER_CLICK
+                : 0n;
+          state.availableMicros += credit;
+          state.lifetimeMicros += credit;
+        }
+        acked.push(receipt.receiptId);
+      }
+
+      const payload: ReceiptsResponseBody = { acked };
+      send(res, 200, payload);
+      return;
+    }
+
+    if (path === "/v1/balance" && req.method === "GET") {
+      const payload: BalanceResponseBody = {
+        availableMicros: state.availableMicros.toString(),
+        lifetimeMicros: state.lifetimeMicros.toString(),
+      };
+      send(res, 200, payload);
+      return;
+    }
+
+    if (path === "/v1/config" && req.method === "GET") {
+      // Deviation D1: the server computes projected micros-per-hour per preset, so the
+      // client can show the earnings/interruption trade-off without doing arithmetic
+      // on money.
+      const perHour = (perDay: number, capPerDay: number): string =>
+        (MICROS_PER_IMPRESSION * BigInt(Math.min(perDay, capPerDay))).toString();
+
+      const projections: Record<CadenceName, string> = {
+        off: "0",
+        light: perHour(1, 4),
+        standard: perHour(2, 8),
+        max: perHour(4, 20),
+      };
+
+      const payload: ConfigResponseBody = {
+        killSwitch: state.killSwitch,
+        caps: { minIntervalMs: 1_800_000, dailyCap: 8 },
+        projections,
+      };
+      send(res, 200, payload);
+      return;
+    }
+
+    if (path === "/v1/referrals" && (req.method === "GET" || req.method === "PATCH")) {
+      if (req.method === "PATCH") {
+        const parsed = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+        if (typeof parsed["showName"] !== "boolean") {
+          send(res, 400, { error: "malformed change" });
+          return;
+        }
+        state.showName = parsed["showName"];
+      }
+      send(res, 200, {
+        code: MY_CODE,
+        link: `https://adcode.bluethenics.com/i/${MY_CODE}`,
+        showName: state.showName,
+        inviterPreview: "A developer invited you to ADCode",
+        claimed: state.claim !== null,
+        invitedBy: state.claim === null ? null : (state.invites.get(state.claim.code) ?? null),
+        canClaim: state.claim === null,
+        claimEndsAt: Date.now() + 14 * 86_400_000,
+        people: { claimed: 0, seen: 0, cameBack: 0 },
+        advertisers: 0,
+        earnedMicros: "0",
+        last30Micros: "0",
+        rates: { userPercent: 10, advertiserPercent: 5, windowDays: 365 },
+      });
+      return;
+    }
+
+    if (path === "/v1/referrals/claim" && req.method === "POST") {
+      const parsed = JSON.parse((await readBody(req)) || "{}") as Record<string, unknown>;
+      const code = inviteCode(parsed["code"]);
+      const how = parsed["how"];
+      if (code === null || (how !== "clipboard" && how !== "paste" && how !== "web")) {
+        send(res, 400, { error: "malformed claim" });
+        return;
+      }
+      if (state.claim !== null) {
+        send(res, 409, { error: "already-claimed" });
+        return;
+      }
+      const name = state.invites.get(code);
+      if (name === undefined) {
+        send(res, 409, { error: "unknown-code" });
+        return;
+      }
+      state.claim = { code, how };
+      state.claims.push({ code, how });
+      send(res, 200, { ok: true, inviterName: name });
+      return;
+    }
+
+    send(res, 404, { error: "not found" });
+  }
+
+  await new Promise<void>((resolve) => server.listen(options.port ?? 0, "127.0.0.1", resolve));
+
+  const address = server.address() as AddressInfo;
+  const url = `http://127.0.0.1:${address.port}`;
+  assetOrigin = `${url}/assets`;
+
+  return {
+    url,
+    assetOrigin,
+    publicAssetOrigin,
+    assetHost: PUBLIC_ASSET_HOST,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        // A client's idle keep-alive sockets would otherwise hold the close open - an app
+        // that has just been killed can leave some behind for a while.
+        server.closeAllConnections();
+      }),
+    seed: (creatives) => {
+      state.seeded = creatives;
+    },
+    setKillSwitch: (on) => {
+      state.killSwitch = on;
+    },
+    receiptCount: () => state.receipts.size,
+    lastServe: () => state.lastServe,
+    serveCount: () => state.serveCount,
+    signUpCount: () => state.signUps,
+    failNext: (count, status) => {
+      state.failures = { remaining: count, status };
+    },
+    corruptNext: (count) => {
+      state.corruptions = count;
+    },
+    hangNext: (count, ms) => {
+      state.hangs = { remaining: count, ms };
+    },
+    claims: () => state.claims.map((c) => ({ ...c })),
+    seedInvite: (code, inviterName) => {
+      state.invites.set(code, inviterName);
+    },
+  };
+}

@@ -1,0 +1,7389 @@
+/**
+ * Smoke launch: start the built app against this repository, drive it over CDP, quit.
+ *
+ * `npm run verify` proves the logic; a build proves it compiles. Neither proves a window
+ * paints, that the preload bridge is reachable, or that a real `git blame` comes back
+ * through IPC - all of which have broken here before and none of which a unit test sees.
+ *
+ * It seeds a session file so §4's "Restore workspace" reopens this repository on launch,
+ * which is also what gives the git checks something real to answer about.
+ *
+ * Run after `npm run build`:  node scripts/smoke.mjs
+ */
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import process from "node:process";
+import { createRequire } from "node:module";
+import { releaseDirectory } from "./release-directory.mjs";
+import { startSmokeBackend } from "./smoke-backend.mjs";
+
+const REPO = process.cwd();
+
+// The `electron` package's main export is the path to the real executable, which is what
+// has to be spawned: the `.bin` shim is a .cmd on Windows and `spawn` refuses it.
+//
+// `--packaged` points the same checks at the installer's output instead, which is the
+// only way to find out whether packaging produced a working app rather than a working
+// developer machine.
+const require = createRequire(join(REPO, "package.json"));
+
+const packaged = process.argv.includes("--packaged");
+const electronPath = packaged
+  ? join(releaseDirectory(REPO), process.platform === "win32" ? "win-unpacked" : "linux-unpacked", process.platform === "win32" ? "ADCode.exe" : "ADCode")
+  : require("electron");
+
+// A packaged app *is* the app; an unpackaged Electron has to be told where it lives.
+const appArgs = packaged ? [] : ["apps/desktop"];
+
+// Keep the long-standing default for callers, while allowing concurrent or isolated smoke
+// launches to avoid attaching to another Electron instance's DevTools endpoint.
+const PORT = Number(process.env.ADCODE_SMOKE_PORT ?? "9333");
+
+// A file that is committed, so the history and blame checks have something to find.
+const TRACKED_FILE = join(REPO, "package.json");
+const SCM_SMOKE_NAME = `adcode-smoke-scm-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`;
+const SCM_SMOKE_FILE = join(REPO, SCM_SMOKE_NAME);
+const CHAT_SMOKE_SESSION = {
+  id: "smoke-chat-history",
+  title: "Smoke saved conversation",
+  renamed: true,
+  createdAt: 1,
+  updatedAt: 2,
+  messages: [
+    { role: "user", text: "Saved Chat request", at: 1 },
+    { role: "assistant", text: "Saved Chat response", at: 2 },
+  ],
+};
+
+// A throwaway userData directory, pre-seeded so §4's "Restore workspace" has something to
+// restore. That is also what gives the git checks a real repository to run against.
+const userData = await mkdtemp(join(tmpdir(), "adcode-smoke-"));
+await mkdir(userData, { recursive: true });
+await writeFile(
+  join(userData, "session.json"),
+  JSON.stringify({
+    state: {
+      root: REPO,
+      openFiles: [TRACKED_FILE],
+      activeFile: TRACKED_FILE,
+    },
+  }),
+  "utf8",
+);
+const chatSessionDirectory = join(
+  userData,
+  "ai-sessions",
+  createHash("sha256").update(REPO).digest("hex").slice(0, 16),
+);
+await mkdir(chatSessionDirectory, { recursive: true });
+await writeFile(
+  join(chatSessionDirectory, `${CHAT_SMOKE_SESSION.id}.json`),
+  JSON.stringify(CHAT_SMOKE_SESSION),
+  "utf8",
+);
+
+// Codex and some CI launchers use Electron's executable as a Node runtime. That inherited
+// switch would make the child run this package as a script and no renderer could exist.
+/*
+ * `ADCODE_PIN_PROMPT` is what lets `pinPromptAsksToPin` below see a card at all.
+ *
+ * This run drives an unpackaged build, and `pinEligibility` refuses to ask there on every
+ * platform - a development run installs no Start Menu shortcut, so Windows resolves the
+ * AppUserModelID to nothing and hides "Pin to taskbar" from the jump list, and a card
+ * pointing at a menu entry that is not there is worse than no card. Forcing it here is the
+ * only way to exercise the card without packaging and installing first.
+ */
+/*
+ * `ADCODE_UPDATE_SIMULATE` is what lets `updateReadyVisible` below see an update at all.
+ *
+ * An unpackaged build has no update feed. With this set, Help > Check for Updates walks
+ * the updater through downloading to "ready" without a network, and Restart to update is
+ * recorded instead of quitting. A packaged build ignores it.
+ */
+/*
+ * `backend.env` points the ad server and Firebase Auth at the mock, so this run no longer
+ * signs up a production account and counts as a new developer every time it launches.
+ * `accountMadeLocally` below fails if anything goes back to production.
+ */
+const backend = await startSmokeBackend();
+// Diagnose identity retries without logging credentials or changing the account check.
+let authTraceCount = 0;
+const authTrace = process.env.ADCODE_SMOKE_AUTH_TRACE === "1" ? setInterval(() => {
+  const count = backend.server.signUpCount();
+  if (count !== authTraceCount) {
+    process.stdout.write(`authTrace: ${JSON.stringify({ count, at: new Date().toISOString() })}\n`);
+    authTraceCount = count;
+  }
+}, 250) : null;
+authTrace?.unref();
+const childEnv = {
+  ...process.env,
+  ...backend.env,
+  ADCODE_USER_DATA_DIR: userData,
+  ELECTRON_ENABLE_LOGGING: "1",
+  ADCODE_PIN_PROMPT: "1",
+  ADCODE_UPDATE_SIMULATE: "1",
+};
+delete childEnv.ELECTRON_RUN_AS_NODE;
+
+const child = spawn(
+  electronPath,
+  [
+    ...appArgs,
+    "--enable-logging",
+    // Automation must keep painting even when the terminal or IDE covers the window.
+    "--disable-renderer-backgrounding",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    `--remote-debugging-port=${PORT}`,
+    `--user-data-dir=${userData}`,
+  ],
+  {
+    cwd: REPO,
+    env: childEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+    shell: false,
+  },
+);
+
+let output = "";
+child.stdout.on("data", (chunk) => (output += chunk.toString()));
+child.stderr.on("data", (chunk) => (output += chunk.toString()));
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const EVALUATE_TIMEOUT_MS = 15_000;
+
+/** Poll the DevTools endpoint until the renderer target shows up. */
+async function findTarget() {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${PORT}/json/list`);
+      const targets = await response.json();
+      const page = targets.find(
+        (target) => target.type === "page" && target.webSocketDebuggerUrl,
+      );
+      if (page !== undefined) return page;
+    } catch {
+      // The port is not listening yet; that is the normal first second or two.
+    }
+    await sleep(500);
+  }
+  throw new Error("no renderer target appeared");
+}
+
+const target = await findTarget();
+// Fail before driving the app if it ignored the isolated application profile.
+let isolatedProfileReady = false;
+for (let attempt = 0; attempt < 80; attempt++) {
+  try {
+    await access(join(userData, "ads", "ads", "identity.json"));
+    isolatedProfileReady = true;
+    break;
+  } catch { await sleep(250); }
+}
+if (!isolatedProfileReady) {
+  child.kill();
+  await backend.server.close();
+  throw new Error("The app did not initialize its temporary account profile; refusing to drive a real profile");
+}
+let socket = new WebSocket(target.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  socket.addEventListener("open", resolve, { once: true });
+  socket.addEventListener("error", reject, { once: true });
+});
+
+let nextId = 1;
+const pending = new Map();
+
+const onSocketMessage = (event) => {
+  const message = JSON.parse(event.data);
+  const settle = pending.get(message.id);
+  if (settle !== undefined) {
+    pending.delete(message.id);
+    settle(message);
+  }
+};
+socket.addEventListener("message", onSocketMessage);
+
+function send(method, params) {
+  const id = nextId++;
+  socket.send(JSON.stringify({ id, method, params }));
+  return new Promise((resolve) => pending.set(id, resolve));
+}
+
+/** Evaluate an expression in the page and return its value. */
+async function evaluate(expression) {
+  let timeout;
+  const request = send("Runtime.evaluate", {
+    expression,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  const message = await Promise.race([
+    request,
+    new Promise((resolve) => {
+      timeout = setTimeout(() => resolve(null), EVALUATE_TIMEOUT_MS);
+    }),
+  ]);
+  clearTimeout(timeout);
+
+  if (message === null) {
+    return `THREW: Runtime.evaluate timed out after ${String(EVALUATE_TIMEOUT_MS)}ms`;
+  }
+
+  if (message.result?.exceptionDetails !== undefined) {
+    return `THREW: ${message.result.exceptionDetails.exception?.description ?? "unknown"}`;
+  }
+
+  return message.result?.result?.value;
+}
+
+// CDP can attach before the first document has loaded. Wait for the restored editor
+// instead of assuming a fixed delay is enough on a cold or removable drive.
+await send("Page.bringToFront", {});
+await send("Emulation.setFocusEmulationEnabled", { enabled: true });
+const startupDeadline = Date.now() + 60_000;
+while (Date.now() < startupDeadline) {
+  const ready = await evaluate(`Boolean(
+    document.body.dataset.sessionReady === 'true' &&
+    document.querySelector('.monaco-editor') &&
+    document.querySelector('#filetree .tree-row') &&
+    document.getElementById('status-workspace')?.textContent !== 'No folder'
+  )`);
+  if (ready === true) break;
+  await sleep(250);
+}
+
+// The IDE is a second OS window. Keep Vibe open and attach to the new renderer.
+const vibeModeBefore = await evaluate("document.body.dataset.workspaceMode");
+const vibeNavigation = await evaluate(`(() => {
+  const visible = selector => {
+    const element = document.querySelector(selector);
+    return !!element && getComputedStyle(element).display !== 'none' && element.getBoundingClientRect().width > 0;
+  };
+  const hostedHistory = document.querySelector('.vibe-history-host > .chat-history');
+  const historyRow = hostedHistory?.querySelector('.chat-history-row');
+  const historyOptions = historyRow?.querySelector('.chat-history-options');
+  const titleStyle = historyRow ? getComputedStyle(historyRow.querySelector('.chat-history-open')) : null;
+  historyOptions?.click();
+  const historyMenu = document.querySelector('.menu-panel[data-context]')?.textContent ?? '';
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  document.querySelector('.project-tools')?.click();
+  const toolsMenu = document.querySelector('.menu-panel[data-context]')?.textContent ?? '';
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  const notificationButton = document.querySelector('.vibe-notifications-button');
+  notificationButton?.click();
+  const inboxOpened = !document.querySelector('.notification-inbox')?.hidden;
+  document.querySelector('.notification-inbox-close')?.click();
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+  // The everyday workflows are sidebar rows, not entries in an overflow menu.
+  const changesLabel = document.querySelector('.vibe-changes-button')?.getAttribute('aria-label') ?? '';
+  const card = document.querySelector('.vibe-project-card');
+  return {
+    docked: document.body.dataset.vibeRail === 'docked',
+    automations: visible('.vibe-automations-button'),
+    // Chat, Agents and Tools are pages; Chat is the one showing at launch.
+    pages: visible('.vibe-page-item.vibe-page-agents') && visible('.vibe-page-item.vibe-page-tools') &&
+      document.querySelector('.vibe-page-item.vibe-page-chat')?.getAttribute('aria-current') === 'page',
+    tools: visible('.project-tools'),
+    noTasksRow: document.querySelector('.vibe-tasks-button') === null,
+    changes: visible('.vibe-changes-button') && changesLabel.startsWith('Changes - '),
+    // Edits land as the assistant works unless the user chose Review.
+    approvalAuto: document.querySelector('.chat-approval')?.textContent === 'Auto',
+    noReviewNag: !(document.querySelector('.chat-disclaimer')?.textContent ?? '').includes('Review'),
+    preview: visible('.vibe-preview-nav'),
+    team: toolsMenu.includes('Set up AI team'),
+    projectCard: visible('.vibe-project-card') && card?.querySelector('.vibe-project-name')?.textContent === ${JSON.stringify(REPO.split(/[\\/]/).pop())},
+    openIde: visible('.vibe-ide-button') && document.querySelector('.vibe-header-ide-button') === null,
+    // Sponsored cards arrive on the right with other notifications, not in the sidebar.
+    noSidebarAdSlot: document.getElementById('vibe-sponsored-slot') === null,
+    history: !!hostedHistory,
+    historyOptions: !historyRow || !!historyOptions && historyMenu.includes('Rename conversation') && historyMenu.includes('Delete conversation'),
+    readableTitles: !titleStyle || titleStyle.whiteSpace === 'normal' && titleStyle.webkitLineClamp === '2',
+    inboxOpened,
+    inboxClosed: document.querySelector('.notification-inbox')?.hidden === true,
+  };
+})()`);
+// Agent controls in the chat: Stop where the work shows, menus that tint rather than fill,
+// Customise chat and Usage that open, and Zoom and Text size that reach the window.
+const chatControls = await evaluate(`(async () => {
+  const frame = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const card = document.querySelector('.chat-card');
+  // The accent as the page paints it, to compare a menu row's background against.
+  const probe = document.createElement('span');
+  probe.style.background = 'var(--accent)';
+  document.body.append(probe);
+  const accent = getComputedStyle(probe).backgroundColor;
+  probe.style.background = 'var(--danger)';
+  const dangerColour = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  const row = document.querySelector('.vibe-history-host .chat-history-row');
+  const options = row?.querySelector('.chat-history-options');
+  const optionsLeft = options?.getBoundingClientRect().left ?? null;
+  options?.click();
+  await frame();
+  const menu = document.querySelector('.menu-panel[data-context]');
+  const items = menu ? [...menu.querySelectorAll('.menu-item')] : [];
+  const focused = items.find((item) => item === document.activeElement) ?? items[0];
+  const danger = items.find((item) => item.dataset.danger === 'true');
+  const menuEvidence = {
+    focusedBackground: focused ? getComputedStyle(focused).backgroundColor : null,
+    dangerBackground: danger ? getComputedStyle(danger).backgroundColor : null,
+    // The position it was given, not its box: menus scale in, and mid-animation the box is not where it lands.
+    menuLeft: menu ? parseFloat(menu.style.left) : null,
+    buttonLeft: optionsLeft,
+  };
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await frame();
+
+  card?.querySelector('[data-chat-action="usage"]')?.click();
+  let usage = null;
+  for (let attempt = 0; attempt < 40 && usage === null; attempt++) {
+    const dialog = document.querySelector('dialog.ai-usage-dialog[open]');
+    if (dialog && !dialog.querySelector('.usage-body')?.textContent?.includes('Loading')) {
+      usage = {
+        tabs: dialog.querySelectorAll('.usage-tabs [role="tab"]').length,
+        selected: dialog.querySelector('.usage-tabs [aria-selected="true"]')?.textContent ?? '',
+        body: (dialog.querySelector('.usage-body')?.textContent ?? '').slice(0, 80),
+      };
+      dialog.querySelector('.usage-footer .ad-btn-primary')?.click();
+    } else await wait(100);
+  }
+  await frame();
+
+  card?.querySelector('[data-chat-action="appearance"]')?.click();
+  let appearance = null;
+  for (let attempt = 0; attempt < 40 && appearance === null; attempt++) {
+    const dialog = document.querySelector('dialog.chat-appearance-dialog[open]');
+    if (dialog) {
+      appearance = {
+        shapes: dialog.querySelectorAll('.agents-shapes [role="radio"]').length,
+        colours: dialog.querySelectorAll('.agents-colors [role="radio"]').length,
+        styles: dialog.querySelectorAll('.chat-appearance-styles [role="radio"]').length,
+        previewAuthor: dialog.querySelector('.chat-appearance-preview .chat-author-name')?.textContent ?? '',
+      };
+      [...dialog.querySelectorAll('button')].find((button) => button.textContent === 'Cancel')?.click();
+    } else await wait(100);
+  }
+  await frame();
+
+  const ratioBefore = window.devicePixelRatio;
+  await window.adcode.settings.write('adcode.appearance.zoom', '125');
+  await wait(400);
+  const ratioZoomed = window.devicePixelRatio;
+  await window.adcode.settings.write('adcode.appearance.zoom', '100');
+  await window.adcode.settings.write('adcode.appearance.textSize', 'larger');
+  await wait(200);
+  const scale = getComputedStyle(document.documentElement).getPropertyValue('--text-scale').trim();
+  await window.adcode.settings.write('adcode.appearance.textSize', 'default');
+  await wait(400);
+  const usageView = await window.adcode.aiUsage.read('7d');
+
+  return {
+    // Idle: no "is writing" row in the conversation. smoke:live checks it while a turn runs.
+    noWorkingRowWhileIdle: !card?.querySelector('.chat-transcript .chat-working:not([hidden])'),
+    menuRowsNotFilledWithAccent: !!focused && menuEvidence.focusedBackground !== accent,
+    dangerRowNotSolidRed: !danger || menuEvidence.dangerBackground !== dangerColour,
+    menuOpensUnderTheButton: !row || (menuEvidence.menuLeft !== null && menuEvidence.buttonLeft !== null && Math.abs(menuEvidence.menuLeft - menuEvidence.buttonLeft) <= 2),
+    usageDialogOpens: usage?.tabs === 4 && usage.selected.length > 0,
+    usageIpcAnswers: typeof usageView === 'object' && usageView !== null && typeof usageView.totals?.requests === 'number',
+    customiseDialogOpens: appearance?.shapes === 8 && appearance.colours === 10 && appearance.styles === 3 && appearance.previewAuthor.length > 0,
+    zoomSettingReachesWindow: Math.abs(ratioZoomed / ratioBefore - 1.25) < 0.02 && Math.abs(window.devicePixelRatio - ratioBefore) < 0.02,
+    textSizeReachesChat: scale === '1.25',
+    evidence: { accent, ...menuEvidence, usage, appearance, ratioBefore, ratioZoomed, scale },
+  };
+})()`);
+
+// The Changes panel, read only: this smoke runs against the real repository, so nothing is
+// clicked that would stage, revert or commit.
+await evaluate("document.querySelector('.vibe-changes-button')?.click()");
+let changesPanel = null;
+for (let attempt = 0; attempt < 60 && changesPanel === null; attempt++) {
+  changesPanel = await evaluate(`(() => {
+    const bar = document.querySelector('.changes-bar');
+    if (!bar || bar.getClientRects().length === 0) return null;
+    const rows = [...document.querySelectorAll('.changes-row')];
+    return {
+      tabs: [...document.querySelectorAll('.context-tabs button')].map((tab) => tab.textContent).join(','),
+      commitButton: document.querySelector('.changes-commit-main')?.textContent ?? '',
+      branch: document.querySelector('.changes-branch')?.textContent ?? '',
+      rows: rows.length,
+      everyRowHasRevertAndCheckbox: rows.every((row) => row.querySelector('.changes-revert') && row.querySelector('input.changes-include')),
+      rowsFit: rows.every((row) => row.scrollWidth <= row.clientWidth + 1),
+      caption: document.querySelector('.changes-caption')?.textContent ?? '',
+    };
+  })()`);
+  if (changesPanel === null) await sleep(150);
+}
+// Nothing docks on the right: Changes floats over the page, and the page keeps the width.
+const vibeNoRightSidebar = await evaluate(`(() => {
+  const panel = document.getElementById('floating-context');
+  const workspace = document.getElementById('vibe-workspace')?.getBoundingClientRect();
+  return {
+    changesFloats: !!panel && !panel.hidden && getComputedStyle(panel).position === 'fixed' &&
+      panel.getAttribute('role') === 'dialog' && panel.getAttribute('aria-modal') === 'false',
+    workspaceReachesRightEdge: !!workspace && workspace.right >= window.innerWidth - 2,
+    noDock: document.getElementById('assistant-dock') === null && document.getElementById('splitter-assistant') === null,
+  };
+})()`);
+await evaluate("document.querySelector('.vibe-changes-button')?.click()");
+// Agents and Tools are pages of their own; the board and the tool cards render for real.
+const vibePages = await evaluate(`(async () => {
+  const wait = async (test) => { for (let i = 0; i < 60 && !test(); i++) await new Promise((r) => setTimeout(r, 100)); };
+  document.querySelector('.vibe-page-item.vibe-page-agents')?.click();
+  await wait(() => document.querySelectorAll('#vibe-page-agents .agent-card').length > 1);
+  const agents = document.getElementById('vibe-page-agents');
+  const board = agents?.querySelector('.agents-page');
+  const result = {
+    agentsShown: !!agents && !agents.hidden && document.getElementById('vibe-page-chat')?.hidden === true,
+    agentsCurrent: document.querySelector('.vibe-page-item.vibe-page-agents')?.getAttribute('aria-current') === 'page',
+    threeColumns: agents?.querySelectorAll('.agents-column [role=list]').length === 3,
+    startersAndNew: (agents?.querySelectorAll('.agent-card').length ?? 0) >= 2,
+    mascotsDrawn: (agents?.querySelectorAll('.agent-card .agent-mascot-body').length ?? 0) >= 1,
+    agentsFullWidth: (agents?.getBoundingClientRect().right ?? 0) >= window.innerWidth - 2,
+    agentsNoOverflow: !!board && board.scrollWidth <= board.clientWidth + 1,
+  };
+  document.querySelector('.vibe-page-item.vibe-page-tools')?.click();
+  await wait(() => document.querySelectorAll('#tools-panel-built-in .tool-card').length > 0);
+  const tools = document.getElementById('vibe-page-tools');
+  result.toolsShown = !!tools && !tools.hidden;
+  result.toolsTabs = tools?.querySelectorAll('[role=tab]').length === 4;
+  // One card per row of BUILT_IN_TOOLS_INFO (renderer/tools/builtInTools.ts).
+  result.builtInCards = tools?.querySelectorAll('#tools-panel-built-in .tool-card').length === 22;
+  document.querySelector('.vibe-page-item.vibe-page-chat')?.click();
+  await wait(() => document.getElementById('vibe-page-chat')?.hidden === false);
+  result.backToChat = document.getElementById('vibe-page-chat')?.hidden === false && !!document.querySelector('#vibe-page-chat .chat-card');
+  return result;
+})()`);
+/*
+ * Long chat memory and motion, in the real Vibe window: the composer shows how full the
+ * model's context is, its menu offers Compact now and View summary, /compact on a new
+ * conversation says there is nothing to compact instead of sending anything, and Vibe runs
+ * the lively motion personality.
+ */
+const memoryAndMotion = await evaluate(`(async () => {
+  const wait = async (test) => { for (let i = 0; i < 40 && !test(); i++) await new Promise((r) => setTimeout(r, 100)); };
+  const chat = document.getElementById('vibe-page-chat');
+  const meter = chat?.querySelector('.chat-context-meter');
+  await wait(() => /^\\d{1,3}%$/.test(meter?.querySelector('.composer-meter-value')?.textContent ?? '') && (meter?.title ?? '').length > 0);
+  const result = {
+    motionLively: document.documentElement.dataset.motion === 'lively',
+    meterInComposer: !!meter && !!meter.closest('.chat-composer-footer'),
+    meterReads: /^\\d{1,3}%$/.test(meter?.querySelector('.composer-meter-value')?.textContent ?? '') && meter?.querySelector('.composer-meter-label')?.textContent === 'Context',
+    meterExplains: / tokens\\. /.test(meter?.title ?? ''),
+  };
+  meter?.click();
+  await wait(() => !!document.querySelector('.menu-panel'));
+  const labels = [...document.querySelectorAll('.menu-panel .menu-item')].map((node) => node.textContent ?? '');
+  result.meterMenu = labels.some((label) => label.includes('Compact now')) && labels.some((label) => label.includes('View summary'));
+  document.querySelector('.menu-panel')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  await wait(() => !document.querySelector('.menu-panel'));
+  const input = chat?.querySelector('.chat-input');
+  const bubbles = chat?.querySelectorAll('.chat-bubble').length ?? 0;
+  if (input) {
+    input.focus();
+    input.value = '/compact';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  }
+  const notice = () => chat?.querySelector('.chat-composer-notice')?.textContent ?? '';
+  await wait(() => /nothing to compact/i.test(notice()));
+  result.compactExplainsEmpty = /nothing to compact/i.test(notice());
+  result.compactSendsNothing = (chat?.querySelectorAll('.chat-bubble').length ?? 0) === bubbles && input?.value === '';
+  return result;
+})()`);
+const windowScreenshotPaths = [];
+if (process.argv.includes("--visual-only")) {
+  const response = await send("Page.captureScreenshot", { format: "png", fromSurface: true });
+  if (typeof response.result?.data === "string") {
+    const path = join(tmpdir(), "adcode-vibe-window.png");
+    await writeFile(path, Buffer.from(response.result.data, "base64"));
+    windowScreenshotPaths.push(path);
+  }
+  await evaluate("document.querySelector('.vibe-notifications-button')?.click()");
+  const inboxShot = await send("Page.captureScreenshot", { format: "png", fromSurface: true });
+  if (typeof inboxShot.result?.data === "string") {
+    const path = join(tmpdir(), "adcode-notification-inbox.png");
+    await writeFile(path, Buffer.from(inboxShot.result.data, "base64"));
+    windowScreenshotPaths.push(path);
+  }
+  await evaluate("document.querySelector('.notification-inbox-close')?.click()");
+}
+await evaluate("window.adcode.window.openIde()");
+let ideTarget;
+for (let attempt = 0; attempt < 80; attempt++) {
+  const response = await fetch(`http://127.0.0.1:${PORT}/json/list`).catch(() => null);
+  const targets = response === null ? [] : await response.json();
+  ideTarget = targets.find((candidate) => candidate.type === "page" && candidate.url?.includes("#/ide") && candidate.webSocketDebuggerUrl);
+  if (ideTarget !== undefined) break;
+  await sleep(250);
+}
+if (ideTarget === undefined) throw new Error("Open IDE did not create a renderer window");
+const vibeSocket = socket;
+socket = new WebSocket(ideTarget.webSocketDebuggerUrl);
+await new Promise((resolve, reject) => {
+  socket.addEventListener("open", resolve, { once: true });
+  socket.addEventListener("error", reject, { once: true });
+});
+socket.addEventListener("message", onSocketMessage);
+await send("Page.bringToFront", {});
+await send("Emulation.setFocusEmulationEnabled", { enabled: true });
+for (let attempt = 0; attempt < 240; attempt++) {
+  if (await evaluate("Boolean(document.body.dataset.sessionReady === 'true' && document.body.dataset.workspaceMode === 'code' && document.getElementById('status-workspace')?.textContent !== 'No folder' && document.querySelector('.monaco-editor') && document.querySelector('#filetree .tree-row') && document.querySelector('#tabs .tab'))") === true) break;
+  await sleep(250);
+}
+await sleep(250);
+const ideSocket = socket;
+const ideMode = await evaluate("document.body.dataset.workspaceMode");
+await evaluate("window.adcode.window.openIde()");
+const rendererCount = (await (await fetch(`http://127.0.0.1:${PORT}/json/list`)).json())
+  .filter((candidate) => candidate.type === "page" && candidate.url?.includes("index.html")).length;
+socket = vibeSocket;
+const vibeModeAfter = await evaluate("document.body.dataset.workspaceMode");
+socket = ideSocket;
+vibeSocket.close();
+if (process.argv.includes("--visual-only")) {
+  const response = await send("Page.captureScreenshot", { format: "png", fromSurface: true });
+  if (typeof response.result?.data === "string") {
+    const path = join(tmpdir(), "adcode-code-window.png");
+    await writeFile(path, Buffer.from(response.result.data, "base64"));
+    windowScreenshotPaths.push(path);
+  }
+}
+await evaluate("(() => { const panel = document.getElementById('floating-assistant'); if (panel && !panel.hidden) document.getElementById('ai-toggle').click(); })()");
+async function openExpandedAssistant() {
+  await evaluate(`(() => {
+    const dialog = document.querySelector('dialog[data-popup-id="chat"]');
+    if (dialog?.open) return;
+    const card = document.querySelector('.chat-card');
+    if (card?.closest('#floating-assistant')) {
+      if (document.getElementById('floating-assistant').hidden) document.getElementById('ai-toggle').click();
+      card.querySelector('.chat-presentation')?.click();
+    } else document.getElementById('ai-toggle')?.click();
+  })()`);
+  await sleep(300);
+}
+const checks = {
+  separateWindows: vibeModeBefore === "vibe" && vibeModeAfter === "vibe" && ideMode === "code" && rendererCount === 2,
+  vibeNavigation: Object.values(vibeNavigation).every(Boolean),
+  chatControls: typeof chatControls === "object" && chatControls !== null &&
+    Object.entries(chatControls).filter(([key]) => key !== "evidence").every(([, value]) => value === true),
+  chatControlsEvidence: chatControls,
+  vibeNoRightSidebar: typeof vibeNoRightSidebar === "object" && vibeNoRightSidebar !== null && Object.values(vibeNoRightSidebar).every(Boolean),
+  vibeNoRightSidebarEvidence: vibeNoRightSidebar,
+  vibeAgentsAndToolsPages: typeof vibePages === "object" && vibePages !== null && Object.values(vibePages).every(Boolean),
+  vibeAgentsAndToolsPagesEvidence: vibePages,
+  chatMemoryAndMotion: typeof memoryAndMotion === "object" && memoryAndMotion !== null && Object.values(memoryAndMotion).every(Boolean),
+  chatMemoryAndMotionEvidence: memoryAndMotion,
+  changesPanel: changesPanel !== null && changesPanel.tabs === "Project,Changes" && /Commit & Push|Push/.test(changesPanel.commitButton)
+    && changesPanel.everyRowHasRevertAndCheckbox && changesPanel.rowsFit && changesPanel.caption.length > 0,
+  changesPanelEvidence: changesPanel,
+  title: await evaluate("document.title"),
+  activities: await evaluate(
+    "document.querySelectorAll('.activity[data-view]').length",
+  ),
+  monacoMounted: await evaluate(
+    "document.querySelectorAll('.monaco-editor').length > 0",
+  ),
+
+  // §4 session restore: the folder and the editor came back without anyone clicking.
+  restoredWorkspace: await evaluate(
+    "document.getElementById('status-workspace').textContent",
+  ),
+  restoredTab: await evaluate("document.querySelectorAll('.tab').length"),
+  treeHasRows: await evaluate(
+    "document.querySelectorAll('#filetree .tree-row').length > 5",
+  ),
+
+  // §4 git: a real repository answers real questions.
+  isRepo: await evaluate("window.adcode.git.status().then((s) => s.isRepo)"),
+  branch: await evaluate("window.adcode.git.status().then((s) => s.branch)"),
+  historyCount: await evaluate(
+    "window.adcode.git.fileHistory('package.json').then((c) => c.length > 0)",
+  ),
+  blameWorks: await evaluate(
+    "window.adcode.git.blame('package.json').then((b) => b.length > 10)",
+  ),
+  showFileWorks: await evaluate(
+    "window.adcode.git.showFile('HEAD', 'package.json').then((t) => typeof t === 'string' && t.includes('adcode'))",
+  ),
+  lineChangesShape: await evaluate(
+    "window.adcode.git.lineChanges('package.json').then((c) => Array.isArray(c))",
+  ),
+
+  // §4 search over the real tree.
+  searchFindsSomething: await evaluate(
+    "window.adcode.search.run({ pattern: 'findConflicts', include: '*.ts' }).then((h) => h.length > 2)",
+  ),
+  quickOpenRanks: await evaluate(
+    "window.adcode.search.quickOpen('conflicts').then((h) => h[0]?.path ?? '(none)')",
+  ),
+};
+
+/*
+ * The welcome sheet.
+ *
+ * Driven rather than waited for: the smoke run seeds its own `userData`, so this machine
+ * has never been welcomed and the sheet is on a 900ms timer from first paint. That timer
+ * has usually already fired by the time these run, which is why this opens it directly
+ * rather than racing it.
+ *
+ * What matters is that every step is escapable. First launch is promised to have no
+ * account and no wall, so a tour that could trap somebody - no skip, no Escape, a modal
+ * over an editor they cannot reach - would be a worse bug than the tour not existing.
+ *
+ * **This runs first, and dismissing it is the point.** It used to sit near the end of the
+ * file, which meant every pointer-driven check above it was aimed at a window with a modal
+ * over it: the menu bar did not open, no context menu appeared, the assistant and feedback
+ * buttons swallowed their clicks, and the sidebar and panel would not drag. Every one of
+ * those reported a string rather than `false`, so the run still exited 0 while roughly
+ * forty checks were quietly testing the onboarding dialog instead of the editor. The tour
+ * is escapable, so escaping it here is also the honest way to reach the app behind it.
+ */
+checks.onboardingIsSkippable = await (async () => {
+  const opened = await evaluate(
+    `(() => {
+       const existing = document.querySelector('dialog.onboarding');
+       if (existing === null) return 'no onboarding sheet in the document';
+       if (!existing.open) existing.showModal();
+       return {
+         steps: existing.querySelectorAll('.onboarding-dot').length,
+         hasSkip: existing.querySelector('.onboarding-skip') !== null,
+         hasIdeaBox: existing.querySelector('textarea.onboarding-idea') !== null,
+         ideaChips: existing.querySelectorAll('.onboarding-idea-chip').length,
+         heading: existing.querySelector('.onboarding-head h2')?.textContent ?? null,
+       };
+     })()`,
+  );
+  if (typeof opened === "string") return opened;
+
+  // Escape must close it. A modal that ignores Escape is a modal somebody is stuck in.
+  await evaluate(
+    `(() => { document.querySelector('dialog.onboarding')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`,
+  );
+  await evaluate("document.querySelector('dialog.onboarding')?.close(); true");
+  await sleep(300);
+
+  return {
+    ...opened,
+    closes:
+      (await evaluate(
+        "document.querySelector('dialog.onboarding')?.open === false",
+      )) === true,
+    // Once dismissed it must stay dismissed, or every launch reopens it.
+    remembered:
+      (await evaluate("window.adcode.onboarding.completed()")) === true,
+  };
+})();
+
+/*
+ * The pin card, which is the only thing allowed to appear once the tour is gone.
+ *
+ * Two reasons it is checked here rather than at the end. The first is that this is when it
+ * happens: it is offered on the tour closing, and a check further down would be looking
+ * for a card that had already been dismissed by some other click. The second is the lesson
+ * directly above - it is `position: fixed` over the bottom-right corner, which is where the
+ * status bar, the assistant button and the earnings readout all live, so leaving it up
+ * would aim every pointer-driven check below it at a card instead of at the editor.
+ *
+ * Windows and macOS get instructions rather than a button that pins, because neither OS
+ * lets an application pin itself; `main/pinPromptPolicy.ts` has the citations. So the
+ * assertion is that the steps exist and stay hidden until somebody asks for them.
+ */
+checks.pinPromptAsksToPin = await (async () => {
+  // Offered `PIN_PROMPT_DELAY_MS` after the tour closes, then one IPC round trip to
+  // decide. Waited out rather than polled: if it is late, it is broken.
+  await sleep(2400);
+
+  const drawn = await evaluate(
+    `(() => {
+       const card = document.querySelector('.pin-card');
+       if (card === null) return 'no pin card after the tour closed';
+       return {
+         state: card.dataset.state ?? null,
+         title: card.querySelector('.pin-card-title')?.textContent ?? null,
+         stepsHiddenUntilAsked: card.querySelector('.pin-card-steps')?.hidden === true,
+         primary: card.querySelector('.pin-card-primary')?.textContent ?? null,
+         offersNever: card.querySelector('.pin-card-never') !== null,
+       };
+     })()`,
+  );
+  if (typeof drawn === "string") return drawn;
+
+  await evaluate("document.querySelector('.pin-card-primary')?.click(); true");
+  await sleep(250);
+  const steps = await evaluate(
+    `(() => {
+       const list = document.querySelector('.pin-card-steps');
+       if (list === null || list.hidden) return 0;
+       return list.querySelectorAll('li').length;
+     })()`,
+  );
+
+  // "Not now", which must close the card WITHOUT settling the question - the second ask
+  // on a later launch depends on this being a dismissal rather than an answer.
+  await evaluate("document.querySelector('.pin-card-later')?.click(); true");
+  await sleep(400);
+
+  return {
+    ...drawn,
+    stepsShownOnRequest: steps,
+    dismissed:
+      (await evaluate("document.querySelector('.pin-card') === null")) === true,
+  };
+})();
+
+/*
+ * The activity rail and sidebar are one navigation system.
+ *
+ * A selected icon closes its own view; choosing another icon opens the shared sidebar on
+ * that view. These are observable shell behaviors, not source-shape assertions, and they
+ * also prove the sidebar never unmounts the editor underneath it.
+ */
+checks.sidebarShellEvidence = await (async () => {
+  const initial = await evaluate(
+    `(() => {
+       const workbench = document.getElementById('workbench');
+       const explorer = document.querySelector('.activity[data-sidebar-view="explorer"]');
+       return {
+         hasState: workbench?.dataset.sidebarOpen === 'true',
+         explorerPressed: explorer?.getAttribute('aria-pressed') === 'true',
+       };
+     })()`,
+  );
+
+  await evaluate(
+    `document.querySelector('.activity[data-sidebar-view="explorer"]')?.click(); true`,
+  );
+  await sleep(220);
+  const collapsed = await evaluate(
+    `document.getElementById('workbench')?.dataset.sidebarOpen === 'false'`,
+  );
+
+  await evaluate(
+    `document.querySelector('.activity[data-sidebar-view="search"]')?.click(); true`,
+  );
+  await sleep(220);
+  const switched = await evaluate(
+    `(() => {
+       const workbench = document.getElementById('workbench');
+       const search = document.getElementById('view-search');
+       return (
+         workbench?.dataset.sidebarOpen === 'true' &&
+         search?.hidden === false &&
+         document.querySelector('.activity[data-sidebar-view="search"]')?.getAttribute('aria-pressed') === 'true'
+       );
+     })()`,
+  );
+
+  return { ...initial, collapsed, switched };
+})();
+checks.sidebarShell =
+  checks.sidebarShellEvidence?.hasState === true &&
+  checks.sidebarShellEvidence?.explorerPressed === true &&
+  checks.sidebarShellEvidence?.collapsed === true &&
+  checks.sidebarShellEvidence?.switched === true;
+
+checks.anchoredToolsEvidence = await (async () => {
+  const before = await evaluate(
+    `(() => {
+       const sidebar = document.getElementById('sidebar')?.getBoundingClientRect();
+       const editor = document.getElementById('editor-area')?.getBoundingClientRect();
+       return sidebar && editor
+         ? { sidebar: { width: sidebar.width }, editor: { width: editor.width } }
+         : null;
+     })()`,
+  );
+
+  await evaluate(`document.getElementById('open-structure')?.click(); true`);
+  await sleep(220);
+  const structure = await evaluate(
+    `(() => {
+       const popup = document.querySelector('[data-popup-id="structure"]');
+       const surface = popup?.querySelector('.popup-shell-surface');
+       const sidebar = document.getElementById('sidebar')?.getBoundingClientRect();
+       const editor = document.getElementById('editor-area')?.getBoundingClientRect();
+       return {
+         open: popup?.open === true,
+         structureOpen: document.querySelector('[data-popup-id="structure"]')?.open === true,
+         sidebarWidth: sidebar?.width ?? -1,
+         editorWidth: editor?.width ?? -1,
+         rounded: surface ? parseFloat(getComputedStyle(surface).borderRadius) >= 4 : false,
+       };
+     })()`,
+  );
+  await evaluate(`document.getElementById('open-earnings')?.click(); true`);
+  await sleep(220);
+  const switchedToEarnings = await evaluate(
+    `(() => {
+       const popup = document.querySelector('[data-popup-id="earnings"]');
+       const surface = popup?.querySelector('.popup-shell-surface');
+       const sidebar = document.getElementById('sidebar')?.getBoundingClientRect();
+       const editor = document.getElementById('editor-area')?.getBoundingClientRect();
+       return {
+         open: popup?.open === true,
+         structureOpen: document.querySelector('[data-popup-id="structure"]')?.open === true,
+         sidebarWidth: sidebar?.width ?? -1,
+         editorWidth: editor?.width ?? -1,
+         rounded: surface ? parseFloat(getComputedStyle(surface).borderRadius) >= 4 : false,
+       };
+     })()`,
+  );
+  await evaluate(`document.getElementById('open-structure')?.click(); true`);
+  await sleep(220);
+  const switchedToStructure = await evaluate(
+    `(() => ({
+       structureOpen: document.querySelector('[data-popup-id="structure"]')?.open === true,
+       earningsOpen: document.querySelector('[data-popup-id="earnings"]')?.open === true,
+     }))()`,
+  );
+  await evaluate(
+    `document.getElementById('editor-area')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); true`,
+  );
+  const outsideClosed = await waitForPopupsClosed([
+    '[data-popup-id="structure"]',
+    '[data-popup-id="earnings"]',
+  ]);
+  await evaluate(`document.getElementById('open-structure')?.click(); true`);
+  await sleep(180);
+  await evaluate(
+    `document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); true`,
+  );
+  const documentEscapeCloses = await waitForPopupsClosed([
+    '[data-popup-id="structure"]',
+  ]);
+
+  return {
+    structureOpen: structure?.open === true,
+    earningsOpen: switchedToEarnings?.open === true,
+    directSwitchToEarnings:
+      switchedToEarnings?.open === true &&
+      switchedToEarnings?.structureOpen === false,
+    directSwitchToStructure:
+      switchedToStructure?.structureOpen === true &&
+      switchedToStructure?.earningsOpen === false,
+    outsidePressCloses: outsideClosed === true,
+    documentEscapeCloses: documentEscapeCloses === true,
+    sidebarStable:
+      before?.sidebar.width === structure?.sidebarWidth &&
+      before?.sidebar.width === switchedToEarnings?.sidebarWidth,
+    editorStable:
+      before?.editor.width === structure?.editorWidth &&
+      before?.editor.width === switchedToEarnings?.editorWidth,
+    rounded:
+      structure?.rounded === true && switchedToEarnings?.rounded === true,
+  };
+})();
+checks.anchoredTools =
+  checks.anchoredToolsEvidence?.structureOpen === true &&
+  checks.anchoredToolsEvidence?.earningsOpen === true &&
+  checks.anchoredToolsEvidence?.sidebarStable === true &&
+  checks.anchoredToolsEvidence?.editorStable === true &&
+  checks.anchoredToolsEvidence?.rounded === true &&
+  checks.anchoredToolsEvidence?.directSwitchToEarnings === true &&
+  checks.anchoredToolsEvidence?.directSwitchToStructure === true &&
+  checks.anchoredToolsEvidence?.outsidePressCloses === true &&
+  checks.anchoredToolsEvidence?.documentEscapeCloses === true;
+
+checks.panelMaximizeEvidence = await (async () => {
+  await evaluate("document.getElementById('terminal-new')?.click(); true");
+  await sleep(500);
+  const before = await evaluate(
+    "document.getElementById('panel')?.getBoundingClientRect().height ?? 0",
+  );
+  await evaluate("document.getElementById('panel-maximize')?.click(); true");
+  await sleep(320);
+  const maximized = await evaluate(
+    `(() => ({
+      state: document.querySelector('.main')?.dataset.panelMaximized === 'true',
+      pressed: document.getElementById('panel-maximize')?.getAttribute('aria-pressed') === 'true',
+      editorHidden: getComputedStyle(document.getElementById('editor-area')).display === 'none',
+      height: document.getElementById('panel')?.getBoundingClientRect().height ?? 0,
+    }))()`,
+  );
+  await evaluate("document.getElementById('panel-close')?.click(); true");
+  await sleep(180);
+  const closed = await evaluate(
+    `document.querySelector('.main')?.dataset.panelMaximized === 'false' && getComputedStyle(document.getElementById('editor-area')).display !== 'none'`,
+  );
+  await evaluate("document.getElementById('terminal-new')?.click(); true");
+  await sleep(320);
+  const reopened = await evaluate(
+    `document.querySelector('.main')?.dataset.panelMaximized === 'true' && document.getElementById('panel-maximize')?.getAttribute('aria-pressed') === 'true'`,
+  );
+  await evaluate("document.getElementById('panel-maximize')?.click(); true");
+  await sleep(320);
+  const restored = await evaluate(
+    `document.querySelector('.main')?.dataset.panelMaximized === 'false' && getComputedStyle(document.getElementById('editor-area')).display !== 'none'`,
+  );
+  return { before, ...maximized, closed, reopened, restored };
+})();
+checks.panelMaximize =
+  checks.panelMaximizeEvidence?.state === true &&
+  checks.panelMaximizeEvidence?.pressed === true &&
+  checks.panelMaximizeEvidence?.editorHidden === true &&
+  checks.panelMaximizeEvidence?.height > checks.panelMaximizeEvidence?.before &&
+  checks.panelMaximizeEvidence?.closed === true &&
+  checks.panelMaximizeEvidence?.reopened === true &&
+  checks.panelMaximizeEvidence?.restored === true;
+
+if (process.env.ADCODE_SMOKE_WORKBENCH_PROBE === "1") {
+  process.stdout.write(
+    `  sidebarShell: ${JSON.stringify(checks.sidebarShellEvidence)}\n`,
+  );
+  process.stdout.write(
+    `  anchoredTools: ${JSON.stringify(checks.anchoredToolsEvidence)}\n`,
+  );
+  process.stdout.write(
+    `  panelMaximize: ${JSON.stringify(checks.panelMaximizeEvidence)}\n`,
+  );
+  socket.close();
+  child.kill();
+  await sleep(500);
+  await rm(userData, { recursive: true, force: true }).catch(() => {});
+  process.exit(
+    checks.sidebarShell && checks.anchoredTools && checks.panelMaximize ? 0 : 1,
+  );
+}
+
+await openSourceControl();
+checks.scmWorkspaceShell = await evaluate(
+  `(() => {
+     const popup = document.querySelector('[data-popup-id="source-control"]');
+     return {
+       open: popup?.open === true,
+       titlebarVisible: (document.getElementById('titlebar')?.getBoundingClientRect().height ?? 0) > 20,
+       statusbarVisible: (document.getElementById('statusbar')?.getBoundingClientRect().height ?? 0) > 12,
+       launcherPressed: document.querySelector('.activity[data-view="scm"]')?.getAttribute('aria-pressed') === 'true',
+       regions:
+         popup?.querySelector('.scm-changes-region') !== null &&
+         popup?.querySelector('.scm-commit-region') !== null &&
+         popup?.querySelector('.scm-history-region') !== null,
+       drawerControlsLabelRegions: [...popup.querySelectorAll('.scm-drawer-toggle')].every((button) =>
+         button.getAttribute('aria-controls') ===
+           (button.textContent === 'Changes' ? 'scm-changes-region' : 'scm-history-region')),
+     };
+   })()`,
+);
+checks.scmCloseButtonVisible = await evaluate(
+  `(() => {
+     const popup = document.querySelector('[data-popup-id="source-control"]');
+     const button = popup?.querySelector('.scm-close');
+     const rect = button?.getBoundingClientRect();
+     const surface = popup?.querySelector('.popup-shell-surface')?.getBoundingClientRect();
+     return button?.getAttribute('aria-label') === 'Close Source Control' &&
+       rect !== undefined && rect.width > 0 && rect.height > 0 &&
+       surface !== undefined && rect.left >= surface.left && rect.top >= surface.top &&
+       rect.right <= surface.right && rect.bottom <= surface.bottom &&
+       rect.left >= 0 && rect.top >= 0 && rect.right <= innerWidth && rect.bottom <= innerHeight;
+   })()`,
+);
+checks.scmCloseAndDrawerControlsDoNotOverlap = await evaluate(
+  `(() => {
+     const popup = document.querySelector('[data-popup-id="source-control"]');
+     const close = popup?.querySelector('.scm-close')?.getBoundingClientRect();
+     const toggle = popup?.querySelector('.scm-drawer-toggle:not([hidden])')?.getBoundingClientRect();
+     if (close === undefined || toggle === undefined) return true;
+     return close.right <= toggle.left || toggle.right <= close.left ||
+       close.bottom <= toggle.top || toggle.bottom <= close.top;
+   })()`,
+);
+await evaluate(
+  `document.querySelector('.activity[data-view="scm"]')?.click(); true`,
+);
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  if (
+    await evaluate(
+      `document.querySelector('[data-popup-id="source-control"]')?.open === false`,
+    )
+  )
+    break;
+  await sleep(100);
+}
+checks.scmLauncherToggleCloses = await evaluate(
+  `document.querySelector('[data-popup-id="source-control"]')?.open === false`,
+);
+checks.scmKeyboardCloseRestoresEditor = await (async () => {
+  await evaluate("document.querySelector('.monaco-editor textarea')?.focus(); true");
+  await pressChord("g", { shift: true });
+
+  const openedFromKeyboard = await evaluate(
+    `document.querySelector('[data-popup-id="source-control"]')?.open === true &&
+      document.querySelector('[data-popup-id="source-control"]')?.dataset.input === "keyboard"`,
+  );
+  if (openedFromKeyboard !== true) return false;
+
+  await pressEscape();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await evaluate("document.querySelector('[data-popup-id=\"source-control\"]')?.open === false && document.activeElement?.closest('.monaco-editor') !== null") === true) break;
+    await sleep(50);
+  }
+  return await evaluate(
+    `document.querySelector('[data-popup-id="source-control"]')?.open === false &&
+      document.activeElement?.closest(".monaco-editor") !== null`,
+  );
+})();
+await openSourceControl();
+checks.scmShowsBranch = await evaluate(
+  "document.querySelector('.scm-branch')?.textContent",
+);
+checks.timelineRows = await evaluate(
+  "document.querySelectorAll('.timeline-row').length > 0",
+);
+checks.scmRowsStillStageAndUnstage = await (async () => {
+  try {
+    await access(SCM_SMOKE_FILE).then(
+      () => {
+        throw new Error(`fixture unexpectedly exists: ${SCM_SMOKE_NAME}`);
+      },
+      () => {},
+    );
+    await evaluate(
+      `(async () => {
+       await window.adcode.files.createFile(${JSON.stringify(REPO)}, ${JSON.stringify(SCM_SMOKE_NAME)});
+       await window.adcode.files.write(${JSON.stringify(SCM_SMOKE_FILE)}, 'source control smoke\\n');
+       return true;
+     })()`,
+    );
+    await pressEscape();
+    await openSourceControl();
+
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const found = await evaluate(
+        `(() => [...document.querySelectorAll('.scm-row')].some(
+        (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+      ))()`,
+      );
+      if (found === true) break;
+      await sleep(150);
+    }
+
+    const before = await evaluate(
+      `(() => {
+       const row = [...document.querySelectorAll('.scm-row')].find(
+         (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+       );
+       return row?.querySelector('.scm-stage')?.getAttribute('aria-label') ?? null;
+     })()`,
+    );
+    if (before !== `Stage ${SCM_SMOKE_NAME}`) return false;
+
+    await evaluate(
+      `(() => {
+       const row = [...document.querySelectorAll('.scm-row')].find(
+         (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+       );
+       row?.querySelector('.scm-stage')?.click();
+       return true;
+     })()`,
+    );
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const ready =
+        await evaluate(`(() => [...document.querySelectorAll('.scm-row')].some(
+      (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)} &&
+        entry.querySelector('.scm-stage')?.getAttribute('aria-label') === ${JSON.stringify(`Unstage ${SCM_SMOKE_NAME}`)},
+    ))()`);
+      if (ready === true) break;
+      await sleep(150);
+    }
+
+    const staged = await evaluate(
+      `(() => {
+       const row = [...document.querySelectorAll('.scm-row')].find(
+         (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+       );
+       return row?.querySelector('.scm-stage')?.getAttribute('aria-label') ?? null;
+     })()`,
+    );
+    if (staged !== `Unstage ${SCM_SMOKE_NAME}`) return false;
+
+    await evaluate(
+      `(() => {
+       const row = [...document.querySelectorAll('.scm-row')].find(
+         (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+       );
+       row?.querySelector('.scm-stage')?.click();
+       return true;
+     })()`,
+    );
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const ready =
+        await evaluate(`(() => [...document.querySelectorAll('.scm-row')].some(
+      (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)} &&
+        entry.querySelector('.scm-stage')?.getAttribute('aria-label') === ${JSON.stringify(`Stage ${SCM_SMOKE_NAME}`)},
+    ))()`);
+      if (ready === true) break;
+      await sleep(150);
+    }
+
+    const unstaged = await evaluate(
+      `(() => {
+       const row = [...document.querySelectorAll('.scm-row')].find(
+         (entry) => entry.querySelector('.scm-path')?.textContent === ${JSON.stringify(SCM_SMOKE_NAME)},
+       );
+       return row?.querySelector('.scm-stage')?.getAttribute('aria-label') ?? null;
+     })()`,
+    );
+
+    return unstaged === `Stage ${SCM_SMOKE_NAME}`;
+  } finally {
+    await evaluate(
+      `(async () => {
+         await window.adcode.git.unstage([${JSON.stringify(SCM_SMOKE_NAME)}]).catch(() => null);
+         await window.adcode.files.delete(${JSON.stringify(SCM_SMOKE_FILE)}).catch(() => null);
+         return true;
+       })()`,
+    ).catch(() => null);
+  }
+})();
+
+checks.messageLifecyclePersistence = await (async () => {
+  const text = "Smoke keeps this message";
+  await evaluate(
+    `(() => {
+       const field = document.querySelector('.scm-message');
+       if (!(field instanceof HTMLTextAreaElement)) return false;
+       field.value = ${JSON.stringify(text)};
+       field.dispatchEvent(new Event('input', { bubbles: true }));
+       return true;
+     })()`,
+  );
+
+  // Deliberately do not submit: this smoke runs against the real checkout. Draft retention is
+  // checked across the shell lifecycle, which is safe and exercises the preserved textarea.
+  await pressEscape();
+  await openSourceControl();
+
+  const kept = await evaluate(
+    `(() => {
+       const field = document.querySelector('.scm-message');
+       return field instanceof HTMLTextAreaElement ? field.value : null;
+     })()`,
+  );
+  await pressEscape();
+  return kept === text;
+})();
+
+checks.historyOpensInWorkspace = await (async () => {
+  await openSourceControl();
+  // Real repository reads can exceed three seconds on a busy or removable volume.
+  // Wait for the rendered result, with a bounded budget for a failed operation.
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const found = await evaluate(
+      `document.querySelector('.scm-history-region .history-head') !== null`,
+    );
+    if (found === true) break;
+    await sleep(150);
+  }
+  await evaluate(
+    `document.querySelector('.scm-history-region .history-head')?.click(); true`,
+  );
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const detail = await evaluate(
+      `document.querySelector('.scm-history-region .history-commit[data-open="true"] .history-detail') !== null`,
+    );
+    if (detail === true) return true;
+    await sleep(150);
+  }
+  return false;
+})();
+
+await pressEscape();
+checks.scmEscapeRestoresLauncher = await evaluate(
+  `document.querySelector('[data-popup-id="source-control"]')?.open === false &&
+    document.activeElement === document.querySelector('.activity[data-view="scm"]')`,
+);
+
+/*
+ * The merge-conflict check, which is the whole reason this feature was unfindable.
+ *
+ * The resolver always worked on a conflicted file; nothing could tell you whether you had
+ * one. This repository is not mid-merge, so the interesting assertion is the empty state:
+ * pressing the button has to leave a section that SAYS there are no conflicts, rather than
+ * leaving the panel exactly as it was.
+ */
+await openSourceControl();
+checks.conflictsButtonExists = await evaluate(
+  "[...document.querySelectorAll('.scm-actions .ghost-button')].some((b) => b.textContent === 'Check Conflicts')",
+);
+
+await evaluate(
+  "[...document.querySelectorAll('.scm-actions .ghost-button')].find((b) => b.textContent === 'Check Conflicts')?.click()",
+);
+/*
+ * Poll rather than sleep a fixed 900ms.
+ *
+ * `checkConflicts` awaits a full `git status` before it renders anything, and on a dirty
+ * checkout that call takes about as long as the budget did: measured at 0.917s against
+ * 900ms on a tree with 48 modified files. So the check was reading the panel before the
+ * answer arrived and reporting a conflict-detection bug that did not exist - intermittently
+ * at first, then every run as the tree grew dirtier. Waiting for the outcome instead of
+ * guessing at how long git takes makes it independent of how much is uncommitted.
+ */
+for (let attempt = 0; attempt < 50; attempt += 1) {
+  if ((await evaluate("document.querySelector('.scm-conflicts')?.hidden === false")) === true) break;
+  await sleep(100);
+}
+
+checks.conflictsAnswerShown = await evaluate(
+  "document.querySelector('.scm-conflicts')?.hidden === false",
+);
+checks.conflictsSaysNone = await evaluate(
+  "document.querySelector('.scm-conflicts .empty-hint')?.textContent",
+);
+checks.conflictsStatusLine = await evaluate(
+  "document.getElementById('status-dirty')?.textContent",
+);
+await pressEscape();
+
+// The three features that had main-process code and no renderer caller at all.
+checks.localHistoryBridge = await evaluate(
+  "window.adcode.history.versions('package.json').then((v) => Array.isArray(v))",
+);
+checks.updateStatusBridge = await evaluate(
+  "window.adcode.updates.status().then((s) => typeof s.state === 'string')",
+);
+
+// Quick open, opened by keyboard rather than by calling into its module directly.
+await evaluate(
+  "document.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true }))",
+);
+await sleep(600);
+// Named specifically: symbol search is also a `.quickopen`, and a bare selector matches
+// whichever happens to be first in the DOM.
+checks.quickOpenVisible = await evaluate(
+  "document.querySelector('.quickopen:not(.quickopen-symbols)')?.hidden === false",
+);
+await evaluate(
+  "window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))",
+);
+await sleep(200);
+checks.quickOpenClosesOnEscape = await evaluate(
+  "document.querySelector('.quickopen')?.hidden === true",
+);
+
+// §4's Session group: auto-save, local history, and crash recovery all round-trip.
+checks.historyBridge = await evaluate(
+  "window.adcode.history.versions('nope.ts').then((v) => Array.isArray(v))",
+);
+checks.draftsBridge = await evaluate(
+  "window.adcode.history.drafts().then((d) => Array.isArray(d))",
+);
+checks.draftRoundTrip = await evaluate(
+  `(async () => {
+     window.adcode.history.draft('E:/smoke/probe.ts', 'unsaved text');
+     await new Promise((r) => setTimeout(r, 400));
+     const found = await window.adcode.history.drafts();
+     const hit = found.find((d) => d.path === 'E:/smoke/probe.ts');
+     window.adcode.history.clearDraft('E:/smoke/probe.ts');
+     return hit?.text === 'unsaved text';
+   })()`,
+);
+
+// The terminal is the one surface that needs a native module at runtime, so it is the
+// one most likely to survive `npm run verify` and still be broken in the built app.
+checks.terminalStarts = await evaluate(
+  `(async () => {
+     const profiles = await window.adcode.terminal.profiles();
+     if (profiles.length === 0) return 'no profiles';
+
+     let received = '';
+     window.adcode.terminal.onData((_id, data) => { received += data; });
+
+     const created = await window.adcode.terminal.create({
+       profileId: profiles[0].id, cols: 80, rows: 24,
+     });
+     if (created === null || created === undefined) return 'create returned nothing';
+
+     await new Promise((r) => setTimeout(r, 2500));
+     window.adcode.terminal.dispose(created.id ?? created);
+     return received.length > 0 ? true : 'no output from the shell';
+   })()`,
+);
+
+// §3's workbench chrome: the menu bar, the palette, and the terminal panel are all ours,
+// so all three are driven here rather than assumed.
+checks.menuBarPresent = await evaluate(
+  "document.querySelectorAll('.menubar-item').length",
+);
+
+/**
+ * A click at real page coordinates, routed through the renderer's own hit testing.
+ *
+ * `element.click()` dispatches straight at a node: it cannot tell you whether anything
+ * covers the element, whether `pointer-events` is off, or whether the coordinates are
+ * even reachable. This check used to use it, and so it passed for a build in which the
+ * menu bar was completely dead to a mouse.
+ */
+async function clickAt(x, y) {
+  await send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+    buttons: 1,
+  });
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "left",
+    clickCount: 1,
+    buttons: 0,
+  });
+  await sleep(250);
+}
+
+/**
+ * Right-click, then wait for the menu rather than for a guessed number of milliseconds.
+ *
+ * The tree's menu fetches git status before it opens, so what it costs varies with the
+ * repository. A fixed sleep passed on a warm run and failed on a cold one.
+ */
+async function rightClickAt(x, y) {
+  await send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x,
+    y,
+    button: "right",
+    clickCount: 1,
+    buttons: 2,
+  });
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x,
+    y,
+    button: "right",
+    clickCount: 1,
+    buttons: 0,
+  });
+
+  // Explorer menus fetch current Git status before exposing Stage/Unstage actions.
+  for (let attempt = 0; attempt < 150; attempt++) {
+    if (
+      await evaluate(
+        "document.querySelector('.menu-panel[data-context] .menu-item') !== null",
+      )
+    )
+      return true;
+    await sleep(100);
+  }
+  return false;
+}
+
+/**
+ * Type, but never into a file this repository actually keeps.
+ *
+ * This run drives the real editor with the real repository open, and several checks type
+ * into a scratch file they just created. When one of them goes wrong the keystrokes do not
+ * vanish - they land in whatever tab happens to be active, and auto-save writes them to
+ * disk 1200ms later. That is not hypothetical: `firebase.json` started with `ll{`,
+ * `electron-builder.yml` with `e#` and the build prompt with `h<div class="smokecard">`,
+ * all three committed-file corruptions produced by earlier runs, and the YAML one would
+ * have failed `npm run package` at the worst possible moment.
+ *
+ * So the editor is only a legal target when the active tab is one of this script's own
+ * files. Anything else throws, which fails one check loudly instead of editing the tree
+ * silently. Typing into a dialog, a search box or the terminal is untouched by this - the
+ * guard only looks when focus is inside Monaco.
+ */
+async function typeText(text) {
+  const intruded = await evaluate(
+    `(() => {
+       const active = document.activeElement;
+       if (active === null || active.closest('.monaco-editor') === null) return null;
+       const label = document.querySelector('.tab[aria-selected="true"] .tab-label')?.textContent ?? '(no active tab)';
+       return /^smoke[-.]/.test(label) ? null : label;
+     })()`,
+  );
+
+  if (typeof intruded === "string") {
+    throw new Error(
+      `refusing to type into "${intruded}": the editor is focused on a file this script does not own. ` +
+        `Whatever was meant to receive ${JSON.stringify(text)} never opened.`,
+    );
+  }
+
+  for (const character of text)
+    await send("Input.dispatchKeyEvent", { type: "char", text: character });
+  await sleep(120);
+}
+
+async function pressEnter() {
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+  });
+  await sleep(500);
+}
+
+/**
+ * A new line *inside Monaco*, which `pressEnter` does not produce.
+ *
+ * A bare `keyDown` with no `text` is enough for the tree's rename input - a plain
+ * `<input>` submits on the key event alone - and produces nothing at all in the editor,
+ * whose input arrives through a hidden textarea that needs the character. Typing four
+ * lines with `pressEnter` put all four on line one, and the outline that read them was
+ * right about the file it was given.
+ *
+ * Carried as `text` on the keyDown rather than as a separate `char` event, so the key and
+ * the character stay one press and Monaco's auto-indent sees what it expects.
+ */
+async function pressEnterInEditor() {
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+    text: "\r",
+    unmodifiedText: "\r",
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Enter",
+    code: "Enter",
+    windowsVirtualKeyCode: 13,
+  });
+  await sleep(350);
+}
+
+/**
+ * A real modifier chord, through the same path a user's keyboard takes.
+ *
+ * CDP's modifier bitmask: Alt 1, Ctrl 2, Meta 4, Shift 8. Sending the chord rather than
+ * calling the command directly is the point - it exercises the resolver, the overrides and
+ * the keydown handler, which is where a rebindable shortcut can go wrong.
+ */
+async function pressChord(key, { shift = false, alt = false } = {}) {
+  const modifiers = 2 | (shift ? 8 : 0) | (alt ? 1 : 0);
+  const code = key === "Home" ? "Home" : `Key${key.toUpperCase()}`;
+  const virtualKey = key === "Home" ? 36 : key.toUpperCase().charCodeAt(0);
+
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key,
+    code,
+    windowsVirtualKeyCode: virtualKey,
+    modifiers,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key,
+    code,
+    windowsVirtualKeyCode: virtualKey,
+    modifiers,
+  });
+  await sleep(400);
+}
+
+async function pressEscape() {
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Escape",
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Escape",
+    code: "Escape",
+    windowsVirtualKeyCode: 27,
+  });
+  await sleep(350);
+}
+
+/**
+ * A plain navigation key, with no modifiers.
+ *
+ * `pressChord` cannot do these: it holds Ctrl and builds a `KeyX` code, which is right for
+ * `Ctrl+A` and meaningless for Home.
+ */
+const PLAIN_KEYS = {
+  Home: 36,
+  End: 35,
+  ArrowLeft: 37,
+  ArrowUp: 38,
+  ArrowRight: 39,
+  ArrowDown: 40,
+};
+
+async function pressKey(key) {
+  const virtualKey = PLAIN_KEYS[key];
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key,
+    code: key,
+    windowsVirtualKeyCode: virtualKey,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key,
+    code: key,
+    windowsVirtualKeyCode: virtualKey,
+  });
+  await sleep(120);
+}
+
+/** Open the anchored Structure popup on a tab, whatever state it was in. */
+async function openStructure(tab) {
+  const alreadyOpen = await evaluate(
+    `document.querySelector('[data-popup-id="structure"]')?.open === true`,
+  );
+  if (alreadyOpen !== true) {
+    await pressChord("u", { shift: true });
+    await sleep(700);
+  }
+
+  const wanted = tab === "project" ? "This project" : "This file";
+  await evaluate(
+    `(() => {
+       const tabs = [...document.querySelectorAll('.structure-tab')];
+       tabs.find((t) => t.textContent === ${JSON.stringify(wanted)})?.click();
+       return true;
+     })()`,
+  );
+
+  // The project tab reads the workspace root off disk; the file tab does not.
+  await sleep(tab === "project" ? 1200 : 500);
+}
+
+async function closeStructure() {
+  const open = await evaluate(
+    `document.querySelector('[data-popup-id="structure"]')?.open === true`,
+  );
+  if (open === true) await pressEscape();
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await evaluate("document.querySelector('[data-popup-id=\"structure\"]')?.open === false") === true) return;
+    await sleep(50);
+  }
+  throw new Error("Structure did not finish closing before the next editor action");
+}
+
+/** Select a docked sidebar view without toggling it closed when it is already selected. */
+async function openSidebar(view) {
+  const visible = await evaluate(
+    `document.querySelector('.workbench')?.dataset.sidebarOpen === 'true' && document.querySelector('.activity[data-sidebar-view="${view}"]')?.getAttribute('aria-pressed') === 'true'`,
+  );
+  if (visible !== true) {
+    await evaluate(
+      `document.querySelector('.activity[data-sidebar-view="${view}"]')?.click(); true`,
+    );
+    await sleep(300);
+  }
+}
+
+async function openSourceControl() {
+  const open = await evaluate(
+    `document.querySelector('[data-popup-id="source-control"]')?.open === true`,
+  );
+  if (open !== true) {
+    await evaluate(
+      `document.querySelector('.activity[data-view="scm"]')?.click(); true`,
+    );
+  }
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const ready = await evaluate(
+      `(() => {
+         const popup = document.querySelector('[data-popup-id="source-control"]');
+         return popup?.open === true &&
+           document.querySelector('.scm-panel')?.dataset.scmState === 'repo' &&
+           (document.querySelector('.scm-branch')?.textContent ?? '').length > 0;
+       })()`,
+    );
+    if (ready === true) return;
+    await sleep(150);
+  }
+}
+
+/** Choose a row from the drawn menu bar, the way a person would. */
+async function chooseMenu(topLabel, itemLabel) {
+  const top = await evaluate(
+    `(() => {
+       const button = [...document.querySelectorAll('.menubar-item')]
+         .find((b) => b.textContent === ${JSON.stringify(topLabel)});
+       if (!button) return null;
+       const r = button.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+
+  if (top === null) throw new Error(`no ${topLabel} menu`);
+
+  await clickAt(top.x, top.y);
+  await sleep(300);
+
+  const chosen = await evaluate(
+    `(() => {
+       const item = [...document.querySelectorAll('.menu-panel .menu-item')]
+         .find((i) => i.querySelector('.menu-item-label')?.textContent === ${JSON.stringify(itemLabel)});
+       if (!item) throw new Error('no such row');
+       item.click();
+       return true;
+     })()`,
+  );
+
+  if (chosen !== true)
+    throw new Error(`${topLabel} > ${itemLabel}: ${String(chosen)}`);
+
+  await sleep(500);
+}
+
+/** Choose an exact command through the keyboard-accessible command palette. */
+async function choosePaletteCommand(commandId, itemLabel) {
+  const alreadyOpen = await evaluate(
+    `document.querySelector('.quickopen-input[aria-label="Command palette"]')?.closest('.quickopen')?.hidden === false`,
+  );
+  if (alreadyOpen === true) {
+    await pressEscape();
+    await sleep(150);
+  }
+
+  await pressChord("p", { shift: true });
+
+  let inputReady = false;
+  for (let attempt = 0; attempt < 10 && !inputReady; attempt += 1) {
+    await sleep(100);
+    inputReady =
+      (await evaluate(
+        `(() => {
+           const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+           if (!(input instanceof HTMLInputElement) || input.closest('.quickopen')?.hidden !== false) {
+             return false;
+           }
+           input.focus();
+           input.value = ${JSON.stringify(itemLabel)};
+           input.dispatchEvent(new Event('input', { bubbles: true }));
+           return true;
+         })()`,
+      )) === true;
+  }
+
+  if (!inputReady) throw new Error("command palette did not open");
+
+  let point = null;
+  for (let attempt = 0; attempt < 10 && point === null; attempt += 1) {
+    await sleep(100);
+    point = await evaluate(
+      `(() => {
+         const row = [...document.querySelectorAll('.palette-row')].find((candidate) =>
+           candidate.querySelector('.palette-id')?.textContent?.trim() === ${JSON.stringify(commandId)} &&
+           candidate.querySelector('span:not(.palette-id)')?.textContent?.trim() === ${JSON.stringify(itemLabel)}
+         );
+         if (!(row instanceof HTMLElement)) return null;
+         const box = row.getBoundingClientRect();
+         return box.width > 0 && box.height > 0
+           ? { x: Math.round(box.left + box.width / 2), y: Math.round(box.top + box.height / 2) }
+           : null;
+       })()`,
+    );
+  }
+
+  if (point === null || typeof point !== "object") {
+    const visibleCommands = await evaluate(
+      `[...document.querySelectorAll('.palette-row')].map((row) => ({
+         id: row.querySelector('.palette-id')?.textContent?.trim(),
+         label: row.querySelector('span:not(.palette-id)')?.textContent?.trim(),
+       }))`,
+    );
+    await pressEscape();
+    throw new Error(
+      `no palette command ${commandId} (${itemLabel}); palette had ${JSON.stringify(visibleCommands)}`,
+    );
+  }
+
+  await clickAt(point.x, point.y);
+  await sleep(500);
+}
+
+/** Wait for animated popup dismissal before the next user action targets the workbench. */
+async function waitForPopupsClosed(selectors) {
+  for (let attempt = 0; attempt < 15; attempt += 1) {
+    const closed = await evaluate(
+      `(${JSON.stringify(selectors)}).every((selector) =>
+         document.querySelector(selector)?.open === false
+       )`,
+    );
+    if (closed === true) return true;
+    await sleep(40);
+  }
+  return false;
+}
+
+/**
+ * Centre of the context-menu entry with this label.
+ *
+ * Throws with what the menu actually contained rather than returning null: a null here
+ * used to surface as `Cannot read properties of null`, which says nothing about whether
+ * the menu failed to open or simply lacked the entry.
+ */
+async function contextItemPoint(label) {
+  const found = await evaluate(
+    `(() => {
+       const panel = document.querySelector('.menu-panel[data-context]');
+       if (!panel) return { error: 'no context menu is open' };
+       const item = [...panel.querySelectorAll('.menu-item')]
+         .find((i) => i.querySelector('.menu-item-label')?.textContent === ${JSON.stringify(label)});
+       if (!item) {
+         const labels = [...panel.querySelectorAll('.menu-item-label')].map(l => l.textContent);
+         return { error: 'menu had: ' + labels.join(', ') };
+       }
+       const r = item.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+
+  if (found?.error !== undefined) throw new Error(`${label}: ${found.error}`);
+  return found;
+}
+
+const filePoint = await evaluate(
+  `(() => {
+     const file = [...document.querySelectorAll('.menubar-item')].find((b) => b.textContent === 'File');
+     if (!file) return null;
+     const r = file.getBoundingClientRect();
+     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+   })()`,
+);
+
+if (filePoint === null) {
+  checks.menuOpens = "no File menu";
+} else {
+  await clickAt(filePoint.x, filePoint.y);
+  checks.menuOpens = await evaluate(
+    `(() => {
+       const items = document.querySelectorAll('.menu-panel .menu-item');
+       const labels = [...items].map((i) => i.querySelector('.menu-item-label')?.textContent);
+       return labels.includes('Save') && labels.includes('Open Folder…') ? true : labels.join(',');
+     })()`,
+  );
+
+  /*
+   * An open menu has to be the thing on top of itself.
+   *
+   * Counting the items only proves they were built. The sidebar and the title bar both
+   * get a stacking context from `backdrop-filter`, which puts them on the same level and
+   * lets DOM order decide - and the sidebar comes second, so it painted straight over an
+   * open menu while every item-count assertion stayed green.
+   */
+  checks.menuPanelOnTop = await evaluate(
+    `(() => {
+       const item = document.querySelector('.menu-panel .menu-item');
+       if (!item) return 'no menu open';
+       const r = item.getBoundingClientRect();
+       const hit = document.elementFromPoint(Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+       return item === hit || item.contains(hit) ? true : 'covered by ' + (hit?.className ?? 'null');
+     })()`,
+  );
+
+  /*
+   * A submenu has to fly out beside its row.
+   *
+   * The recents used to be a picker precisely because a long list inlined into File was a
+   * wall, so the list only earns its place in the menu if the flyout works - and the
+   * flyout is positioned from three offsets that a unit test cannot see.
+   */
+  checks.menuSubmenuFliesOut = await (async () => {
+    const point = await evaluate(
+      `(() => {
+         const row = [...document.querySelectorAll('.menu-panel .menu-item')]
+           .find((i) => i.querySelector('.menu-item-label')?.textContent === 'Open Recent');
+         if (!row) return null;
+         const r = row.getBoundingClientRect();
+         return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+       })()`,
+    );
+    if (point === null) return "no Open Recent row";
+
+    await clickAt(point.x, point.y);
+    await sleep(150);
+
+    return evaluate(
+      `(() => {
+         const sub = document.querySelector('.menu-panel[data-depth="1"]');
+         if (!sub) return 'no submenu opened';
+         const parent = document.querySelector('.menu-panel[data-depth="0"]');
+         const s = sub.getBoundingClientRect();
+         const p = parent.getBoundingClientRect();
+         if (s.left < p.right - 12) return 'the submenu opened on top of its parent';
+         if (s.right > window.innerWidth) return 'the submenu hangs off the window';
+         return true;
+       })()`,
+    );
+  })();
+
+  await evaluate(
+    "document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); true",
+  );
+}
+
+/*
+ * Alt+G opens Git, from wherever you were.
+ *
+ * The mnemonic table is asserted in unit tests; what cannot be asserted there is that the
+ * keystroke survives the trip - Monaco stops propagation on the Alt combinations it owns,
+ * and this listener has to run in the capture phase to be ahead of it.
+ */
+checks.altLetterOpensMenu = await (async () => {
+  await evaluate(
+    "document.querySelector('.monaco-editor textarea')?.focus(); true",
+  );
+
+  await send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "g",
+    code: "KeyG",
+    windowsVirtualKeyCode: 71,
+    modifiers: 1,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "g",
+    code: "KeyG",
+    windowsVirtualKeyCode: 71,
+    modifiers: 1,
+  });
+  await sleep(250);
+
+  const opened = await evaluate(
+    `(() => {
+       const open = document.querySelector('.menubar-item[aria-expanded="true"]');
+       if (!open) return 'no menu opened';
+       if (open.textContent !== 'Git') return 'Alt+G opened ' + open.textContent;
+       const labels = [...document.querySelectorAll('.menu-panel .menu-item-label')].map((l) => l.textContent);
+       return labels.includes('Commit…') && labels.includes('Push') ? true : 'Git menu had: ' + labels.join(',');
+     })()`,
+  );
+
+  await evaluate(
+    "document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); true",
+  );
+  return opened;
+})();
+
+/* The bottom-left corner names the folder in full, and the build after it. */
+checks.statusBarSaysWhereAndWhat = await evaluate(
+  `(() => {
+     const path = document.getElementById('status-workspace');
+     const version = document.getElementById('status-version');
+     if (!path || !version) return 'the status bar is missing an element';
+     if (!path.title.includes('/') && !path.title.includes('\')) return 'the folder is not a path: ' + path.title;
+     if (!/^ADCode \\d+\\.\\d+\\.\\d+/.test(version.textContent ?? '')) return 'the version reads: ' + version.textContent;
+     return true;
+   })()`,
+);
+
+/*
+ * No draggable region may sit under anything in the title bar you are meant to click.
+ *
+ * Draggable regions are resolved by the OS through WM_NCHITTEST before the renderer sees
+ * the press, and CDP injects input below that layer - so no amount of driving the app
+ * from here can catch this. What can be checked is the geometry that causes it: a `drag`
+ * rect overlapping a control means real clicks become window drags, which is exactly the
+ * bug that shipped.
+ *
+ * The selector covers every control in the bar, not just the menus. The assistant button
+ * and the command centre are newer and sit in the same bar for the same reasons, and the
+ * failure would look identical: a control that works under CDP and is dead to a mouse.
+ */
+checks.titleBarNotInDragRegion = await evaluate(
+  `(() => {
+     const dragRects = [...document.querySelectorAll('*')]
+       .filter((el) => getComputedStyle(el).getPropertyValue('-webkit-app-region').trim() === 'drag')
+       .map((el) => ({ el, r: el.getBoundingClientRect() }));
+
+     // Adjacent fractional CSS rectangles can differ by floating-point rounding.
+     const overlaps = (a, b) =>
+       Math.min(a.right, b.right) - Math.max(a.left, b.left) > 0.01 &&
+       Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 0.01;
+
+     const controls = document.querySelectorAll('.menubar-item, .titlebar-action, .command-centre');
+     if (controls.length === 0) return 'no title bar controls found';
+
+     const clashes = [];
+     for (const control of controls) {
+       const br = control.getBoundingClientRect();
+       for (const { el, r } of dragRects) {
+         if (overlaps(br, r)) {
+           clashes.push((control.textContent || control.ariaLabel) + ' under ' + (el.className || el.tagName));
+         }
+       }
+     }
+     return clashes.length === 0 ? true : clashes.join(', ');
+   })()`,
+);
+
+// Nothing may be left covering the window - the bug that made the app unclickable.
+checks.nothingCoversWindow = await evaluate(
+  `(() => {
+     const covering = [...document.body.querySelectorAll('*')].filter((el) => {
+       const s = getComputedStyle(el);
+       if (s.display === 'none' || s.visibility === 'hidden' || s.pointerEvents === 'none') return false;
+       if (s.position !== 'fixed') return false;
+       const r = el.getBoundingClientRect();
+       return r.width >= innerWidth * 0.9 && r.height >= innerHeight * 0.9;
+     });
+     return covering.length === 0 ? true : covering.map((e) => e.className).join(',');
+  })()`,
+);
+
+/* ── Complete feature discovery ─────────────────────────────────────────── */
+
+const featureLauncherPoint = await evaluate(
+  `(() => {
+     const button = document.querySelector('#open-features');
+     if (!button) return null;
+     const r = button.getBoundingClientRect();
+     return {
+       x: Math.round(r.left + r.width / 2),
+       y: Math.round(r.top + r.height / 2),
+       sidebarWidth: Math.round(document.getElementById('sidebar').getBoundingClientRect().width),
+       panelHeight: Math.round(document.getElementById('panel').getBoundingClientRect().height),
+     };
+   })()`,
+);
+
+if (featureLauncherPoint === null) {
+  checks.featureLibraryPlacement = false;
+  checks.featureLibrarySearch = false;
+  checks.featureLibraryHelp = false;
+  checks.featureLibraryActionDispatch = false;
+} else {
+  await clickAt(featureLauncherPoint.x, featureLauncherPoint.y);
+  await sleep(500);
+
+  checks.featureLibraryPlacementEvidence = await evaluate(
+    `(() => {
+       const button = document.querySelector('#open-features');
+       const sheet = document.querySelector('.feature-library');
+       const dialog = sheet?.closest('dialog[data-popup-id="features"]');
+       const surface = dialog?.querySelector('.popup-shell-surface');
+       const close = sheet?.querySelector('.feature-library-close[aria-label="Close All Features"]');
+       if (!button || !sheet || !dialog?.open || !surface || !close) return false;
+       const box = sheet.getBoundingClientRect();
+       const categories = sheet.querySelector('.feature-library-categories');
+       const results = sheet.querySelector('.feature-library-results');
+       const categoriesBox = categories?.getBoundingClientRect();
+       const resultsBox = results?.getBoundingClientRect();
+       const closeBox = close.getBoundingClientRect();
+       const surfaceBox = surface.getBoundingClientRect();
+       return {
+         belowEarnings: button.previousElementSibling?.id === 'open-earnings',
+         expanded: button.getAttribute('aria-expanded') === 'true',
+         open: sheet.dataset.state === 'open',
+         shellOwned: dialog.contains(sheet),
+         margin: box.left >= 48 && box.top >= 0 && box.right <= window.innerWidth && box.bottom <= window.innerHeight,
+         twoPanes: categoriesBox && resultsBox && categoriesBox.width > 0 && resultsBox.width > 0 && categoriesBox.right <= resultsBox.left,
+         closeNamed: close.getAttribute('title') === 'Close All Features',
+         closeVisible: closeBox.width >= 24 && closeBox.height >= 24 && closeBox.left >= surfaceBox.left && closeBox.right <= surfaceBox.right && closeBox.top >= surfaceBox.top && closeBox.bottom <= surfaceBox.bottom && closeBox.right <= window.innerWidth && closeBox.bottom <= window.innerHeight,
+         sidebarStable: Math.round(document.getElementById('sidebar').getBoundingClientRect().width) === ${String(featureLauncherPoint.sidebarWidth)},
+         panelStable: Math.round(document.getElementById('panel').getBoundingClientRect().height) === ${String(featureLauncherPoint.panelHeight)},
+       };
+     })()`,
+  );
+  checks.featureLibraryPlacement =
+    typeof checks.featureLibraryPlacementEvidence === "object" &&
+    [
+      "belowEarnings",
+      "expanded",
+      "open",
+      "shellOwned",
+      "margin",
+      "twoPanes",
+      "closeNamed",
+      "closeVisible",
+      "sidebarStable",
+      "panelStable",
+    ].every((key) => checks.featureLibraryPlacementEvidence[key] === true);
+
+  checks.featureLibrarySearch = await evaluate(
+    `(() => {
+       const input = document.querySelector('.feature-library-search');
+       if (!input) return false;
+       input.value = 'send something to ai later';
+       input.dispatchEvent(new Event('input', { bubbles: true }));
+       const rows = [...document.querySelectorAll('.feature-library-row')];
+       return rows.length > 0 &&
+         rows.some((row) => row.dataset.featureId === 'adcode.ai.scheduledMessages');
+     })()`,
+  );
+
+  const featureHelpPoint = await evaluate(
+    `(() => {
+       const row = document.querySelector('.feature-library-row[data-feature-id="adcode.ai.scheduledMessages"]');
+       const button = row?.querySelector('.help-button');
+       if (!button) return null;
+       const r = button.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+  if (featureHelpPoint === null) {
+    checks.featureLibraryHelp = false;
+  } else {
+    await clickAt(featureHelpPoint.x, featureHelpPoint.y);
+    await sleep(350);
+    checks.featureLibraryHelp = await evaluate(
+      `(() => {
+         const pop = document.querySelector('.help-popover:not([hidden])');
+         if (!pop) return false;
+         const details = [...pop.querySelectorAll('.help-popover-detail')]
+           .map((one) => one.textContent ?? '');
+         return (
+           (pop.querySelector('.help-popover-plain')?.textContent ?? '').startsWith('What it does:') &&
+           details.some((text) => text.startsWith('Why use it:')) &&
+           details.some((text) => text.startsWith('How to use it:'))
+         );
+       })()`,
+    );
+    await pressEscape();
+  }
+
+  // Updates you can see, found by the words people use for them, in the real library.
+  checks.featureLibraryFindsRestartToUpdate = await evaluate(
+    `(() => {
+       const input = document.querySelector('.feature-library-search');
+       if (!input) return false;
+       input.value = 'restart to update';
+       input.dispatchEvent(new Event('input', { bubbles: true }));
+       return [...document.querySelectorAll('.feature-library-row')]
+         .some((row) => row.dataset.featureId === 'adcode.updates.auto');
+     })()`,
+  );
+
+  // The assistant's eyes and its tool kit, found by the words people use, in the real library.
+  checks.featureLibraryFindsAgentTools = await evaluate(
+    `(() => {
+       const input = document.querySelector('.feature-library-search');
+       if (!input) return false;
+       const finds = (query, id) => {
+         input.value = query;
+         input.dispatchEvent(new Event('input', { bubbles: true }));
+         return [...document.querySelectorAll('.feature-library-row')].some((row) => row.dataset.featureId === id);
+       };
+       return finds('see my app', 'ai.seesYourApp') && finds('check the page', 'ai.seesYourApp') &&
+         finds('undo delete', 'ai.agentTools') && finds('background command', 'ai.agentTools');
+     })()`,
+  );
+
+  // The licence, found by either spelling, in the real library.
+  checks.featureLibraryFindsOpenSource = await evaluate(
+    `(() => {
+       const input = document.querySelector('.feature-library-search');
+       if (!input) return false;
+       const finds = (query) => {
+         input.value = query;
+         input.dispatchEvent(new Event('input', { bubbles: true }));
+         return [...document.querySelectorAll('.feature-library-row')]
+           .some((row) => row.dataset.featureId === 'workbench.openSource');
+       };
+       return finds('open source license') && finds('licence');
+     })()`,
+  );
+
+  const actionPoint = await evaluate(
+    `(() => {
+       const input = document.querySelector('.feature-library-search');
+       input.value = 'trusted auto apply';
+       input.dispatchEvent(new Event('input', { bubbles: true }));
+       const row = document.querySelector('.feature-library-row[data-feature-id="adcode.ai.editPolicy"]');
+       const button = row?.querySelector('.feature-library-open');
+       if (!button || button.disabled) return null;
+       const r = button.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+  if (actionPoint === null) {
+    checks.featureLibraryActionDispatch = false;
+  } else {
+    await clickAt(actionPoint.x, actionPoint.y);
+    await sleep(900);
+    checks.featureLibraryActionEvidence = await evaluate(
+      `(() => {
+         const library = document.querySelector('.feature-library');
+         const settings = document.querySelector('.settings-sheet:not(.help-sheet)');
+         const row = document.querySelector('[data-setting-id="adcode.ai.editPolicy"]');
+        return {
+          libraryClosed: library?.closest('dialog[data-popup-id="features"]')?.open === false,
+          settingsVisible: settings?.closest('dialog[data-popup-id="settings"]')?.open === true,
+          settingsAnimatedOpen: settings?.dataset.state === 'open',
+          rowExists: row !== null,
+          rowMarked: row?.dataset.highlight === 'true',
+          rowFocused: document.activeElement === row,
+        };
+      })()`,
+    );
+    checks.featureLibraryActionDispatch =
+      typeof checks.featureLibraryActionEvidence === "object" &&
+      checks.featureLibraryActionEvidence.libraryClosed === true &&
+      checks.featureLibraryActionEvidence.settingsVisible === true &&
+      checks.featureLibraryActionEvidence.rowExists === true &&
+      checks.featureLibraryActionEvidence.rowMarked === true &&
+      checks.featureLibraryActionEvidence.rowFocused === true;
+    await pressEscape();
+  }
+}
+
+for (let attempt = 0; attempt < 10; attempt += 1) {
+  const settingsVisible = await evaluate(
+    `document.querySelector('dialog[data-popup-id="settings"]')?.open === true`,
+  );
+  if (settingsVisible !== true) break;
+  await pressEscape();
+}
+
+await chooseMenu("View", "All Features…");
+checks.featureLibraryMenuEvidence = await evaluate(
+  `(() => {
+     const library = document.querySelector('.feature-library');
+     return {
+       visible: library?.closest('dialog[data-popup-id="features"]')?.open === true,
+       state: library?.dataset.state ?? null,
+       expanded: document.querySelector('#open-features')?.getAttribute('aria-expanded'),
+     };
+   })()`,
+);
+checks.featureLibraryFromViewMenu =
+  checks.featureLibraryMenuEvidence?.visible === true &&
+  checks.featureLibraryMenuEvidence?.state === "open" &&
+  checks.featureLibraryMenuEvidence?.expanded === "true";
+await pressEscape();
+checks.featureLibraryEscapeRestoresLauncher = await evaluate(
+  `document.querySelector('dialog[data-popup-id="features"]')?.open === false && document.activeElement === document.querySelector('#open-features')`,
+);
+
+const commandCentrePoint = await evaluate(
+  `(() => {
+     const button = document.querySelector('.command-centre');
+     if (!button) return null;
+     const r = button.getBoundingClientRect();
+     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+   })()`,
+);
+
+let baseUniversalGroups = [];
+let symbolUniversalGroup = false;
+let universalSearchDebug = null;
+if (commandCentrePoint !== null) {
+  await clickAt(commandCentrePoint.x, commandCentrePoint.y);
+  await sleep(1800);
+  baseUniversalGroups = await evaluate(
+    `[...document.querySelectorAll('.universal-search-group-title')].map((one) => one.textContent)`,
+  );
+
+  await evaluate(
+    `(() => {
+       const input = document.querySelector('.universal-search-input');
+       if (!input) return false;
+       input.value = 'createEditorHost';
+       input.dispatchEvent(new Event('input', { bubbles: true }));
+       return true;
+     })()`,
+  );
+  // Workspace symbol discovery scans real project content. A cold antivirus/file-cache
+  // run can take several seconds, so poll the state instead of treating one timing as API.
+  for (let attempt = 0; attempt < 45 && !symbolUniversalGroup; attempt += 1) {
+    await sleep(1000);
+    symbolUniversalGroup =
+      (await evaluate(
+        `[...document.querySelectorAll('.universal-search-group-title')]
+          .some((one) => one.textContent === 'Symbols')`,
+      )) === true;
+  }
+  universalSearchDebug = await evaluate(`({
+    query: document.querySelector('.universal-search-input')?.value,
+    status: document.querySelector('.universal-search-status')?.textContent,
+    groups: [...document.querySelectorAll('.universal-search-group-title')].map((one) => one.textContent),
+    rows: [...document.querySelectorAll('.universal-search-row')].slice(0, 6).map((one) => one.textContent),
+  })`);
+}
+
+checks.universalSearchEvidence = {
+  baseGroups: baseUniversalGroups,
+  symbols: symbolUniversalGroup,
+  debug: universalSearchDebug,
+};
+checks.universalSearchSources =
+  Array.isArray(baseUniversalGroups) &&
+  ["Features", "Commands", "Files", "Recent folders"].every((name) =>
+    baseUniversalGroups.includes(name),
+  ) &&
+  symbolUniversalGroup;
+
+if (commandCentrePoint !== null) {
+  const outside = await evaluate(
+    `(() => ({ x: window.innerWidth - 10, y: window.innerHeight - 10 }))()`,
+  );
+  await clickAt(outside.x, outside.y);
+  await sleep(250);
+}
+
+const editorFocusPoint = await evaluate(
+  `(() => {
+     const editor = document.querySelector('.monaco-editor');
+     if (!editor) return null;
+     const r = editor.getBoundingClientRect();
+     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+   })()`,
+);
+if (editorFocusPoint !== null)
+  await clickAt(editorFocusPoint.x, editorFocusPoint.y);
+checks.discoveryCloseRestoresEditor = await evaluate(
+  `document.querySelector('.universal-search-overlay')?.hidden === true &&
+   document.querySelector('dialog[data-popup-id="features"]')?.open === false &&
+   document.activeElement?.closest('.monaco-editor') !== null`,
+);
+
+const focusedSearchEvidence = {};
+await pressChord("p");
+focusedSearchEvidence.quickOpen = await evaluate(
+  `document.querySelector('.quickopen-input[aria-label="Go to file"]')?.closest('.quickopen')?.hidden === false`,
+);
+await pressEscape();
+
+await pressChord("p", { shift: true });
+focusedSearchEvidence.palette = await evaluate(
+  `document.querySelector('.quickopen-input[aria-label="Command palette"]')?.closest('.quickopen')?.hidden === false`,
+);
+await pressEscape();
+
+await chooseMenu("Go", "Go to Symbol…");
+focusedSearchEvidence.symbols = await evaluate(
+  `document.querySelector('.quickopen-input[aria-label="Go to symbol in project"]')?.closest('.quickopen')?.hidden === false`,
+);
+await pressEscape();
+
+await pressChord("f", { shift: true });
+focusedSearchEvidence.content = await evaluate(
+  `(() => {
+       const input = document.querySelector('input[aria-label="Search the workspace"]');
+       const view = document.getElementById('view-search');
+       return input !== null && view?.hidden === false;
+     })()`,
+);
+checks.focusedSearchEvidence = focusedSearchEvidence;
+checks.focusedSearchShortcuts = Object.values(focusedSearchEvidence).every(
+  (value) => value === true,
+);
+await openSidebar("explorer");
+await sleep(300);
+
+if (process.argv.includes("--visual-only")) {
+  const screenshotPaths = [...windowScreenshotPaths];
+  const codeBoot = await evaluate(`(async () => ({
+    ready: document.readyState,
+    mode: document.body.dataset.workspaceMode,
+    current: await window.adcode.workspace.current(),
+    session: await window.adcode.session.restore(),
+    status: document.getElementById('status-workspace')?.textContent,
+    tabs: document.querySelectorAll('#tabs .tab').length,
+    tree: document.querySelectorAll('#filetree .tree-row').length,
+    monaco: document.querySelectorAll('.monaco-editor').length,
+  }))()`);
+
+  async function captureFeatureLibrary(name) {
+    const path = join(tmpdir(), `adcode-feature-library-${name}.png`);
+    const response = await send("Page.captureScreenshot", {
+      format: "png",
+      fromSurface: true,
+    });
+    const data = response.result?.data;
+    if (typeof data !== "string") {
+      throw new Error(`could not capture ${name} feature-library screenshot`);
+    }
+    await writeFile(path, Buffer.from(data, "base64"));
+    screenshotPaths.push(path);
+  }
+
+  async function applyAppearance(theme, density) {
+    const applied = await evaluate(
+      `(async () => {
+         await window.adcode.settings.write('adcode.appearance.theme', ${JSON.stringify(theme)});
+         await window.adcode.settings.write('adcode.appearance.density', ${JSON.stringify(density)});
+         await new Promise((resolve) => setTimeout(resolve, 250));
+         document.querySelector('#open-features')?.click();
+         await new Promise((resolve) => setTimeout(resolve, 250));
+         return {
+           theme: document.documentElement.dataset.theme,
+           density: document.documentElement.dataset.density,
+           open: document.querySelector('.feature-library')?.dataset.state === 'open',
+         };
+       })()`,
+    );
+    return applied;
+  }
+
+  const visual = {};
+  visual.lightComfortable = await applyAppearance("light", "comfortable");
+  await captureFeatureLibrary("light-comfortable");
+  await pressEscape();
+
+  visual.midnightCompact = await applyAppearance("midnight", "compact");
+  visual.compactRowPadding = await evaluate(
+    `getComputedStyle(document.querySelector('.feature-library-row')).paddingTop`,
+  );
+  await captureFeatureLibrary("midnight-compact");
+
+  visual.keyboard = await evaluate(
+    `(() => ({
+       startsInSearch: document.activeElement?.classList.contains('feature-library-search') === true,
+       searchRole: document.querySelector('.feature-library-search')?.getAttribute('role'),
+       resultRole: document.querySelector('.feature-library-results')?.getAttribute('role'),
+       dialogRole: document.querySelector('.feature-library')?.getAttribute('role'),
+     }))()`,
+  );
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "ArrowDown",
+    code: "ArrowDown",
+    windowsVirtualKeyCode: 40,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "ArrowDown",
+    code: "ArrowDown",
+    windowsVirtualKeyCode: 40,
+  });
+  visual.keyboard.arrowSelectsResult = await evaluate(
+    `document.querySelector('.feature-library-row[aria-selected="true"]') !== null &&
+     document.querySelector('.feature-library-search')?.hasAttribute('aria-activedescendant') === true`,
+  );
+  await pressEscape();
+
+  const viewportBeforeZoom = await evaluate(
+    `({ width: innerWidth, height: innerHeight })`,
+  );
+  for (let step = 0; step < 8; step += 1) {
+    await evaluate(`window.adcode.window.zoom(1); true`);
+    await sleep(80);
+  }
+  const viewportAtZoom = await evaluate(
+    `({ width: innerWidth, height: innerHeight })`,
+  );
+  await evaluate(`document.querySelector('#open-features')?.click(); true`);
+  await sleep(300);
+  visual.zoom = await evaluate(
+    `(() => {
+       const box = document.querySelector('.feature-library')?.getBoundingClientRect();
+       if (!box) return false;
+       return {
+         before: ${JSON.stringify(viewportBeforeZoom)},
+         after: ${JSON.stringify(viewportAtZoom)},
+         approximately200Percent: innerWidth <= ${String(viewportBeforeZoom.width)} * 0.55,
+         box: { left: box.left, top: box.top, right: box.right, bottom: box.bottom },
+         onScreen: box.left >= 8 && box.top >= 8 &&
+           box.right <= innerWidth - 8 && box.bottom <= innerHeight - 8,
+       };
+     })()`,
+  );
+  await captureFeatureLibrary("midnight-compact-200-percent");
+  await pressEscape();
+  await evaluate(`window.adcode.window.zoom(0); true`);
+  await sleep(300);
+
+  await send("Emulation.setEmulatedMedia", {
+    media: "",
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+  });
+  await evaluate(`document.querySelector('#open-features')?.click(); true`);
+  await sleep(200);
+  visual.reducedMotion = await evaluate(
+    `(() => {
+       const style = getComputedStyle(document.querySelector('.feature-library'));
+       return {
+         mediaMatches: matchMedia('(prefers-reduced-motion: reduce)').matches,
+         transform: style.transform,
+         transitionDuration: style.transitionDuration,
+       };
+     })()`,
+  );
+  await pressEscape();
+
+  await send("Emulation.setEmulatedMedia", {
+    media: "",
+    features: [{ name: "forced-colors", value: "active" }],
+  });
+  await evaluate(
+    `(() => {
+       document.querySelector('#open-features')?.click();
+       document.querySelector('.feature-library-filter-button')?.focus();
+       return true;
+     })()`,
+  );
+  await sleep(200);
+  visual.highContrastFocus = await evaluate(
+    `(() => {
+       const focused = document.activeElement;
+       const style = getComputedStyle(focused);
+       return {
+         forcedColors: matchMedia('(forced-colors: active)').matches,
+         element: focused?.className ?? null,
+         outlineStyle: style.outlineStyle,
+         outlineWidth: style.outlineWidth,
+       };
+     })()`,
+  );
+  await captureFeatureLibrary("forced-colors-focus");
+  await pressEscape();
+  await send("Emulation.setEmulatedMedia", { media: "", features: [] });
+  await evaluate(
+    `(async () => {
+       await window.adcode.settings.write('adcode.appearance.theme', 'system');
+       await window.adcode.settings.write('adcode.appearance.density', 'comfortable');
+     })()`,
+  );
+
+  socket.close();
+  child.kill();
+  await sleep(500);
+  await rm(userData, { recursive: true, force: true }).catch(() => {});
+  process.stdout.write(
+    `${JSON.stringify({ visual, vibeNavigation, separateWindows: checks.separateWindows, universalSearch: checks.universalSearchEvidence, codeBoot, screenshotPaths, logs: output.slice(-3000) }, null, 2)}\n`,
+  );
+
+  const visualPassed =
+    checks.separateWindows === true &&
+    checks.vibeNavigation === true &&
+    visual.lightComfortable?.theme === "light" &&
+    visual.lightComfortable?.density === "comfortable" &&
+    visual.lightComfortable?.open === true &&
+    visual.midnightCompact?.theme === "midnight" &&
+    visual.midnightCompact?.density === "compact" &&
+    visual.midnightCompact?.open === true &&
+    visual.keyboard?.startsInSearch === true &&
+    visual.keyboard?.searchRole === "combobox" &&
+    visual.keyboard?.resultRole === "listbox" &&
+    visual.keyboard?.dialogRole === "dialog" &&
+    visual.keyboard?.arrowSelectsResult === true &&
+    visual.zoom?.approximately200Percent === true &&
+    visual.zoom?.onScreen === true &&
+    visual.reducedMotion?.mediaMatches === true &&
+    visual.reducedMotion?.transform === "none" &&
+    visual.highContrastFocus?.forcedColors === true &&
+    visual.highContrastFocus?.outlineStyle !== "none" &&
+    visual.highContrastFocus?.outlineWidth !== "0px";
+  process.exit(visualPassed ? 0 : 1);
+}
+
+if (process.argv.includes("--discovery-only")) {
+  socket.close();
+  child.kill();
+  await sleep(500);
+  await rm(userData, { recursive: true, force: true }).catch(() => {});
+  const discovery = Object.fromEntries(
+    Object.entries(checks).filter(([name]) =>
+      /featureLibrary|universalSearch|discoveryClose|focusedSearch/.test(name),
+    ),
+  );
+  process.stdout.write(`${JSON.stringify(discovery, null, 2)}\n`);
+  const failedDiscovery = Object.entries(discovery).filter(
+    ([, value]) => value === false,
+  );
+  process.exit(failedDiscovery.length === 0 ? 0 : 1);
+}
+
+checks.paletteFinds = await evaluate(
+  `(async () => {
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+     if (!input) return 'palette did not open';
+
+     input.value = 'split term';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 200));
+
+     const first = document.querySelector('.palette-row span')?.textContent;
+     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+     return first ?? 'no rows';
+   })()`,
+);
+
+checks.multipleTerminals = await evaluate(
+  `(async () => {
+     const tabsOf = () => document.querySelectorAll('.terminal-tab').length;
+     const panesOf = () => document.querySelectorAll('.terminal-pane').length;
+
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: '\`', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 2000));
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: '\`', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 2000));
+
+     const tabs = tabsOf();
+     document.getElementById('terminal-split').click();
+     await new Promise((r) => setTimeout(r, 2000));
+
+     return JSON.stringify({ tabs, panes: panesOf() });
+   })()`,
+);
+
+/*
+ * The terminal's right-click menu.
+ *
+ * This is the only door into automatic continuation, scheduled messages and Team for
+ * somebody working in the terminal - before it existed those three were reachable only from
+ * a settings screen and a panel on the other side of the window. The menu model has unit
+ * tests; what they cannot tell us is whether the listener is attached to a real pane and
+ * whether the panel renders what it returns, which is exactly how a feature ends up
+ * finished and unreachable.
+ *
+ * The AI rows are deliberately not asserted here: no agent is running in this pane, so the
+ * honest expectation is the shell menu plus the two rows that always show.
+ */
+checks.terminalContextMenu = await evaluate(
+  `(async () => {
+     const pane = document.querySelector('.terminal-pane');
+     if (!pane) return 'no terminal pane';
+
+     const box = pane.getBoundingClientRect();
+     pane.dispatchEvent(new MouseEvent('contextmenu', {
+       bubbles: true,
+       clientX: Math.round(box.left + box.width / 2),
+       clientY: Math.round(box.top + box.height / 2),
+     }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const panel = document.querySelector('.menu-panel[data-context]');
+     if (!panel) return 'no context menu opened';
+     // The label span, not the item: an item also holds its accelerator, so reading the
+     // whole row gives you "CopyCtrl+Shift+C" and every startsWith below stops matching.
+     const labels = [...panel.querySelectorAll('.menu-item .menu-item-label')].map(
+       (label) => label.textContent.trim(),
+     );
+
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+     await new Promise((r) => setTimeout(r, 200));
+
+     return JSON.stringify({
+       labels,
+       team: labels.some((label) => label.startsWith('Start a Team')),
+       features: labels.some((label) => label.startsWith('All terminal AI features')),
+       closed: document.querySelector('.menu-panel[data-context]') === null,
+     });
+   })()`,
+);
+
+/*
+ * The shell launcher on the panel's split button, driven at real coordinates.
+ *
+ * Asserts what the dropdown is for rather than that it renders: picking a shell has to
+ * start that shell, and the tab has to say which one it is - the tab strip is the only
+ * place that information exists once two different shells are running.
+ */
+/*
+ * Several terminals must not deform the panel.
+ *
+ * A regression test for a real bug. The list of open terminals used to be a horizontal strip
+ * in the panel header, and once that header also had to hold the five panel tabs, opening a
+ * third or fourth shell squeezed those tabs until their labels clipped - two scrolling tab
+ * strips cannot share one 32px row, and it got worse the more you used the terminal.
+ *
+ * The fix moved the list into a column beside the terminals, so this asserts the thing that
+ * would have caught it: the panel's own tab strip is exactly as wide with four terminals
+ * open as with one, and nothing about the panel's own size changed.
+ */
+checks.manyTerminalsDoNotDeformThePanel = await evaluate(
+  `(async () => {
+     // Make sure the Terminal tab is the one showing, so its header controls are present.
+     document.querySelector('#panel-tabs .panel-tab[data-tab="terminal"]')?.click();
+     await new Promise((r) => setTimeout(r, 400));
+
+     const tabsWidth = () =>
+       Math.round(document.getElementById('panel-tabs').getBoundingClientRect().width);
+     const panelWidth = () =>
+       Math.round(document.getElementById('panel').getBoundingClientRect().width);
+
+     const rail = document.getElementById('terminal-tabs');
+     const surface = document.getElementById('terminal-surface');
+     const newButton = document.getElementById('terminal-new');
+     if (!newButton) return 'no new-terminal button on the Terminal tab';
+
+     const beforeTabs = tabsWidth();
+     const beforePanel = panelWidth();
+     if (beforeTabs === 0) return 'the panel tab strip has no width to begin with';
+
+     // Three more, so four are open - which is where the old layout visibly broke.
+     for (let i = 0; i < 3; i += 1) {
+       newButton.click();
+       await new Promise((r) => setTimeout(r, 900));
+     }
+
+     const railBox = rail.getBoundingClientRect();
+     const surfaceBox = surface.getBoundingClientRect();
+
+     return {
+       open: document.querySelectorAll('#terminal-tabs .terminal-tab').length,
+       // The whole point. A strip in the header shrank this; a column does not.
+       tabStripUnchanged: tabsWidth() === beforeTabs,
+       panelUnchanged: panelWidth() === beforePanel,
+       railShown: !rail.hidden,
+       // A column, not a row: taller than a single row, and no wider than its fixed width.
+       railIsAColumn: railBox.height > 40 && railBox.width <= 160,
+       // Beside the terminals rather than above them.
+       railBesideSurface: railBox.left >= surfaceBox.right - 1,
+       // Every panel tab label still fully drawn rather than clipped.
+       labelsNotClipped: [...document.querySelectorAll('#panel-tabs .panel-tab-label')].every(
+         (l) => l.scrollWidth <= l.clientWidth + 1,
+       ),
+     };
+   })()`,
+);
+
+checks.terminalProfileLauncher = await (async () => {
+  const chevron = await evaluate(
+    `(() => {
+       const button = document.getElementById('terminal-profiles');
+       if (!button) return null;
+       const r = button.getBoundingClientRect();
+       if (r.width === 0) return null;
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+
+  if (chevron === null) return "no profile chevron (is the panel open?)";
+
+  await clickAt(chevron.x, chevron.y);
+
+  const shells = await evaluate(
+    `(() => {
+       const panel = document.querySelector('.menu-panel[data-context]');
+       if (!panel) return null;
+       return [...panel.querySelectorAll('.menu-item-label')].map((l) => l.textContent);
+     })()`,
+  );
+
+  if (shells === null || shells.length === 0) return "launcher did not open";
+
+  const before = await evaluate(
+    "document.querySelectorAll('.terminal-tab').length",
+  );
+  const point = await contextItemPoint(shells[0]);
+  await clickAt(point.x, point.y);
+  await sleep(2500);
+
+  const after = await evaluate(
+    `(() => {
+       const titles = [...document.querySelectorAll('.terminal-tab')]
+         .map((t) => t.querySelector('span')?.textContent);
+       return JSON.stringify({ count: titles.length, titles });
+     })()`,
+  );
+
+  const { count, titles } = JSON.parse(after);
+  if (count <= before)
+    return `picking ${shells[0]} started nothing (${before} -> ${count})`;
+
+  // "Terminal 1" was the old numbered title; a tab still called that means the shell's
+  // name never reached the strip.
+  const named = titles.some(
+    (t) => typeof t === "string" && t.includes(shells[0]),
+  );
+  return named
+    ? true
+    : `tabs are ${titles.join(", ")}, expected one saying ${shells[0]}`;
+})();
+
+/*
+ * Alt is a menu key only when it is pressed alone.
+ *
+ * Alt+Up is Move Line Up. Deciding the menu on the `Alt` keydown - which always arrives
+ * first - opened the bar and pulled focus off the editor, so the arrow walked a menu
+ * instead of moving the line. Dispatched as real key events because the ordering *is* the
+ * bug: nothing about it is visible from a single synthesised event.
+ */
+checks.altChordLeavesMenuShut = await (async () => {
+  const altDown = {
+    type: "rawKeyDown",
+    key: "Alt",
+    code: "AltLeft",
+    windowsVirtualKeyCode: 18,
+    modifiers: 1,
+  };
+  const altUp = {
+    type: "keyUp",
+    key: "Alt",
+    code: "AltLeft",
+    windowsVirtualKeyCode: 18,
+  };
+
+  await send("Input.dispatchKeyEvent", altDown);
+  await send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    key: "ArrowUp",
+    code: "ArrowUp",
+    windowsVirtualKeyCode: 38,
+    modifiers: 1,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "ArrowUp",
+    code: "ArrowUp",
+    windowsVirtualKeyCode: 38,
+    modifiers: 1,
+  });
+  await send("Input.dispatchKeyEvent", altUp);
+  await sleep(250);
+
+  const takenByChord = await evaluate(
+    "document.activeElement?.classList.contains('menubar-item') === true",
+  );
+  if (takenByChord) return "Alt+Up moved focus to the menu bar";
+
+  /*
+   * And the other half of the contract: a bare Alt still reaches the bar.
+   *
+   * Focus rather than an open dropdown. Alt puts the bar into the state where the next
+   * key decides - a letter picks a menu, an arrow opens one - which is what Windows has
+   * always done and what the mnemonics are for. It used to open File outright, so every
+   * Alt+F cost you a File menu you then had to leave.
+   */
+  await send("Input.dispatchKeyEvent", altDown);
+  await send("Input.dispatchKeyEvent", altUp);
+  await sleep(250);
+
+  const focused = await evaluate(
+    `(() => {
+       const active = document.activeElement;
+       if (active?.classList.contains('menubar-item') !== true) return 'focus is on ' + (active?.className ?? 'nothing');
+       if (document.querySelector('.menu-panel') !== null) return 'Alt opened a dropdown as well';
+       if (document.querySelector('.menubar')?.dataset.mnemonics !== 'true') return 'the mnemonics stayed hidden';
+       return true;
+     })()`,
+  );
+
+  await evaluate(
+    "document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); true",
+  );
+
+  return focused === true ? true : `a bare Alt: ${focused}`;
+})();
+
+/* On-demand assistant and command centre, clicked where they actually are. */
+checks.titleBarControlsWork = await (async () => {
+  const pointOf = async (selector) =>
+    evaluate(
+      `(() => {
+         const el = document.querySelector(${JSON.stringify(selector)});
+         if (!el) return null;
+         const r = el.getBoundingClientRect();
+         if (r.width === 0) return null;
+         return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+       })()`,
+    );
+
+  const tools = await pointOf(".project-tools");
+  if (tools === null) return "no tools menu";
+  await clickAt(tools.x, tools.y);
+  const ai = await evaluate(`(() => {
+    const button = [...document.querySelectorAll('.menu-item')].find(b => b.textContent === 'AI assistant');
+    if (!button) return null;
+    const r = button.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  })()`);
+  if (ai === null) return "no assistant menu action";
+  await clickAt(ai.x, ai.y);
+  const chatOpen = await evaluate(
+    "document.querySelector('.chat-card')?.hidden === false",
+  );
+  if (!chatOpen) return "the assistant menu did not open the chat";
+
+  const pressed = await evaluate(
+    "document.getElementById('ai-toggle')?.getAttribute('aria-pressed')",
+  );
+  if (pressed !== "true")
+    return `aria-pressed is ${pressed} while the chat is open`;
+
+  await evaluate("document.querySelector('[aria-label=\"Close Assistant\"]')?.click()");
+  await sleep(300);
+
+  const centre = await pointOf(".command-centre");
+  if (centre === null) return "no command centre";
+
+  await clickAt(centre.x, centre.y);
+
+  const universal = await evaluate(
+    `(() => {
+       const overlay = document.querySelector('.universal-search-overlay');
+       const input = document.querySelector('.universal-search-input[aria-label="Search all of ADCode"]');
+       if (overlay?.hidden !== false || input === null) {
+         const hit = document.elementFromPoint(${centre.x}, ${centre.y});
+         return 'nothing opened; the pointer reached ' +
+           (hit === null ? 'nothing' : hit.tagName + '.' + (hit.getAttribute('class') ?? '(no class)'));
+       }
+       return overlay.dataset.state === 'open' && document.activeElement === input;
+     })()`,
+  );
+
+  // Always shut the fixed overlay, pass or fail, so later pointer checks reach the app.
+  await pressEscape();
+
+  return universal === true ? true : `the command centre: ${universal}`;
+})();
+
+/*
+ * The feedback button, which sits immediately after the command centre.
+ *
+ * Deliberately stops short of submitting: a real send would reach the live API from a
+ * test run, and what is worth checking here is that the button is reachable and the form
+ * opens - the round trip has its own tests in services/api.
+ */
+/*
+ * The account button, and that it is visible out of the box.
+ *
+ * `hidden` is the check that matters. The button hides itself when there is no Firebase
+ * key, which was right in principle and meant a plain `npm start` showed no sign-in at
+ * all - the feature existed and nobody could see it. A committed default key fixed that,
+ * and this fails if anything puts it back.
+ */
+checks.accountButtonVisible = await (async () => {
+  const state = await evaluate(
+    `(() => {
+       const button = document.getElementById('account-toggle');
+       if (!button) return 'no account button';
+       if (button.hidden) return 'the account button is hidden - is the Firebase key configured?';
+
+       const feedback = document.getElementById('report-toggle');
+       if (!feedback) return 'no feedback button to sit after';
+       const b = button.getBoundingClientRect();
+       const f = feedback.getBoundingClientRect();
+       if (b.width === 0) return 'the account button has no width';
+       if (b.left < f.right) return 'the account button is not after the feedback button';
+       return true;
+     })()`,
+  );
+
+  return state === true ? true : `the account button: ${state}`;
+})();
+
+checks.reportDialogOpens = await (async () => {
+  const geometry = await evaluate(
+    `(() => {
+       const button = document.getElementById('report-toggle');
+       if (!button) return 'no feedback button';
+       const centre = document.querySelector('.command-centre-slot');
+       if (!centre) return 'no command centre slot';
+       const b = button.getBoundingClientRect();
+       const c = centre.getBoundingClientRect();
+       if (b.width === 0) return 'the feedback button has no width';
+       if (!button.closest('#titlebar') || !centre.closest('.project-toolbar')) return 'feedback and project search are not in their chrome rows';
+       return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) };
+     })()`,
+  );
+
+  if (typeof geometry === "string") return geometry;
+
+  await clickAt(geometry.x, geometry.y);
+  await sleep(250);
+
+  const form = await evaluate(
+    `(() => {
+       const dialog = document.querySelector('.report-dialog');
+       if (!dialog?.open) {
+         // Same reason as the command centre: name what the pointer actually reached.
+         const hit = document.elementFromPoint(${geometry.x}, ${geometry.y});
+         const button = document.getElementById('report-toggle');
+         return 'the button did not open the form ' + JSON.stringify({
+           hit: hit === null ? null : hit.tagName + '.' + (hit.getAttribute('class') ?? '(no class)'),
+           // A click on the icon inside the button still counts - it bubbles. What would
+           // not count is the pointer landing on something that is not the button at all.
+           hitIsTheButton: hit !== null && button !== null && button.contains(hit),
+           dialogExists: dialog !== null,
+           dialogOpen: dialog === null ? null : dialog.open,
+         });
+       }
+       if (dialog.querySelectorAll('.report-kind').length !== 4) return 'the four report kinds are not all there';
+       if (dialog.querySelector('.report-kind[aria-checked="true"]') === null) return 'no kind is selected by default';
+       if (!dialog.querySelector('.report-input')) return 'no summary field';
+       if (!dialog.querySelector('.report-textarea')) return 'no detail field';
+       return true;
+     })()`,
+  );
+
+  await evaluate("document.querySelector('.report-dialog')?.close(); true");
+  await sleep(150);
+
+  const closed = await evaluate(
+    "document.querySelector('.report-dialog')?.open === false",
+  );
+  if (closed !== true) return "the form would not close";
+
+  return form === true ? true : `the feedback form: ${form}`;
+})();
+
+/*
+ * Dragging the mouse across a line selects the line.
+ *
+ * It did not: the "Multi-cursor" settings row was wired to Monaco's `columnSelection`, and
+ * that row defaults to on - so every install shipped in column-select mode and a drag
+ * produced a rectangular block. Read off the live editor rather than the settings file,
+ * because the setting being right is not the same as the option being right.
+ */
+checks.dragSelectsWholeLine = await evaluate(
+  `(() => {
+     const host = document.querySelector('.editor-file-panel[data-active="true"] .editor-file-content');
+     const mode = host?.dataset?.columnSelection;
+     if (mode === undefined) return 'the editor never reported its selection mode';
+     return mode === 'false' ? true : 'the editor is in column-selection mode';
+   })()`,
+);
+
+checks.fileIcons = await evaluate(
+  "document.querySelectorAll('#filetree .file-icon').length > 5",
+);
+
+/*
+ * A full tab strip stays usable: it overflows rather than crushing every tab, the tab you
+ * just opened is on screen, and no label escapes its own tab.
+ *
+ * All three broke at once when the strip's scrollbar was hidden with nothing scrolling it,
+ * and the third came back the moment the tabs were told to stop shrinking.
+ */
+checks.tabStripStaysUsable = await evaluate(
+  `(async () => {
+     const files = [...document.querySelectorAll('.tree-row')]
+       .filter((r) => r.querySelector('.tree-twisty')?.textContent === '');
+     for (const row of files.slice(0, 14)) {
+       row.click();
+       await new Promise((r) => setTimeout(r, 180));
+     }
+     await new Promise((r) => setTimeout(r, 600));
+
+     const strip = document.getElementById('tabs');
+     const tabs = [...strip.querySelectorAll('.tab')];
+     if (tabs.length < 4) return 'only ' + tabs.length + ' tabs opened';
+
+     const spilling = tabs.filter((tab) => {
+       const label = tab.querySelector('.tab-label');
+       if (!label) return false;
+       return label.getBoundingClientRect().right > tab.getBoundingClientRect().right + 1;
+     });
+     if (spilling.length > 0) return spilling.length + ' label(s) overflow their tab';
+
+     const active = strip.querySelector('.tab[aria-selected="true"]');
+     const sr = strip.getBoundingClientRect();
+     const ar = active?.getBoundingClientRect();
+     if (!ar) return 'no active tab';
+     if (ar.left < sr.left - 1 || ar.right > sr.right + 1) return 'active tab is off screen';
+
+     // Overflow is the point: if it all fits, the scrolling path went untested.
+     return strip.scrollWidth > strip.clientWidth ? true : 'strip did not overflow';
+   })()`,
+);
+
+/*
+ * The explorer's structural operations, end to end and at real coordinates.
+ *
+ * Everything happens inside a scratch folder created through the UI and removed at the
+ * end, so a smoke run never leaves the repository modified. The `finally` matters: a
+ * failed assertion partway through must not leave the folder behind.
+ */
+const SCRATCH = ".adcode-smoke-tmp";
+try {
+  // The search and source-control checks above left the sidebar on another view, which
+  // hides the tree entirely - so every coordinate below would be measured against a box
+  // of zero size.
+  await openSidebar("explorer");
+  await sleep(500);
+  // This flow explicitly exercises auto-save; normal installs default to manual save.
+  await evaluate("window.adcode.settings.write('adcode.session.autoSave', true)");
+
+  /*
+   * Recomputed before every use, never cached.
+   *
+   * Each file this flow creates adds a row, so the blank area below the tree moves up. A
+   * coordinate captured once and reused lands on a row later in the run, and the right
+   * click then opens the *file* menu - which has no "New File" - and the failure reads as
+   * "no context menu is open" rather than as a stale coordinate.
+   */
+  const emptyTreeSpace = () =>
+    evaluate(
+      `(() => {
+         const tree = document.getElementById('filetree');
+         const box = tree.getBoundingClientRect();
+         const rows = tree.querySelectorAll('.tree-row');
+         const last = rows[rows.length - 1]?.getBoundingClientRect();
+         const visible = document.getElementById('sidebar-content').getBoundingClientRect();
+         const y = Math.max(visible.top + 8, Math.min(last ? last.bottom + 40 : box.top + 40, visible.bottom - 12));
+         // The tree's padding stays a root-level context target even when rows fill
+         // the viewport. Its full scroll height can extend well below the window.
+         return { x: Math.round(box.left + 2), y: Math.round(y) };
+       })()`,
+    );
+
+  async function waitForTreePath(suffix) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const found = await evaluate(
+        `[...document.querySelectorAll('#filetree .tree-row')].some(r => r.dataset.path?.endsWith(${JSON.stringify(suffix)}))`,
+      );
+      if (found === true) return true;
+      await sleep(100);
+    }
+    return false;
+  }
+
+  const emptySpace = await emptyTreeSpace();
+
+  await rightClickAt(emptySpace.x, emptySpace.y);
+  checks.contextMenuOpens = await evaluate(
+    `(() => {
+       const panel = document.querySelector('.menu-panel[data-context]');
+       if (!panel) {
+         const tree = document.getElementById('filetree').getBoundingClientRect();
+         const hit = document.elementFromPoint(${emptySpace.x}, ${emptySpace.y});
+         return 'no context menu; point ' + ${emptySpace.x} + ',' + ${emptySpace.y} +
+           ' hit ' + (hit ? hit.tagName + '.' + hit.className : 'null') +
+           ' tree ' + JSON.stringify({ l: Math.round(tree.left), t: Math.round(tree.top), r: Math.round(tree.right), b: Math.round(tree.bottom) });
+       }
+       const item = panel.querySelector('.menu-item');
+       const r = item.getBoundingClientRect();
+       const hit = document.elementFromPoint(Math.round(r.left + r.width/2), Math.round(r.top + r.height/2));
+       // Built *and* on top: the menu bar shipped dead behind a count that stayed green.
+       return item === hit || item.contains(hit) ? true : 'covered by ' + (hit?.className ?? 'null');
+     })()`,
+  );
+
+  let point = await contextItemPoint("New Folder");
+  await clickAt(point.x, point.y);
+  await typeText(SCRATCH);
+  await pressEnter();
+  await sleep(600);
+
+  checks.createFolder = await waitForTreePath(SCRATCH);
+  if (checks.createFolder !== true) {
+    throw new Error(`scratch folder ${SCRATCH} did not appear in the Explorer`);
+  }
+
+  const folderPoint = await evaluate(
+    `(() => {
+       const row = [...document.querySelectorAll('#filetree .tree-row')]
+         .find(r => r.dataset.path?.endsWith(${JSON.stringify(SCRATCH)}));
+       if (!row) return null;
+       const r = row.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+     })()`,
+  );
+
+  // A reserved device name has to be refused with a reason, and leave the editor open.
+  await rightClickAt(folderPoint.x, folderPoint.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await typeText("CON.txt");
+  await pressEnter();
+
+  checks.badNameRefused = await evaluate(
+    `(() => {
+       const row = document.querySelector('.tree-edit-row');
+       if (!row) return 'the editor closed on a name that should have been refused';
+       const message = document.querySelector('.tree-edit-error')?.textContent ?? '';
+       return /reserved/i.test(message) ? true : 'unexpected message: ' + message;
+     })()`,
+  );
+
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-note.md");
+  await pressEnter();
+  await sleep(800);
+
+  checks.createFileOpensIt = await evaluate(
+    `(() => ({
+       inTree: [...document.querySelectorAll('#filetree .tree-row')].some(r => r.dataset.path?.endsWith('smoke-note.md')),
+       tabOpen: [...document.querySelectorAll('.tab .tab-label')].some(l => l.textContent === 'smoke-note.md'),
+     }))()`,
+  );
+
+  // Rename, and the tab has to follow it or the next save forks the file in two.
+  const filePoint = await evaluate(
+    `(() => {
+       const row = [...document.querySelectorAll('#filetree .tree-row')].find(r => r.dataset.path?.endsWith('smoke-note.md'));
+       const r = row.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+     })()`,
+  );
+
+  await rightClickAt(filePoint.x, filePoint.y);
+  point = await contextItemPoint("Rename");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-renamed.md");
+  await pressEnter();
+  await sleep(800);
+
+  checks.renameMovesTab = await evaluate(
+    `(() => ({
+       renamed: [...document.querySelectorAll('#filetree .tree-row')].some(r => r.dataset.path?.endsWith('smoke-renamed.md')),
+       tabFollowed: [...document.querySelectorAll('.tab .tab-label')].some(l => l.textContent === 'smoke-renamed.md'),
+     }))()`,
+  );
+
+  // The row's own New File / New Folder buttons, which is how most people will reach them.
+  checks.folderRowHasActions = await evaluate(
+    `(() => {
+       const row = [...document.querySelectorAll('#filetree .tree-row')]
+         .find(r => r.dataset.path?.endsWith(${JSON.stringify(SCRATCH)}));
+       const actions = row?.querySelector('.tree-actions');
+       if (!actions) return 'no action group on the folder row';
+       const titles = [...actions.querySelectorAll('.tree-action')].map(b => b.title);
+       // Out of the way until wanted: a resting tree is a list of names, not of buttons.
+       if (getComputedStyle(actions).opacity !== '0') return 'actions are visible at rest';
+       return titles.join(',') === 'New File,New Folder' ? true : 'buttons were ' + titles.join(',');
+     })()`,
+  );
+
+  /*
+   * Drag and drop, driven with real DragEvents.
+   *
+   * CDP's Input domain cannot produce an HTML5 drag - it is a browser-internal sequence
+   * rather than a stream of mouse events - so the handlers are fed the events and the
+   * DataTransfer they actually consume, and the result is checked on disk.
+   */
+  // Made through the UI, not the bridge: the tree re-lists a directory when it changes
+  // one, and a folder created behind its back has no row to drop onto.
+  await rightClickAt(folderPoint.x, folderPoint.y);
+  point = await contextItemPoint("New Folder");
+  await clickAt(point.x, point.y);
+  await typeText("nested");
+  await pressEnter();
+  await sleep(700);
+
+  checks.dragMovesFile = await evaluate(
+    `(async () => {
+       const root = (await window.adcode.workspace.current()).root;
+       const base = root + '/' + ${JSON.stringify(SCRATCH)};
+       const rows = () => [...document.querySelectorAll('#filetree .tree-row')];
+       const file = rows().find(r => r.dataset.path?.endsWith('smoke-renamed.md'));
+       let folder = rows().find(r => r.dataset.path?.endsWith('nested'));
+       if (!file || !folder) return 'rows missing (file: ' + !!file + ', folder: ' + !!folder + ')';
+
+       const dt = new DataTransfer();
+       file.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: dt }));
+       folder.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+       const highlighted = !!document.querySelector('[data-drop-target="true"]');
+       folder.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+       await new Promise(r => setTimeout(r, 1500));
+       file.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: dt }));
+
+       const inside = await window.adcode.workspace.list(base + '/nested');
+       return highlighted && inside.some(e => e.name === 'smoke-renamed.md')
+         ? true
+         : 'highlighted=' + highlighted + ' nested=' + inside.map(e => e.name).join(',');
+     })()`,
+  );
+
+  // Copy collisions suffix rather than overwrite, and a folder cannot swallow itself.
+  checks.copyAndGuards = await evaluate(
+    `(async () => {
+       const root = (await window.adcode.workspace.current()).root;
+       const base = root + '/' + ${JSON.stringify(SCRATCH)};
+       const source = base + '/nested/smoke-renamed.md';
+
+       const first = await window.adcode.files.copy(source, base);
+       const second = await window.adcode.files.copy(source, base);
+       const intoSelf = await window.adcode.files.move(base, base + '/nested');
+
+       if (!first.ok || !second.ok) return 'copy failed: ' + first.message + ' / ' + second.message;
+       if (first.path === second.path) return 'the second copy overwrote the first';
+       if (intoSelf.ok) return 'a folder was allowed to move into itself';
+       return true;
+     })()`,
+  );
+
+  // The git group describes this file as it is now, and Push is repo-wide but present.
+  const trackedPoint = await evaluate(
+    `(() => {
+       const row = [...document.querySelectorAll('#filetree .tree-row')].find(r => r.dataset.path?.endsWith('README.md'));
+       if (!row) return null;
+       /*
+        * Scroll it into view before measuring.
+        *
+        * The checks above this one create, rename and move files, which grows the tree and
+        * pushes README.md below the fold. Its rect is still perfectly real down there, and
+        * right-clicking those coordinates dispatches into nothing - the failure printed
+        * "no menu", which reads as a broken context menu rather than a point off-screen.
+        */
+       row.scrollIntoView({ block: 'center' });
+       const r = row.getBoundingClientRect();
+       const point = { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+       if (point.y < 0 || point.y > window.innerHeight || point.x < 0 || point.x > window.innerWidth) return null;
+       return point;
+     })()`,
+  );
+
+  if (trackedPoint !== null) {
+    await rightClickAt(trackedPoint.x, trackedPoint.y);
+    checks.gitGroupInMenu = await evaluate(
+      `(() => {
+         const panel = document.querySelector('.menu-panel[data-context]');
+         if (!panel) {
+           const hit = document.elementFromPoint(${trackedPoint.x}, ${trackedPoint.y});
+           return 'no menu ' + JSON.stringify({
+             hit: hit === null ? null : hit.tagName + '.' + (hit.className || '(no class)'),
+             anyPanels: document.querySelectorAll('.menu-panel').length,
+             rowUnderPoint: hit === null ? null : (hit.closest('.tree-row')?.dataset.path ?? null),
+           });
+         }
+         const headings = [...panel.querySelectorAll('.menu-heading')].map(h => h.textContent);
+         const labels = [...panel.querySelectorAll('.menu-item-label')].map(l => l.textContent);
+         if (!headings.includes('Git')) return 'no Git heading';
+         const wanted = ['Discard Changes', 'Commit…', 'Push'];
+         const missing = wanted.filter(w => !labels.includes(w));
+         if (missing.length > 0) return 'missing ' + missing.join(', ');
+         // Exactly one of the pair, chosen from the file's actual staged state.
+         const staged = labels.includes('Stage');
+         const unstaged = labels.includes('Unstage');
+         return staged !== unstaged ? true : 'Stage/Unstage both ' + (staged ? 'present' : 'absent');
+       })()`,
+    );
+    await evaluate(
+      "document.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })); true",
+    );
+    await sleep(200);
+  }
+
+  /*
+   * The branch switcher opens a dialog instead of throwing.
+   *
+   * It called `window.prompt`, which Electron does not implement, inside a `void`-ed async
+   * function - so the rejection was swallowed and the button did nothing at all.
+   */
+  checks.branchSwitcherOpens = await evaluate(
+    `(async () => {
+       document.querySelector('.activity[data-view="scm"]').click();
+       await new Promise(r => setTimeout(r, 800));
+       const button = document.querySelector('.scm-branch');
+       if (!button) return 'no branch button';
+
+       button.click();
+       await new Promise(r => setTimeout(r, 1200));
+
+       const dialog = document.querySelector('.prompt-dialog');
+       if (!dialog?.open) return 'no dialog opened';
+
+       const suggestions = [...dialog.querySelectorAll('datalist option')].map(o => o.value);
+       dialog.querySelector('.confirm-cancel').click();
+       await new Promise(r => setTimeout(r, 300));
+
+       if (dialog.open) return 'cancel did not close it';
+       return suggestions.length > 0 ? true : 'no branches offered';
+     })()`,
+  );
+
+  /*
+   * The commit browser: history, a commit opened, and a restore that asks first.
+   *
+   * The confirmation is *cancelled* rather than accepted. A restore writes over a tracked
+   * file, and a smoke run that edits the repository it is testing is a smoke run nobody
+   * will be willing to execute.
+   */
+  checks.historyListsCommits = await evaluate(
+    `(async () => {
+       document.querySelector('.activity[data-view="scm"]').click();
+       for (let i = 0; i < 30 && document.querySelectorAll('.history-commit').length === 0; i++) {
+         await new Promise(r => setTimeout(r, 200));
+       }
+       const rows = [...document.querySelectorAll('.history-commit')];
+       if (rows.length === 0) return 'no commits listed';
+
+       const first = rows[0];
+       return {
+         count: rows.length,
+         subject: first.querySelector('.history-subject')?.textContent?.slice(0, 40),
+         hasHash: /^[0-9a-f]{7,}$/.test(first.querySelector('.history-hash')?.textContent ?? ''),
+         hasMeta: (first.querySelector('.history-meta')?.textContent ?? '').includes('·'),
+       };
+     })()`,
+  );
+
+  checks.commitOpensItsFiles = await evaluate(
+    `(async () => {
+       const first = document.querySelector('.history-commit .history-head');
+       if (!first) return 'no commit row';
+       if (first.closest('.history-commit')?.dataset.open !== 'true') first.click();
+
+       for (let i = 0; i < 40 && !document.querySelector('.history-file'); i++) {
+         await new Promise(r => setTimeout(r, 200));
+       }
+       const files = [...document.querySelectorAll('.history-file')];
+       if (files.length === 0) return 'the commit showed no files';
+
+       const stat = files[0].querySelector('.history-file-stat')?.textContent ?? '';
+       return {
+         files: files.length,
+         // Both counts always, so a lone "+4" cannot be misread as a total.
+         hasBothCounts: stat.includes('+') && stat.includes('−'),
+         hasRestore: !!files[0].querySelector('.history-restore'),
+         summary: document.querySelector('.history-summary')?.textContent,
+       };
+     })()`,
+  );
+
+  checks.restoreAsksAndCanCancel = await evaluate(
+    `(async () => {
+       const restore = document.querySelector('.history-file .history-restore');
+       if (!restore) return 'no restore button';
+       restore.click();
+
+       for (let i = 0; i < 25 && !document.querySelector('.confirm-dialog[open]'); i++) {
+         await new Promise(r => setTimeout(r, 200));
+       }
+       const dialog = document.querySelector('.confirm-dialog[open]');
+       if (!dialog) return 'restore did not ask first';
+
+       const title = dialog.querySelector('.result-title')?.textContent ?? '';
+       const body = dialog.querySelector('.result-summary')?.textContent ?? '';
+
+       // Cancelled: nothing in the working tree is touched by this check.
+       dialog.querySelector('.confirm-cancel').click();
+       await new Promise(r => setTimeout(r, 400));
+       if (document.querySelector('.confirm-dialog[open]')) return 'cancel did not close it';
+
+       return /restore/i.test(title) && /uncommitted|rewritten/i.test(body)
+         ? true
+         : 'unexpected wording: ' + title + ' / ' + body;
+     })()`,
+  );
+
+  await openSidebar("explorer");
+  await sleep(400);
+
+  // Delete, through however many confirmations this volume needs. A drive with no
+  // Recycle Bin asks a second time before anything is removed for good.
+  const deletePoint = await evaluate(
+    `(() => {
+       const row = [...document.querySelectorAll('#filetree .tree-row')]
+         .find(r => r.dataset.path?.endsWith(${JSON.stringify(SCRATCH)}));
+       if (!row) return null;
+       row.scrollIntoView({ block: 'center' });
+       const r = row.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+  if (deletePoint === null) {
+    throw new Error(
+      `refusing to delete: scratch folder ${SCRATCH} is not visible`,
+    );
+  }
+  await rightClickAt(deletePoint.x, deletePoint.y);
+  point = await contextItemPoint("Delete");
+  await clickAt(point.x, point.y);
+
+  let asked = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const button = await evaluate(
+      `(() => {
+         const b = document.querySelector('.confirm-dialog[open] .result-close');
+         if (!b) return null;
+         const r = b.getBoundingClientRect();
+         return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+       })()`,
+    );
+    if (button === null) break;
+    asked++;
+    await clickAt(button.x, button.y);
+    await sleep(1000);
+  }
+
+  checks.deleteAsksFirst = asked > 0 ? true : "deleted without asking";
+  checks.deleteRemovesRow = await evaluate(
+    `(() => ({
+       goneFromTree: ![...document.querySelectorAll('#filetree .tree-row')].some(r => r.dataset.path?.endsWith(${JSON.stringify(SCRATCH)})),
+       tabMarkedStale: [...document.querySelectorAll('.tab .tab-label')].some(l => l.textContent === 'smoke-renamed.md (deleted)'),
+     }))()`,
+  );
+
+  /*
+   * The Problems panel, end to end.
+   *
+   * A real file, created through the real menu, typed into with real key events, checked
+   * by Monaco's real TypeScript worker. Every unit test in this feature passes against a
+   * hand-built `Diagnostic`; none of them can tell whether a marker ever reaches the
+   * panel, which is the only thing a user experiences.
+   */
+  const brokenSpace = await emptyTreeSpace();
+  await rightClickAt(brokenSpace.x, brokenSpace.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  // Created at the workspace root, like every other file this flow makes, so the cleanup
+  // below has to name it. A smoke run that leaves a stray `.ts` behind has modified the
+  // repository, which is the one thing this whole block promises not to do.
+  await typeText("smoke-broken.ts");
+  await pressEnter();
+  await sleep(1000);
+
+  async function focusActiveEditor() {
+    const point = await evaluate(`(() => {
+      const panel = document.querySelector('.editor-file-panel[data-active="true"]');
+      const r = panel.querySelector('.view-lines').getBoundingClientRect();
+      const bounds = panel.getBoundingClientRect();
+      return { x: Math.round(r.left + 40), y: Math.round(Math.max(r.top, bounds.top + 50) + 10) };
+    })()`);
+    await clickAt(point.x, point.y);
+  }
+  await focusActiveEditor();
+
+  /*
+   * Select the whole buffer before typing.
+   *
+   * A new `.ts` file no longer opens empty - `adcode.editing.fileTemplates` starts it with
+   * a doc comment and a stub function. Typing into that put this line *inside the comment*,
+   * so the compiler saw nothing wrong, the badge stayed hidden, and this block quietly
+   * reported prose instead of failing. Replacing the buffer keeps the check testing the
+   * compiler rather than the template.
+   */
+  await pressChord("a");
+  await sleep(150);
+
+  // No quotes and no brackets: auto-closing pairs would rewrite anything containing them,
+  // and this needs to be exactly the source that produces TS2322.
+  await typeText("let x: number = true;");
+
+  // The TypeScript worker is a web worker doing a real compile. It is the slowest thing
+  // in this run and the only one worth waiting seconds for.
+  await sleep(6000);
+
+  checks.problemsBadgeAppears = await evaluate(
+    `(() => {
+       const badge = document.getElementById('problems-badge');
+       if (!badge) return 'no badge element';
+       if (badge.hidden) return 'badge stayed hidden with an error on screen';
+       return { text: badge.textContent, tone: badge.dataset.tone };
+     })()`,
+  );
+
+  await evaluate(
+    `document.querySelector('.activity[data-view="problems"]').click(); true`,
+  );
+  await sleep(600);
+
+  checks.problemsActivityState = await evaluate(
+    `(() => {
+       const button = document.querySelector('.activity[data-view="problems"]');
+       return button?.getAttribute('aria-pressed') === 'true' && button?.getAttribute('aria-expanded') === 'true';
+     })()`,
+  );
+
+  checks.problemsPanelExplains = await evaluate(
+    `(() => {
+       const view = document.getElementById('panel-body-problems');
+       if (view.hidden) return 'the problems tab did not show';
+
+       const rows = view.querySelectorAll('.problems-row');
+       if (rows.length === 0) return 'panel listed nothing: ' + (view.textContent ?? '').trim().slice(0, 120);
+
+       const headline = view.querySelector('.problems-headline')?.textContent ?? '';
+       const raw = view.querySelector('.problems-raw')?.textContent ?? '';
+
+       const files = [...view.querySelectorAll('.problems-file-name')].map((f) => f.textContent);
+
+       return {
+         // Grouped under the file that has the error, and that file is the one just typed
+         // into. A regression in the "is this an editable tab" predicate shows up here as
+         // a list of files the user never opened.
+         files,
+         worstFirst: files[0] === 'smoke-broken.ts',
+         // The rewrite happened, in words with no type-system vocabulary in them.
+         rewritten: /true or false/.test(headline) && !/assignable/.test(headline),
+         // And the compiler's own sentence is still on the row. Demoted, never dropped -
+         // a rewrite is only safe to ship because this is one glance away.
+         keepsRaw: /not assignable/.test(raw),
+       };
+     })()`,
+  );
+
+  checks.problemsRowJumpsToTheColumn = await evaluate(
+    `(async () => {
+       const row = document.querySelector('#panel-body-problems .problems-row');
+       if (!row) return 'no row to click';
+
+       row.click();
+       await new Promise((r) => setTimeout(r, 700));
+
+       const position = document.getElementById('status-position')?.textContent ?? '';
+       // The column is the point: landing on column 1 of a long line makes the reader do
+       // the search the panel was supposed to do for them.
+       return /Ln \\d+, Col [2-9]\\d*/.test(position) ? position : 'cursor at ' + position;
+     })()`,
+  );
+
+  // A picture is worth five probes: capture what the window actually looks like here.
+  {
+    const shot = await send("Page.captureScreenshot", { format: "png" });
+    if (shot.result?.data !== undefined) {
+      const { writeFileSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      writeFileSync(
+        join(tmpdir(), "adcode-smoke.png"),
+        Buffer.from(shot.result.data, "base64"),
+      );
+    }
+  }
+
+  checks.layoutProbe = await evaluate(
+    `(() => {
+       const host = document.getElementById('editor-host')?.getBoundingClientRect();
+       const bar = document.querySelector('.breadcrumbs')?.getBoundingClientRect();
+       return {
+         breadcrumbsHeight: Math.round(bar?.height ?? -1),
+         hostTop: Math.round(host?.top ?? -1),
+         hostHeight: Math.round(host?.height ?? -1),
+         monacoLines: document.querySelectorAll('.monaco-editor .view-line').length,
+         tabs: document.querySelectorAll('.tab').length,
+         activeTab: document.querySelector('.tab[aria-selected="true"] .tab-label')?.textContent ?? null,
+         placeholderVisible: !(document.getElementById('editor-placeholder')?.hidden ?? true),
+         placeholderText: (document.getElementById('editor-placeholder')?.textContent ?? '').trim().slice(0, 60),
+         hostHidden: document.getElementById('editor-host')?.hidden ?? '?',
+         viewZones: document.querySelectorAll('.view-zones > *').length,
+       };
+     })()`,
+  );
+
+  /* ── The editing group, on the file that already has a real error (P2a) ── */
+
+  /*
+   * Every one of these clicks into the editor with real input first.
+   *
+   * The first version used synthetic MouseEvents and a bare Ctrl+A, and all four checks
+   * reported false for the same reason: focus was still on the Problems row that the
+   * previous block clicked, so the typing went nowhere. Monaco owns a hidden textarea and
+   * only real input reliably lands in it.
+   */
+  /*
+   * Replace the scratch file's contents - and *only* the scratch file's.
+   *
+   * This helper selects everything and types over it, which is a loaded gun pointed at
+   * whichever buffer happens to be in front. It has already gone off once: the Problems
+   * check above clicks a row to test that it jumps to the right column, that row belonged
+   * to a real repository file, and the next `retypeFile` overwrote a 582-line document with
+   * two lines of test input. Auto-save then wrote it to disk.
+   *
+   * So the target is verified before anything is typed, and this refuses rather than
+   * guesses. A smoke run must not be able to modify the repository it is running in.
+   */
+  async function retypeFile(text) {
+    const onTarget = await evaluate(
+      `(() => (document.querySelector('.tab[aria-selected="true"] .tab-label')?.textContent ?? '')
+         .startsWith('smoke-broken.ts'))`,
+    );
+
+    if (onTarget !== true) {
+      const activated = await evaluate(
+        `(() => {
+           const tab = [...document.querySelectorAll('.tab')].find(
+             (t) => (t.querySelector('.tab-label')?.textContent ?? '').startsWith('smoke-broken.ts'),
+           );
+           if (!tab) return false;
+           tab.click();
+           return true;
+         })()`,
+      );
+
+      if (activated !== true) {
+        throw new Error(
+          "smoke-broken.ts is not open - refusing to type over another file",
+        );
+      }
+      await sleep(600);
+    }
+
+    await focusActiveEditor();
+    await sleep(200);
+    await pressChord("a");
+    await sleep(150);
+    await typeText(text);
+  }
+
+  checks.errorLensShowsTheMessage = await (async () => {
+    await evaluate("window.adcode.settings.write('adcode.editing.inlineErrorLens', true)");
+    // The error stays on line 1 and the cursor ends on line 2, because the lens deliberately
+    // says nothing about the line you are typing on.
+    await retypeFile("let x: number = true;");
+    await pressEnterInEditor();
+    await typeText("const ok = 1;");
+
+    // The TypeScript worker is a real compile.
+    await sleep(5000);
+
+    return await evaluate(
+      `(() => {
+         const lenses = [...document.querySelectorAll('.error-lens')];
+         if (lenses.length === 0) return false;
+         const text = lenses.map((l) => l.textContent ?? '').join(' ');
+         return {
+           appears: true,
+           // One error in the file means exactly one annotation. Hints and info markers
+           // are deliberately not shown, so an unused variable adds nothing here.
+           /*
+            * Counted by line, not by element.
+            *
+            * Monaco splits injected text across several spans of its own accord - one
+            * message arrived as "You're putting true or false where a num" plus
+            * "belongs." - so counting elements measures Monaco's text rendering rather
+            * than this feature. One error in the file means one annotated line.
+            */
+           onlyTheErrorLine:
+             new Set(lenses.map((l) => l.closest('.view-line')?.style.top ?? '?')).size === 1,
+           inPlainEnglish: /true or false|number/i.test(text),
+           tinted: lenses.some((l) => l.className.includes('error-lens-error')),
+         };
+       })()`,
+    );
+  })();
+
+  checks.todoHighlightMarksOnlyComments = await (async () => {
+    // A note in a comment, and the same word in code. Only the first may light up.
+    await retypeFile("// TODO make this work");
+    await pressEnterInEditor();
+    await typeText("const TODO = 1;");
+    await sleep(900);
+
+    return await evaluate(
+      `(() => {
+         const marks = [...document.querySelectorAll('.todo-mark')];
+         return {
+           markedExactlyOne: marks.length === 1,
+           isTheComment: (marks[0]?.textContent ?? '') === 'TODO',
+           toned: marks[0]?.className.includes('todo-mark-todo') === true,
+         };
+       })()`,
+    );
+  })();
+
+  checks.pathCompleteOffersRealFiles = await (async () => {
+    await retypeFile('import x from "./pack');
+
+    /*
+     * Read before auto-save fires, not after.
+     *
+     * Auto-save runs 1200ms after typing stops, and format-on-save deliberately dismisses
+     * the suggestion list before rewriting the buffer. Waiting 1200ms here watched the
+     * widget get closed by a different feature working correctly.
+     */
+    await sleep(500);
+
+    const offered = await evaluate(
+      `(() => {
+         const rows = [...document.querySelectorAll('.suggest-widget .monaco-list-row')];
+         const labels = rows.map((r) => (r.textContent ?? '').trim());
+         return {
+           opened: rows.length > 0,
+           offersRealFile: labels.some((l) => l.toLowerCase().startsWith('package')),
+         };
+       })()`,
+    );
+
+    await pressEscape();
+    return offered;
+  })();
+
+  checks.formatterTidiesOnSave = await (async () => {
+    // Deliberately messy, and deliberately valid: the point is that saving fixes the
+    // indentation without changing what the code says.
+    await retypeFile("function a(){");
+    await pressEnterInEditor();
+    await typeText("return 1");
+    await sleep(300);
+
+    await pressChord("s");
+    await sleep(1200);
+
+    return await evaluate(
+      `(() => {
+         const lines = [...document.querySelectorAll('.monaco-editor .view-line')]
+           .map((l) => (l.textContent ?? '').replace(/ /g, ' '));
+         const body = lines.find((l) => l.includes('return 1')) ?? '';
+         return {
+           // Auto-closing braces put the } there; format-on-save indents the body under it.
+           indented: /^\\s\\s+return 1/.test(body),
+           // And the code itself is untouched - this formatter only ever moves whitespace.
+           unchanged: body.trim() === 'return 1',
+         };
+       })()`,
+    );
+  })();
+
+  /*
+   * There is deliberately no smoke check that types JSON into the editor.
+   *
+   * One was written and removed. It typed `{"b":1,"a":[1,2,3]}` into a TypeScript buffer to
+   * watch the formatter run, and with auto-closing pairs and CDP typing at machine speed it
+   * provoked "Token length and text length do not match!" from inside Monaco's own suggest
+   * model - `checkForWordEnd` asking for a word in a buffer whose tokens had not caught up.
+   * Nothing in this app edits the model during that sequence, the editor carries on working,
+   * and every check after it passed.
+   *
+   * It was also a weak check: it only asserted the buffer still contained the text that had
+   * been typed. What JSON formatting actually produces is pinned exactly by the unit tests
+   * in packages/format, and what the smoke run is here to prove - that format-on-save is
+   * wired to the save path at all - is proven by the check above it.
+   */
+
+  checks.pairedTagRenameFollowsAlong = await (async () => {
+    // Auto-close writes the closing tag, which is what gives us a pair to rename.
+    await retypeFile("<div>");
+    await sleep(500);
+
+    const before = await evaluate(
+      `(document.querySelector('.monaco-editor .view-lines')?.textContent ?? '')`,
+    );
+
+    // One step left puts the cursor at the end of the opening tag's name.
+    await pressKey("ArrowLeft");
+    await typeText("s");
+    await sleep(700);
+
+    const after = await evaluate(
+      `(document.querySelector('.monaco-editor .view-lines')?.textContent ?? '')`,
+    );
+
+    return {
+      startedPaired: before.includes("<div>") && before.includes("</div>"),
+      // Both halves followed, from one keystroke.
+      renamedBoth: after.includes("<divs>") && after.includes("</divs>"),
+    };
+  })();
+
+  /* ── The terminal clipboard ───────────────────────────────────────────── */
+
+  /*
+   * Reported by the user: nothing could be pasted into the terminal.
+   *
+   * The cause was that there was no paste path at all - xterm does not paste by itself, and
+   * the bridge only exposed `clipboard.writeText`, because `navigator.clipboard.readText`
+   * is refused in this renderer's context. This drives the whole route: write the clipboard,
+   * run the Paste command, and read what the shell echoed back.
+   */
+  checks.terminalPastes = await (async () => {
+    /*
+     * The pasted text runs a command, and the check is whether the file it writes appears.
+     *
+     * Reading the terminal back was the obvious approach and it cannot work: xterm draws
+     * through the WebGL renderer, so what is on screen is a canvas and there is no text in
+     * the DOM for any selector to find. A side effect on disk is visible to this script.
+     */
+    const marker = join(REPO, "smoke-paste.txt");
+    await rm(marker, { force: true }).catch(() => {});
+
+    const readable = await evaluate(
+      `(async () => {
+         await window.adcode.clipboard.writeText(
+           'echo pasted-ok > smoke-paste.txt' + String.fromCharCode(10),
+         );
+         return await window.adcode.clipboard.readText();
+       })()`,
+    );
+
+    if (typeof readable !== "string" || !readable.includes("smoke-paste.txt")) {
+      return { clipboardReadable: false };
+    }
+
+    // Make sure a terminal is open and focused before pasting into it.
+    await evaluate(
+      `(() => {
+         const panel = document.querySelector('.terminal-panel');
+         return panel !== null && !panel.hidden;
+       })()`,
+    );
+
+    await runCommand("paste into terminal");
+    await sleep(2000);
+
+    const { existsSync } = await import("node:fs");
+    let ran = false;
+    for (let attempt = 0; attempt < 12 && !ran; attempt += 1) {
+      await sleep(500);
+      ran = existsSync(marker);
+    }
+
+    await rm(marker, { force: true }).catch(() => {});
+    return { clipboardReadable: true, reachedTheShell: ran };
+  })();
+
+  /*
+   * Reported by the user: Ctrl+V pasted everything twice - `cp .env.example .envcp
+   * .env.example .env`. The check above runs the Paste *command*, which never had the bug:
+   * the second copy came from the browser's own paste, which only the real key triggers.
+   * So this presses Ctrl+V in the focused terminal and counts how many times the pasted
+   * command ran.
+   *
+   * A count of one proves nothing if a CDP key press never triggers the browser's paste, so
+   * the same press is made first with the bug put back - the browser's default let through -
+   * and must count two. `seesTheBug: false` means this check is blind, not that all is well.
+   */
+  checks.terminalCtrlVPastesOnce = await (async () => {
+    // The Paste check above writes the pty directly and needs no terminal on screen; a key
+    // press does. A fresh terminal is shown and active.
+    await runCommand("new terminal");
+    await sleep(800);
+    const point = await evaluate(
+      `(() => {
+         const surface = [...document.querySelectorAll('.terminal-pane .xterm')]
+           .find((one) => one.getBoundingClientRect().width > 0);
+         if (!surface) return null;
+         const r = surface.getBoundingClientRect();
+         return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+       })()`,
+    );
+    if (point === null) return { terminalVisible: false };
+
+    const { existsSync, readFileSync } = await import("node:fs");
+    async function pasteAndCount(name) {
+      const marker = join(REPO, name);
+      await rm(marker, { force: true }).catch(() => {});
+      await evaluate(
+        `window.adcode.clipboard.writeText('echo pasteonce >> ${name}' + String.fromCharCode(10))`,
+      );
+      await clickAt(point.x, point.y);
+      await sleep(300);
+      await pressChord("v");
+      let runs = 0;
+      for (let attempt = 0; attempt < 16; attempt += 1) {
+        await sleep(500);
+        if (!existsSync(marker)) continue;
+        // Windows PowerShell writes UTF-16 with `>>`; dropping the NULs reads either encoding.
+        runs = (readFileSync(marker, "latin1").replace(/\u0000/g, "").match(/pasteonce/g) ?? []).length;
+        if (runs > 0 && attempt >= 6) break;
+      }
+      await rm(marker, { force: true }).catch(() => {});
+      return runs;
+    }
+
+    await evaluate(
+      `(() => {
+         const original = KeyboardEvent.prototype.preventDefault;
+         window.__smokeRestorePreventDefault = () => { KeyboardEvent.prototype.preventDefault = original; };
+         KeyboardEvent.prototype.preventDefault = function () {
+           if (this.type === 'keydown' && this.ctrlKey && this.key.toLowerCase() === 'v') return;
+           return original.call(this);
+         };
+       })()`,
+    );
+    let runsWithTheBug = 0;
+    try {
+      runsWithTheBug = await pasteAndCount("smoke-paste-twice.txt");
+    } finally {
+      await evaluate(`window.__smokeRestorePreventDefault?.()`);
+    }
+    const runs = await pasteAndCount("smoke-paste-once.txt");
+    return { seesTheBug: runsWithTheBug === 2, ranOnce: runs === 1, runsWithTheBug, runs };
+  })();
+
+  /* ── Terminal agent detection ─────────────────────────────────────────── */
+
+  checks.terminalOffersSharedMemory = await (async () => {
+    await runCommand("new terminal");
+    await sleep(500);
+    /*
+     * A real click into the terminal, at real coordinates.
+     *
+     * `element.click()` does not move focus, and a synthetic focus on xterm's helper
+     * textarea did not take either - the keystrokes went to the editor instead, which is
+     * both a broken check and a good way to type into somebody's file.
+     */
+    const terminalPoint = await evaluate(
+      `(() => {
+         const surface = [...document.querySelectorAll('.terminal-pane .xterm')]
+           .find((one) => one.getBoundingClientRect().width > 0);
+         if (!surface) return null;
+         const r = surface.getBoundingClientRect();
+         if (r.width === 0) return null;
+         return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+       })()`,
+    );
+    if (terminalPoint === null) return { terminalVisible: false };
+
+    await clickAt(terminalPoint.x, terminalPoint.y);
+    await sleep(400);
+
+    /*
+     * A path that cannot exist, ending in a recognised agent name.
+     *
+     * Typing a bare `claude` would detect correctly and also *start Claude Code* inside the
+     * smoke run's terminal. This exercises the same detection - the parser matches on the
+     * basename - and the shell answers "not found".
+     */
+    // First: do typed keystrokes reach the shell at all? The paste check proves a
+    // different path (the pty is written directly), and detection only sees typed input.
+    const typedMarker = join(REPO, "smoke-typed.txt");
+    await rm(typedMarker, { force: true }).catch(() => {});
+    await typeText("echo typed > smoke-typed.txt");
+    await pressEnterInEditor();
+    await sleep(2000);
+    {
+      const { existsSync } = await import("node:fs");
+      checks.terminalReceivesTyping = existsSync(typedMarker);
+      await rm(typedMarker, { force: true }).catch(() => {});
+    }
+
+    await typeText("./no-such-dir/claude");
+    // `pressEnter` sends a key event with no character, and xterm needs the carriage return
+    // itself - the same reason `pressEnterInEditor` exists for Monaco.
+    await pressEnterInEditor();
+    await sleep(1500);
+
+    return await evaluate(
+      `(() => {
+         const strip = document.querySelector('.agent-strip:not(.team-strip)');
+         if (!strip) return { stripInDom: false };
+         if (strip.hidden) return { stripInDom: true, hidden: true };
+         return {
+           shown: true,
+           namesTheAgent: (strip.querySelector('.agent-strip-text')?.textContent ?? '').includes('Claude Code'),
+           carriesTheCommand:
+             (strip.querySelector('.agent-strip-command')?.textContent ?? '').length > 0,
+           offersCopy: strip.querySelector('.ghost-button') !== null,
+         };
+       })()`,
+    );
+  })();
+
+  /* ── Tree-sitter highlighting ─────────────────────────────────────────── */
+
+  /*
+   * What is worth checking here is the part that can actually fail: whether the WebAssembly
+   * runtime and a grammar are fetched and compiled inside a packaged Electron renderer,
+   * under the app's own protocol and CSP. Which node becomes which colour is decided by
+   * `@adcode/highlight`, which is pure and has its own tests.
+   */
+  checks.treeSitterColoursByMeaning = await (async () => {
+    /*
+     * A function call and a variable, which Monaco's tokenizer cannot tell apart.
+     *
+     * Both are bare identifiers to a regular expression, so its tokenizer gives them the
+     * same class. A parse tree knows one is the callee of a call expression and the other
+     * is not - so different classes here is the whole feature, observable from the DOM.
+     */
+    await retypeFile("const alpha = 1;");
+    await pressEnterInEditor();
+    await typeText("console.log(alpha);");
+    await sleep(3500);
+
+    return await evaluate(
+      `(() => {
+         const spans = [...document.querySelectorAll('.monaco-editor .view-line span span')];
+         const classOf = (text) =>
+           spans.find((s) => (s.textContent ?? '').trim() === text)?.className ?? null;
+
+         const call = classOf('log');
+         const variable = classOf('alpha');
+
+         return {
+           painted: spans.length > 0,
+           foundBoth: call !== null && variable !== null,
+           // The point: a call and a variable are coloured differently.
+           toldApart: call !== null && variable !== null && call !== variable,
+         };
+       })()`,
+    );
+  })();
+
+  /* ── Navigation (P2c) ─────────────────────────────────────────────────── */
+
+  /** Run a command the way a person would: through the palette. */
+  async function runCommand(query) {
+    await evaluate(
+      `(() => {
+         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true, bubbles: true }));
+         return true;
+       })()`,
+    );
+    await sleep(350);
+
+    return await evaluate(
+      `(async () => {
+         const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+         if (!input) return false;
+
+         input.value = ${JSON.stringify(query)};
+         input.dispatchEvent(new Event('input', { bubbles: true }));
+         await new Promise((r) => setTimeout(r, 250));
+
+         const row = document.querySelector('.palette-row');
+         if (!row) {
+           input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+           return false;
+         }
+         row.click();
+         return true;
+       })()`,
+    );
+  }
+
+  checks.breadcrumbsShowPathAndSymbol = await (async () => {
+    // A declaration and a use of it, with no braces - auto-closing pairs would rewrite them.
+    await retypeFile("const alpha = 1;");
+    await pressEnterInEditor();
+    await typeText("alpha;");
+
+    // Long enough for the breadcrumb recompute and for auto-save to put this on disk, which
+    // the definition search below reads.
+    await sleep(1800);
+
+    return await evaluate(
+      `(() => {
+         const bar = document.querySelector('.breadcrumbs');
+         if (!bar || bar.dataset.empty === 'true') return false;
+         const labels = [...bar.querySelectorAll('.breadcrumb')].map((b) => b.textContent);
+         return {
+           shown: labels.length > 0,
+           namesTheFile: labels.includes('smoke-broken.ts'),
+           // Every crumb is a button, which is the part worth asserting. Separators are not
+           // checked: this file sits at the workspace root, so its trail is one segment long.
+           allClickable: [...bar.querySelectorAll('.breadcrumb')].every((b) => b.tagName === 'BUTTON'),
+         };
+       })()`,
+    );
+  })();
+
+  checks.symbolSearchFindsADeclaration = await (async () => {
+    const opened = await runCommand("go to symbol");
+    if (opened !== true) return false;
+
+    /*
+     * Wait for the field to hold focus before typing.
+     *
+     * The overlay clears and focuses its input on open, and the palette hands focus back to
+     * the editor as it closes. Which lands last is a race that went both ways across runs,
+     * so this waits for the settled state rather than sleeping and hoping.
+     */
+    let focused = false;
+    for (let attempt = 0; attempt < 15 && !focused; attempt += 1) {
+      await sleep(200);
+      focused =
+        (await evaluate(
+          `(document.activeElement?.getAttribute('aria-label') === 'Go to symbol in project')`,
+        )) === true;
+    }
+    if (!focused) return false;
+
+    /*
+     * Take focus once more, immediately before typing.
+     *
+     * The palette calls `restoreFocus()` as it closes, which can land *after* the loop above
+     * saw the field focused - and then the query is typed into the editor instead. This is
+     * the difference between this check passing every run and passing most runs.
+     */
+    await sleep(400);
+    await evaluate(
+      `(() => {
+         document.querySelector('.quickopen-input[aria-label="Go to symbol in project"]')?.focus();
+         return true;
+       })()`,
+    );
+
+    /*
+     * Typed for real rather than assigned.
+     *
+     * Setting `input.value` raced the overlay's own `open()`, which clears the field - the
+     * search then ran on an empty string and the check read "Type at least two letters."
+     * Real keystrokes arrive after open() has finished, as a person's would.
+     */
+    // The palette returns focus to the editor when it closes, so the field is focused
+    // explicitly rather than assumed - otherwise this types into the file instead.
+    /*
+     * Set the query and wait for the search to actually run.
+     *
+     * Typing raced the overlay's own `open()`, which clears the field, and the palette's
+     * `restoreFocus()`, which takes focus back - so a single attempt passed most runs and
+     * not all of them. Re-asserting the value when it goes missing removes that race
+     * without weakening what is being checked: the rows still have to come from a real
+     * search, name the real declaration, and cite the file that declares it.
+     *
+     * What it must *not* do is re-assert while a search is still running - see the note
+     * inside the loop. The wait is long because a project search is allowed to be slow;
+     * the check is that it answers, not that it answers quickly.
+     */
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const rows = await evaluate(
+        `(() => {
+           const input = document.querySelector('.quickopen-input[aria-label="Go to symbol in project"]');
+           if (!input) return -1;
+           // Re-assert the query only when the field has actually lost it.
+           //
+           // Dispatching unconditionally was worse than doing nothing: every 'input' event
+           // increments the overlay's \`generation\`, and \`run()\` drops its own result when
+           // the generation moved while it was awaiting the workspace search. On a project
+           // large enough for that search to outlast the retry interval, each retry killed
+           // the search that was about to answer, so the check could never pass - and it
+           // read the DOM immediately after the last dispatch, before that one landed too.
+           if (input.value !== 'createEditorHost') {
+             input.focus();
+             input.value = 'createEditorHost';
+             input.dispatchEvent(new Event('input', { bubbles: true }));
+           }
+           return document.querySelectorAll('.symbol-row').length;
+         })()`,
+      );
+      if (typeof rows === "number" && rows > 0) break;
+      await sleep(500);
+    }
+
+    const found = await evaluate(
+      `(async () => {
+         const input = document.querySelector('.quickopen-input[aria-label="Go to symbol in project"]');
+         if (!input) return false;
+
+         const rows = [...document.querySelectorAll('.symbol-row')];
+         const names = rows.map((r) => r.querySelector('.symbol-name')?.textContent ?? '');
+         const where = rows.map((r) => r.querySelector('.symbol-where')?.textContent ?? '');
+
+         return {
+           hint: document.querySelector('.quickopen-symbols .quickopen-hint')?.textContent ?? '?',
+           query: input.value,
+           overlays: [...document.querySelectorAll('.quickopen-symbols')].map((one) => ({ hidden: one.hidden, query: one.querySelector('input')?.value })),
+           found: rows.length > 0,
+           // The real declaration, in the file that really declares it.
+           namesTheSymbol: names.includes('createEditorHost'),
+           inTheRightFile: where.some((w) => w.includes('editorHost.ts')),
+           saysWhatKindItIs: (rows[0]?.querySelector('.symbol-kind')?.textContent ?? '') !== '',
+         };
+       })()`,
+    );
+
+    await pressEscape();
+    return found;
+  })();
+  checks.symbolSearchJourney =
+    typeof checks.symbolSearchFindsADeclaration === "object" &&
+    checks.symbolSearchFindsADeclaration.found === true &&
+    checks.symbolSearchFindsADeclaration.namesTheSymbol === true &&
+    checks.symbolSearchFindsADeclaration.inTheRightFile === true &&
+    checks.symbolSearchFindsADeclaration.saysWhatKindItIs === true;
+
+  checks.peekShowsTheDefinition = await (async () => {
+    // Put the cursor on `alpha` on the second line - the use, not the declaration.
+    await focusActiveEditor();
+    await sleep(200);
+    /*
+     * Land on `alpha` in `alpha;`, which is line 2.
+     *
+     * Navigate from the start so this works with either trailing-newline convention.
+     * Format-on-save can change the number of blank lines at the end of the file.
+     */
+    await pressChord("Home");
+    await pressKey("ArrowDown");
+    await pressKey("Home");
+    await pressKey("ArrowRight");
+    await pressKey("ArrowRight");
+    await sleep(200);
+
+    const ran = await runCommand("peek definition");
+    if (ran !== true) return false;
+
+    await sleep(1800);
+
+    {
+      const shot = await send("Page.captureScreenshot", { format: "png" });
+      if (shot.result?.data !== undefined) {
+        const { writeFileSync } = await import("node:fs");
+        const { tmpdir } = await import("node:os");
+        const { join } = await import("node:path");
+        writeFileSync(
+          join(tmpdir(), "adcode-peek.png"),
+          Buffer.from(shot.result.data, "base64"),
+        );
+      }
+    }
+
+    const shown = await evaluate(
+      `(() => {
+         const peek = document.querySelector('.peek');
+         if (!peek) return false;
+         const badge = peek.querySelector('.peek-badge');
+         return {
+           opened: true,
+           // Provenance is always stated - this is the honesty rule made visible.
+           saysHowItWasFound: (badge?.textContent ?? '') !== '',
+           // No language server runs for TypeScript here, so it must be the name match.
+           matchedByName: badge?.classList.contains('peek-badge-matched') === true,
+           showsSource: (peek.querySelector('.peek-code')?.textContent ?? '').includes('alpha'),
+           // Name matching can return another declaration; its source must still be named.
+           namesTheFile: /[^\\\\/]+\\.ts:\\d+$/.test(peek.querySelector('.peek-title')?.textContent ?? ''),
+         };
+       })()`,
+    );
+
+    await pressEscape();
+    return shown;
+  })();
+
+  /*
+   * The language-server chain, end to end, on a machine with no language servers installed.
+   *
+   * That is the point: this repository has no Python toolchain, and the useful behaviour in
+   * that situation is not silence. Creating a `.py` file has to walk the whole path -
+   * Monaco model, IPC, PATH lookup, "missing" state, back through the bridge - and arrive
+   * as a row that names the program and the command that installs it.
+   *
+   * If a machine running this *does* have pyright, the server starts instead and publishes
+   * real diagnostics; the check accepts either, because both prove the chain is connected
+   * and only one of them is under our control.
+   */
+  /*
+   * The Go Live / Run button, in the corner it is supposed to be in.
+   *
+   * `smoke-broken.ts` is open and active from the checks above, so the button should be
+   * offering to run it - which is the interesting half, because the label is generated from
+   * the recipe table and a wrong language id shows up as a button that says nothing or is
+   * not there at all.
+   */
+  checks.runButtonOffersTheActiveFile = await evaluate(
+    `(() => {
+       const button = document.querySelector('#status-run-slot .status-action');
+       if (button === null) return 'no run button in the status bar';
+       if (button.hidden) return 'button is hidden with a runnable file open';
+
+       const bar = document.getElementById('statusbar').getBoundingClientRect();
+       const box = button.getBoundingClientRect();
+
+       return {
+         says: button.textContent?.trim(),
+         // Bottom-right corner, where Live Server has trained everyone to look. Reaching
+         // the right edge is what makes the whole corner a target rather than a small box.
+         inTheCorner: Math.abs(box.right - bar.right) < 2 && box.height > 12,
+         // Built *and* on top - the rule the dead menu bar taught this repository.
+         topmost: (() => {
+           const hit = document.elementFromPoint(
+             Math.round(box.left + box.width / 2),
+             Math.round(box.top + box.height / 2),
+           );
+           return button === hit || button.contains(hit);
+         })(),
+       };
+     })()`,
+  );
+
+  /*
+   * And the other half of the fork: an HTML file is served, not executed.
+   *
+   * Which branch a file takes is the one guess `runCommands.ts` makes, and the guess that
+   * decides whether pressing the button previews the user's page or runs it as a program.
+   */
+  // Back to the explorer before measuring anything in it. The problems checks above left
+  // the sidebar on another view, and a hidden tree measures as a zero-sized box - so the
+  // coordinate lands on the title bar and the failure reads as "no context menu is open".
+  await openSidebar("explorer");
+  await sleep(400);
+
+  const pageSpace = await emptyTreeSpace();
+  await rightClickAt(pageSpace.x, pageSpace.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-page.html");
+  await pressEnter();
+  await sleep(1200);
+
+  checks.runButtonGoesLiveOnAPage = await evaluate(
+    `(() => {
+       const button = document.querySelector('#status-run-slot .status-action');
+       if (button === null || button.hidden) return 'no button on an HTML file';
+
+       const says = button.textContent?.trim();
+       return says === 'Go Live' ? true : 'said ' + JSON.stringify(says);
+     })()`,
+  );
+
+  /*
+   * Auto tag closing, in a real editor with a real HTML model.
+   *
+   * `smoke-page.html` is open and empty from the check above. The decision itself is a pure
+   * function with nineteen unit tests behind it; what those cannot see is whether the
+   * Monaco wiring fires at all - the listener runs inside a change notification and defers
+   * its edit to a microtask, and every way of getting that wrong produces a feature that is
+   * silently absent rather than broken.
+   */
+
+  /*
+   * The file template, which wrote itself into this file when it was created.
+   *
+   * Checked before anything is typed, because typing is what would destroy the evidence.
+   * The caret is already parked inside `<body>`, which is the half of this feature that
+   * cannot be seen from the text alone.
+   */
+  // Long enough for the auto-save the template's edit scheduled.
+  await focusActiveEditor();
+  await pressChord("s");
+  await sleep(1600);
+
+  checks.newFileStartsFromATemplate = await evaluate(
+    `(async () => {
+       /*
+        * Read off disk, not out of the DOM.
+        *
+        * Monaco only renders the lines it is showing, and the template puts the caret on
+        * line 10 - so with the terminal open the viewport had scrolled and the doctype on
+        * line 1 was not in the document at all. The check was measuring what was painted;
+        * what matters is what was written.
+        */
+       const { root } = await window.adcode.workspace.current();
+       const file = await window.adcode.files.read(root + '/smoke-page.html');
+       const text = file.text ?? '';
+
+       if (text.trim().length === 0) return 'the new file is empty - no template was written';
+
+       return {
+         hasDoctype: /<!doctype html>/i.test(text),
+         hasCharset: text.includes('charset'),
+         closesItsTags: text.includes('</html>'),
+         titledAfterTheFile: text.includes('<title>smoke-page</title>'),
+         // The caret sits where the work starts, not at line 1.
+         caret: document.getElementById('status-position')?.textContent,
+       };
+     })()`,
+  );
+
+  await focusActiveEditor();
+  await typeText("<h1>");
+  await sleep(400);
+  await typeText("Hello");
+  await sleep(400);
+
+  checks.tagsCloseThemselves = await evaluate(
+    `(() => {
+       const lines = [...document.querySelectorAll('.view-line')].map((l) => l.textContent);
+       const line = lines.find((text) => text?.includes('h1'));
+       if (line === undefined) return 'nothing typed: ' + JSON.stringify(lines);
+
+       // "contains", not "equals": the file was started from a template, so this
+       // line sits inside a body element, and what is asserted is that the closing
+       // tag appeared around what was typed. No backticks in here: the whole block
+       // is inside a template literal, and one would end it.
+       const normalised = line.replace(/ /g, ' ').trim();
+       return normalised.includes('<h1>Hello</h1>') ? true : 'line reads ' + JSON.stringify(normalised);
+     })()`,
+  );
+
+  /*
+   * Something for a stylesheet to be about, two checks below.
+   *
+   * Typed here rather than written to disk because this file is already open and focused,
+   * and because the auto-close under test is what writes the `</div>`. The pause is the
+   * auto-save interval: the project-wide search that answers "what does this style" reads
+   * the disk, so the markup has to have reached it.
+   */
+  await pressEnterInEditor();
+  await typeText('<div class="smokecard">');
+  await sleep(1800);
+
+  /*
+   * The activity-bar button that opens Structure.
+   *
+   * It went missing once - deleted along with the sidebar view it used to select, which left
+   * the whole feature reachable only by a shortcut nobody had been told about. That is the
+   * exact shape of bug this run exists to catch, and it passed every unit test.
+   *
+   * Clicked rather than called: a button that is built, positioned, and covered by something
+   * else is indistinguishable from a working one until a pointer lands on it.
+   */
+  checks.structureButtonOpensThePopup = await evaluate(
+    `(async () => {
+       const button = document.getElementById('open-structure');
+       if (button === null) return 'no Structure button in the activity bar';
+
+       const box = button.getBoundingClientRect();
+       if (box.width < 8 || box.height < 8) return 'the button has no size';
+
+       const hit = document.elementFromPoint(
+         Math.round(box.left + box.width / 2),
+         Math.round(box.top + box.height / 2),
+       );
+       const topmost = button === hit || button.contains(hit);
+
+       const before = button.getAttribute('aria-expanded');
+       button.click();
+       await new Promise((r) => setTimeout(r, 400));
+
+       const popup = document.querySelector('[data-popup-id="structure"]');
+       const opened = popup?.open === true && popup.querySelector('.structure-popup') !== null;
+       const announced = button.getAttribute('aria-expanded');
+       const sidebarBeforeClose = [...document.querySelectorAll('.activity[data-sidebar-view]')]
+         .find((activity) => ['explorer', 'search'].includes(activity.dataset.sidebarView)
+           && activity.getAttribute('aria-pressed') === 'true')?.dataset.sidebarView ?? null;
+
+       // A second press closes it again, which is what a toggle has to do or the button
+       // feels broken the moment anybody presses it twice.
+       button.click();
+       await new Promise((r) => setTimeout(r, 400));
+       const closed = popup?.open === false;
+
+       return {
+         inTheActivityBar: button.closest('#activitybar') !== null,
+         topmost,
+         opened,
+         closesOnSecondPress: closed,
+         leavesSidebarSelection: sidebarBeforeClose !== null &&
+           document.querySelector('.activity[data-sidebar-view="' + sidebarBeforeClose + '"]')
+             ?.getAttribute('aria-pressed') === 'true',
+         announcesState: before === 'false' && announced === 'true'
+           && button.getAttribute('aria-expanded') === 'false',
+       };
+    })()`,
+  );
+
+  // Structure leaves the selected structural view alone. Select Explorer before asking for
+  // coordinates inside its tree.
+  await openSidebar("explorer");
+
+  /*
+   * The Structure view, on a file with real nesting.
+   *
+   * Typed rather than written to disk, because a buffer's outline has to describe what is
+   * on screen including unsaved edits - reading the file back off disk would pass this
+   * check while showing the user a tree of what they had before they started typing.
+   *
+   * Monaco over-types a closing bracket the user types themselves, so `function beta() {}`
+   * arrives exactly as written.
+   */
+  const structureSpace = await emptyTreeSpace();
+  await rightClickAt(structureSpace.x, structureSpace.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-structure.ts");
+  await pressEnter();
+  await sleep(1200);
+
+  await focusActiveEditor();
+
+  // Clear the template first. A `.ts` file is created with one now, and typing into it
+  // would be testing the template's outline rather than the one being written here.
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    modifiers: 2,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    modifiers: 2,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Delete",
+    code: "Delete",
+    windowsVirtualKeyCode: 46,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Delete",
+    code: "Delete",
+    windowsVirtualKeyCode: 46,
+  });
+  await sleep(300);
+
+  await typeText("const alpha = 1;");
+  await pressEnterInEditor();
+  await typeText("function beta() {}");
+  await pressEnterInEditor();
+  // Monaco closes this brace itself and puts the caret on an indented line between the
+  // pair, which is what makes `delta` a child of `Gamma` rather than a sibling.
+  await typeText("class Gamma {");
+  await pressEnterInEditor();
+  await typeText("delta() {}");
+  await sleep(600);
+
+  // Through the menu command, because there is no activity-bar button any more - Structure
+  // is a popup. `window.adcode.window.onCommand` is the same route the menu and the
+  // accelerator take, so this exercises the wiring rather than a click handler.
+  await openStructure("file");
+
+  checks.structureReadsTheOpenFile = await evaluate(
+    `(() => {
+       const popup = document.querySelector('.structure-popup');
+       if (popup === null || popup.closest('[data-popup-id="structure"]')?.open !== true) return 'the structure view did not open';
+
+       const rows = [...popup.querySelectorAll('.structure-row')];
+       if (rows.length === 0) return 'no rows: ' + (view.textContent ?? '').slice(0, 120);
+
+       const names = rows.map((r) => r.querySelector('.structure-name')?.textContent);
+       const gamma = rows.find((r) => r.querySelector('.structure-name')?.textContent === 'Gamma');
+       const delta = rows.find((r) => r.querySelector('.structure-name')?.textContent === 'delta');
+
+       return {
+         names: names.join(','),
+         // The four declarations that were typed, all of them, in source order.
+         foundAll: ['alpha', 'beta', 'Gamma', 'delta'].every((n) => names.includes(n)),
+         // The kinds are what make the icons and the colours mean anything.
+         kinds: rows.map((r) => r.dataset.kind).join(','),
+         // The tree is drawn with rails; a nested row must have more of them than its parent.
+         nestedDeeper:
+           gamma !== undefined &&
+           delta !== undefined &&
+           delta.querySelectorAll('.structure-rail').length >
+             gamma.querySelectorAll('.structure-rail').length,
+         // Built and on top - the rule the dead menu bar taught this repository.
+         topmost: (() => {
+           const box = rows[0].getBoundingClientRect();
+           const hit = document.elementFromPoint(
+             Math.round(box.left + box.width / 2),
+             Math.round(box.top + box.height / 2),
+           );
+           return rows[0] === hit || rows[0].contains(hit);
+         })(),
+       };
+     })()`,
+  );
+
+  // Clicking a row moves the cursor. This is the half of the panel that has to be wired to
+  // the editor rather than merely rendered beside it.
+  await evaluate(
+    `(() => {
+       const rows = [...document.querySelectorAll('.structure-popup .structure-row')];
+       const gamma = rows.find((r) => r.querySelector('.structure-name')?.textContent === 'Gamma');
+       gamma?.click();
+       return true;
+     })()`,
+  );
+  await sleep(400);
+
+  // `class Gamma {` is the third line typed, so clicking its row must land the cursor there.
+  checks.structureRowJumpsToTheLine = await evaluate(
+    `(() => {
+       const at = document.getElementById('status-position')?.textContent ?? 'no position';
+       return /^Ln 3,/.test(at) ? true : 'cursor went to ' + at;
+     })()`,
+  );
+
+  /*
+   * Relations, which is the half of this feature that reaches outside the file.
+   *
+   * `beta` exists only in this scratch file, so "who calls this" honestly finds nothing -
+   * and that is the assertion worth making, because a drawer that says "nowhere else"
+   * proves the search ran, came back, and was rendered. A drawer stuck on "Looking…" is
+   * exactly what a broken await would produce.
+   */
+  await evaluate(
+    `(() => {
+       const rows = [...document.querySelectorAll('.structure-popup .structure-row')];
+       const beta = rows.find((r) => r.querySelector('.structure-name')?.textContent === 'beta');
+       beta?.querySelector('.structure-relate')?.click();
+       return true;
+     })()`,
+  );
+  await sleep(2500);
+
+  checks.structureRelationsAnswer = await evaluate(
+    `(() => {
+       const drawer = document.querySelector('.structure-popup .structure-drawer');
+       if (drawer === null) return 'no drawer opened';
+
+       const text = drawer.textContent ?? '';
+       if (text.includes('Looking')) return 'still loading after 2.5s';
+
+       return {
+         hasSection: drawer.querySelector('.structure-section-title') !== null,
+         says: drawer.querySelector('.structure-section-title')?.textContent,
+       };
+     })()`,
+  );
+
+  /*
+   * "What does this rule actually style?" - the question a stylesheet cannot answer about
+   * itself, and the reason this panel exists at all.
+   *
+   * The whole chain is under test here and only here: read the selector out of the CSS,
+   * reduce it to a searchable token, run the project-wide search, parse each hit line as
+   * markup, and judge it. Every step of that has unit tests against strings; none of them
+   * can tell whether the search is wired to the panel, and a rule that reports "styles
+   * nothing" when it styles something is worse than no answer.
+   */
+  // The popup is modal, so nothing behind it can be clicked at all - a right-click on the
+  // tree with it open surfaces as "no context menu is open" three lines later, naming the
+  // wrong thing entirely.
+  await closeStructure();
+  await openSidebar("explorer");
+
+  const styleSpace = await emptyTreeSpace();
+  await rightClickAt(styleSpace.x, styleSpace.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-style.css");
+  await pressEnter();
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (await evaluate("document.querySelector('.editor-file-panel[data-active=\"true\"]')?.dataset.path?.endsWith('smoke-style.css') && Boolean(document.querySelector('.editor-file-panel[data-active=\"true\"] .monaco-editor'))") === true) break;
+    await sleep(150);
+  }
+
+  const styleEditorPoint = await evaluate(
+    `(() => {
+       const panel = document.querySelector('.editor-file-panel[data-active="true"]');
+       if (!panel?.dataset.path?.endsWith('smoke-style.css')) return null;
+       const r = panel.querySelector('.monaco-editor')?.getBoundingClientRect();
+       return r ? { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + 20) } : null;
+     })()`,
+  );
+  if (styleEditorPoint === null) {
+    const detail = await evaluate(`(() => ({
+      tabs: [...document.querySelectorAll('.tab')].map(tab => ({ label: tab.querySelector('.tab-label')?.textContent, selected: tab.getAttribute('aria-selected') })),
+      panels: [...document.querySelectorAll('.editor-file-panel')].map(panel => ({ path: panel.dataset.path, active: panel.dataset.active, editor: !!panel.querySelector('.monaco-editor') })),
+      name: document.querySelector('.tree-edit-input')?.value,
+      error: document.querySelector('.tree-edit-error:not([hidden])')?.textContent,
+      focused: document.activeElement?.className,
+      status: document.getElementById('status-message')?.textContent
+    }))()`);
+    const debug = await evaluate("window.adcode.debugLog.report()");
+    throw new Error('The new stylesheet did not open in the active editor: ' + JSON.stringify(detail) + '\\n' + String(debug));
+  }
+  await clickAt(styleEditorPoint.x, styleEditorPoint.y);
+
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    modifiers: 2,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "a",
+    code: "KeyA",
+    windowsVirtualKeyCode: 65,
+    modifiers: 2,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyDown",
+    key: "Delete",
+    code: "Delete",
+    windowsVirtualKeyCode: 46,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    key: "Delete",
+    code: "Delete",
+    windowsVirtualKeyCode: 46,
+  });
+  await sleep(300);
+
+  await typeText(".smokecard {");
+  await pressEnterInEditor();
+  await typeText("color: red;");
+  await sleep(1800);
+
+  await openStructure("file");
+
+  await evaluate(
+    `(() => {
+       const rows = [...document.querySelectorAll('.structure-popup .structure-row')];
+       const rule = rows.find((r) => r.querySelector('.structure-name')?.textContent === '.smokecard');
+       rule?.querySelector('.structure-relate')?.click();
+       return true;
+     })()`,
+  );
+  await sleep(3000);
+
+  checks.selectorSaysWhatItStyles = await evaluate(
+    `(() => {
+       const drawer = document.querySelector('.structure-popup .structure-drawer');
+       if (drawer === null) {
+         const names = [...document.querySelectorAll('.structure-popup .structure-name')]
+           .map((n) => n.textContent).join(',');
+         return 'no drawer; rows were: ' + names;
+       }
+
+       const text = drawer.textContent ?? '';
+       if (text.includes('Looking')) return 'still loading after 3s';
+
+       const titles = [...drawer.querySelectorAll('.structure-section-title')]
+         .map((t) => t.textContent);
+       const entries = [...drawer.querySelectorAll('.structure-entry-primary')]
+         .map((e) => e.textContent);
+
+       return {
+         // Both halves of the answer: what the rule sets, and where it lands.
+         sets: titles.some((t) => (t ?? '').startsWith('Sets')),
+         appliesTo: titles.some((t) => (t ?? '').startsWith('Applies to 1')),
+         // Named the way dev tools name it, so the reader recognises the element.
+         foundTheElement: entries.includes('div.smokecard'),
+         titles: titles.join(' | '),
+       };
+     })()`,
+  );
+
+  /*
+   * "What are all these folders?" - the other half of the popup.
+   *
+   * Run against this repository, which is the best possible fixture for it: a root full of
+   * names a newcomer would have to guess at, several of which are generated. The check is
+   * that the dictionary reached the screen and that the generated ones are marked, because
+   * "half of what is here was not written by anybody" is the single most useful thing this
+   * view says.
+   */
+  await openStructure("project");
+
+  checks.projectMapExplainsTheFolders = await evaluate(
+    `(() => {
+       const popup = document.querySelector('.structure-popup');
+       if (popup === null || popup.closest('[data-popup-id="structure"]')?.open !== true) return 'the structure view did not open';
+
+       const map = popup.querySelector('.projectmap');
+       if (map === null || map.hidden) return 'the project tab did not show';
+
+       const names = [...map.querySelectorAll('.projectmap-name')].map((n) => n.textContent);
+       const details = [...map.querySelectorAll('.projectmap-detail')].map((d) => d.textContent ?? '');
+       const generated = [...map.querySelectorAll('.projectmap-row[data-generated="true"] .projectmap-name')]
+         .map((n) => n.textContent);
+
+       return {
+         // It read the real root.
+         sawPackages: names.includes('packages'),
+         sawScripts: names.includes('scripts'),
+         // It said what kind of project this is.
+         says: map.querySelector('.projectmap-line')?.textContent,
+         // Every note is a real sentence, not a restatement of the folder's name.
+         explained: details.length > 3 && details.every((text) => text.length > 20),
+         // The tree does not walk node_modules or .git, so the map cannot list them - and
+         // says so, which is the honest version of leaving them out.
+         namesWhatItSkips: (map.querySelector('.projectmap-hidden')?.textContent ?? '').includes('node_modules'),
+         // And it dims whatever generated folders are visible.
+         generatedMarked: generated.length,
+       };
+     })()`,
+  );
+
+  await closeStructure();
+
+  /*
+   * The keyboard shortcuts dialog, and a real remap.
+   *
+   * The whole chain: open the dialog, record a chord onto a command, and read it back from
+   * the *menu model* rather than from the dialog's own list - because the failure this is
+   * guarding against is a remap that changes the list and not the menu, which is a shortcut
+   * that displays one thing and does another. Reset afterwards, so a smoke run leaves no
+   * keybindings file behind.
+   */
+  await chooseMenu("Help", "Keyboard Shortcuts");
+  await sleep(400);
+
+  checks.shortcutsDialogIsUsable = await evaluate(
+    `(() => {
+       const dialog = document.querySelector('.shortcuts-dialog');
+       if (dialog === null || !dialog.open) return 'the shortcuts dialog did not open';
+
+       const rows = [...dialog.querySelectorAll('.shortcuts-row')];
+       const keys = [...dialog.querySelectorAll('.shortcuts-key')].map((k) => k.textContent);
+
+       return {
+         rows: rows.length,
+         // Grouped by the menu each command came from.
+         groups: [...dialog.querySelectorAll('.shortcuts-group')].map((g) => g.textContent).join(','),
+         // Real chords, not a blank column.
+         showsChords: keys.some((text) => (text ?? '').includes('Ctrl')),
+         searchable: dialog.querySelector('.shortcuts-search') !== null,
+         topmost: (() => {
+           const row = rows[0];
+           if (row === undefined) return false;
+           const box = row.getBoundingClientRect();
+           const hit = document.elementFromPoint(
+             Math.round(box.left + box.width / 2),
+             Math.round(box.top + box.height / 2),
+           );
+           return row === hit || row.contains(hit);
+         })(),
+       };
+     })()`,
+  );
+
+  checks.shortcutCanBeRebound = await evaluate(
+    `(async () => {
+       // A row on the View menu itself, not one inside its Appearance submenu - a submenu's
+       // rows are not in the DOM until it flies out, and reading null from one would look
+       // exactly like a remap that never reached the menu.
+       const written = await window.adcode.keybindings.write('view.scm', 'CmdOrCtrl+Alt+9');
+       if (written['view.scm'] !== 'CmdOrCtrl+Alt+9') return 'the write did not stick';
+
+       await new Promise((r) => setTimeout(r, 400));
+
+       // The drawn menu is where most people read a shortcut. If the remap did not reach it,
+       // the label and the key now disagree - which is the failure this whole feature has to
+       // avoid, and it is invisible from the dialog's own list.
+       const view = [...document.querySelectorAll('.menubar-item')].find((b) => b.textContent === 'View');
+       view?.click();
+       await new Promise((r) => setTimeout(r, 250));
+
+       const rows = [...document.querySelectorAll('.menu-panel .menu-item')];
+       const scm = rows.find((r) => r.querySelector('.menu-item-label')?.textContent === 'Source Control');
+       const printed = scm?.querySelector('.menu-item-accelerator')?.textContent ?? null;
+
+       document.body.click();
+
+       // A bare letter must still be refused, or a user can lock themselves out.
+       const refused = await window.adcode.keybindings.write('view.scm', 'K');
+       const heldFirm = refused['view.scm'] === 'CmdOrCtrl+Alt+9';
+
+       await window.adcode.keybindings.reset();
+       await new Promise((r) => setTimeout(r, 300));
+
+       return {
+         menuPrintsTheNewChord: printed,
+         refusesABareLetter: heldFirm,
+         resetIsClean: Object.keys(await window.adcode.keybindings.read()).length === 0,
+       };
+     })()`,
+  );
+
+  await evaluate(
+    `(() => { document.querySelector('.shortcuts-dialog')?.close(); return true; })()`,
+  );
+  await sleep(300);
+
+  /*
+   * The missing-runtime bridge.
+   *
+   * Asserted through the bridge rather than by pressing Run, because whether the dialog
+   * appears depends on what happens to be installed on the machine running this - and the
+   * part that must be right either way is the shape of the answer: a runtime ADCode knows
+   * comes back named, with a per-platform install line, and one it does not know comes back
+   * null so the run proceeds untouched.
+   */
+  checks.runtimeCheckExplainsWhatIsMissing = await evaluate(
+    `(async () => {
+       const python = await window.adcode.runtime.check('python');
+       const unknown = await window.adcode.runtime.check('some-tool-nobody-has');
+
+       if (python === null) return 'python is not in the runtime table';
+
+       return {
+         label: python.label,
+         installLineOffered: typeof python.install === 'string' && python.install.length > 0,
+         // Never a bare address from the renderer: the page is chosen in the main process.
+         https: python.url.startsWith('https://'),
+         found: python.found,
+         unknownIsNull: unknown === null,
+       };
+     })()`,
+  );
+
+  await openSidebar("explorer");
+  await sleep(300);
+
+  const pythonSpace = await emptyTreeSpace();
+  await rightClickAt(pythonSpace.x, pythonSpace.y);
+  point = await contextItemPoint("New File");
+  await clickAt(point.x, point.y);
+  await evaluate("document.querySelector('.tree-edit-input').value = ''; true");
+  await typeText("smoke-lang.py");
+  await pressEnter();
+  await sleep(3000);
+
+  checks.languageServerReportsItself = await evaluate(
+    `(async () => {
+       const states = await window.adcode.language.states();
+       const python = states.find((state) => state.languageId === 'python');
+       if (python === undefined) return 'no state for python; got ' + JSON.stringify(states);
+
+       return {
+         label: python.label,
+         status: python.status,
+         // The whole value of the "missing" path: a command the user can act on.
+         explains: python.status !== 'missing' || (python.detail ?? '').length > 0,
+       };
+     })()`,
+  );
+
+  await evaluate(
+    `document.querySelector('.activity[data-view="problems"]').click(); true`,
+  );
+  await sleep(800);
+
+  checks.missingServerBecomesAHint = await evaluate(
+    `(() => {
+       const view = document.getElementById('panel-body-problems');
+       const rows = [...view.querySelectorAll('.problems-row')];
+       const hint = rows.find((row) => /smoke-lang|install|pyright/i.test(row.textContent ?? ''));
+
+       if (hint === undefined) {
+         // A machine with pyright installed reports real diagnostics instead, and an empty
+         // Python file has none - which is a pass, not a failure.
+         return 'no hint row (pyright may be installed)';
+       }
+
+       return {
+         // An \`info\`, never an error: a tool the user has not installed is not a problem
+         // with their code, and the badge is reserved for things that are.
+         severity: hint.className.includes('problems-row-info'),
+         mentionsTheFix: /install/i.test(hint.textContent ?? ''),
+       };
+     })()`,
+  );
+
+  await openSidebar("explorer");
+  await sleep(300);
+
+  // The renderer is hostile by assumption, so the guards are asserted through the bridge
+  // rather than trusted because the UI never offers these.
+  checks.guardsHold = await evaluate(
+    `(async () => {
+       const { root } = await window.adcode.workspace.current();
+       const results = {
+         root: await window.adcode.files.trash(root),
+         rename: await window.adcode.files.rename(root, 'hijacked'),
+         traversal: await window.adcode.files.createFile(root, '../escaped.txt'),
+         dotGit: await window.adcode.files.trash(root + '/.git'),
+       };
+       const allowed = Object.entries(results).filter(([, r]) => r.ok).map(([name]) => name);
+       return allowed.length === 0 ? true : 'ALLOWED: ' + allowed.join(', ');
+     })()`,
+  );
+} catch (error) {
+  /*
+   * Recorded as a failed check rather than crashing the run, so the checks that already
+   * passed still get printed and the cleanup below still happens.
+   *
+   * The key says `explorerFlow` for history, but this `try` now wraps everything from the
+   * explorer through the editing, terminal and navigation checks - so an error anywhere in
+   * it landed here wearing the wrong name and sent me hunting the wrong feature twice. The
+   * originating line is included for that reason.
+   */
+  const where =
+    error instanceof Error
+      ? (error.stack ?? "").split(String.fromCharCode(10))[1]?.trim()
+      : "";
+  checks.explorerFlow = `THREW: ${error instanceof Error ? error.message : String(error)} (${where})`;
+} finally {
+  await rm(join(REPO, SCRATCH), { recursive: true, force: true }).catch(
+    () => {},
+  );
+  await rm(join(REPO, "smoke-broken.ts"), { force: true }).catch(() => {});
+  await rm(join(REPO, "smoke-lang.py"), { force: true }).catch(() => {});
+  await rm(join(REPO, "smoke-page.html"), { force: true }).catch(() => {});
+  await rm(join(REPO, "smoke-structure.ts"), { force: true }).catch(() => {});
+  await rm(join(REPO, "smoke-style.css"), { force: true }).catch(() => {});
+}
+
+/*
+ * The live preview.
+ *
+ * The unit tests cover request resolution and script injection against strings. What they
+ * cannot cover is whether a socket actually binds, whether the CSP lets the frame render
+ * at all, and whether the editor gives up the width - and a `frame-src` that still said
+ * `'none'` would fail silently, as a blank white rectangle with the console error hidden
+ * inside a frame nobody was reading.
+ */
+checks.previewStartsOnLoopback = await evaluate(
+  `window.adcode.preview.start().then((status) => {
+     if (!status.running) return 'did not start: ' + (status.error ?? 'no reason given');
+     // Never 0.0.0.0: binding a project folder to the LAN is not a default anyone asked for.
+     return /^http:\\/\\/127\\.0\\.0\\.1:\\d+\\/$/.test(status.url)
+       ? true
+       : 'bound somewhere unexpected: ' + status.url;
+   })`,
+);
+
+checks.previewPaneRendersIt = await evaluate(
+  `(async () => {
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+     if (!input) return 'palette did not open';
+
+     input.value = 'live preview';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 250));
+
+     const rows = [...document.querySelectorAll('.palette-row')];
+     const titles = rows.map((r) => r.querySelector('span')?.textContent);
+     // By title, not by position: "Reload Live Preview" also matches this query and ranks
+     // above it, and clicking whatever came first tested the wrong command.
+     const row = rows.find((r) => r.querySelector('span')?.textContent === 'Toggle Live Preview');
+     if (!row) return 'no Toggle command; palette had [' + titles.join(' | ') + ']';
+     row.click();
+     // Opening detects the project and starts a server asynchronously. Wait for the
+     // visible pane rather than assuming a cold disk finishes within a fixed delay.
+     for (let attempt = 0; attempt < 80; attempt++) {
+       const shown = document.querySelector('.preview-pane');
+       if (shown && !shown.hidden) break;
+       await new Promise((r) => setTimeout(r, 100));
+     }
+
+     const pane = document.querySelector('.preview-pane');
+     if (!pane || pane.hidden) {
+       const status = await window.adcode.preview.status();
+       return 'pane never showed; palette had [' + titles.join(' | ') + ']; server ' +
+         JSON.stringify(status);
+     }
+
+     const frame = pane.querySelector('.preview-frame');
+     const box = pane.getBoundingClientRect();
+     const editor = document.getElementById('editor-host').getBoundingClientRect();
+
+     const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+     const evidence = {
+       framed: /^http:\\/\\/127\\.0\\.0\\.1:\\d+\\//.test(frame?.getAttribute('src') ?? ''),
+       // The pane has real width and floats on top of the editor: nothing docks on the
+       // right, so the editor keeps its full width underneath instead of giving up a column.
+       paneWide: box.width > 100,
+       floatsOnTop: getComputedStyle(pane).position === 'fixed' && pane.contains(centre),
+       editorKeepsWidth: editor.right >= window.innerWidth - 24,
+     };
+     return Object.values(evidence).every(Boolean) || JSON.stringify(evidence);
+   })()`,
+);
+
+/*
+ * Project detection, without running anything.
+ *
+ * This repository has a `dev` script and no framework config at its root, which is exactly
+ * the case the automatic choice must not act on: `npm run dev` here launches Electron and
+ * serves no page. So the bar should offer it and the preview should still have started the
+ * static server, which the checks above already proved it did.
+ */
+checks.previewDetectsProjectWithoutRunningIt = await evaluate(
+  `(async () => {
+     const project = await window.adcode.preview.detect();
+     if (project === null) return 'detect() found no dev script in a repo that has one';
+
+     const status = await window.adcode.preview.status();
+     return {
+       offered: project.label,
+       // Never auto-started: a bare \`dev\` script is offered, not executed.
+       stayedStatic: status.mode === 'static' || status.running === false,
+     };
+   })()`,
+);
+
+checks.previewStopsCleanly = await evaluate(
+  `(async () => {
+     const close = document.querySelector('.preview-pane .icon-button[aria-label="Close preview"]');
+     if (!close) return 'no close button';
+     close.click();
+     await new Promise((r) => setTimeout(r, 800));
+
+     const status = await window.adcode.preview.status();
+     const pane = document.querySelector('.preview-pane');
+     const editor = document.getElementById('editor-host').getBoundingClientRect();
+
+     return {
+       serverStopped: status.running === false,
+       paneHidden: pane?.hidden === true,
+       // The editor took the width back. A pane that hides without releasing it leaves a
+       // dead strip down the side of the window.
+       editorFullWidth: editor.width > 200,
+     };
+   })()`,
+);
+
+/*
+ * The adjustable layout, dragged for real.
+ *
+ * `Input.dispatchMouseEvent` is what exercises pointer capture: a drag that leaves the
+ * 4px divider - which every drag does immediately - only keeps receiving moves because
+ * the handle captured the pointer. Setting the CSS variable directly would prove nothing
+ * about that, which is the part most likely to break.
+ */
+async function dragBy(handleId, dx, dy) {
+  const from = await evaluate(
+    `(() => {
+       const el = document.getElementById(${JSON.stringify(handleId)});
+       if (!el || el.hidden) return null;
+       const r = el.getBoundingClientRect();
+       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+     })()`,
+  );
+  if (from === null) return false;
+
+  await send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: from.x,
+    y: from.y,
+    button: "left",
+    clickCount: 1,
+    buttons: 1,
+  });
+  // Two moves: one small, one to the target. A single jump can be coalesced away.
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: from.x + Math.sign(dx) * 2,
+    y: from.y + Math.sign(dy) * 2,
+    button: "left",
+    buttons: 1,
+  });
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: from.x + dx,
+    y: from.y + dy,
+    button: "left",
+    buttons: 1,
+  });
+  await sleep(80);
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: from.x + dx,
+    y: from.y + dy,
+    button: "left",
+    buttons: 0,
+  });
+  await sleep(300);
+  return true;
+}
+
+const sidebarWidthNow = () =>
+  evaluate(
+    "Math.round(document.getElementById('sidebar').getBoundingClientRect().width)",
+  );
+
+checks.sidebarResizes = await (async () => {
+  await openSidebar("explorer");
+  const before = await sidebarWidthNow();
+  if (!(await dragBy("splitter-sidebar", 120, 0))) return "no sidebar handle";
+  const after = await sidebarWidthNow();
+  if (after <= before) return `width did not grow: ${before} -> ${after}`;
+
+  // Roughly the distance dragged, not merely "bigger": a handle that jumps to some fixed
+  // size would also pass a `>` check.
+  return Math.abs(after - before - 120) <= 8
+    ? true
+    : `expected ~+120, got ${after - before}`;
+})();
+
+checks.sidebarClampsAndResets = await (async () => {
+  // Far past the ceiling in one throw; it must stop rather than eat the window.
+  await dragBy("splitter-sidebar", 4000, 0);
+  const clamped = await sidebarWidthNow();
+  if (clamped > 600) return `not clamped: ${clamped}`;
+
+  await evaluate(
+    `(() => {
+       const el = document.getElementById('splitter-sidebar');
+       el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+       return true;
+     })()`,
+  );
+  await sleep(250);
+
+  const reset = await sidebarWidthNow();
+  return reset === 240 ? true : `double-click reset to ${reset}, expected 240`;
+})();
+
+checks.panelResizes = await (async () => {
+  // The panel is open from the terminal checks above, and so is its divider.
+  const height = () =>
+    evaluate(
+      "Math.round(document.getElementById('panel').getBoundingClientRect().height)",
+    );
+  const before = await height();
+  if (before === 0) return "panel is not open";
+
+  // Upwards makes the panel taller, which is the sign the splitter has to get right.
+  if (!(await dragBy("splitter-panel", 0, -90))) return "no panel handle";
+  const after = await height();
+
+  return after > before && Math.abs(after - before - 90) <= 8
+    ? true
+    : `expected ~+90, got ${after - before}`;
+})();
+
+checks.panelDividerFollowsPanel = await evaluate(
+  `(async () => {
+     const divider = document.getElementById('splitter-panel');
+     const panel = document.getElementById('panel');
+     if (divider.hidden !== panel.hidden) return 'divider and panel disagree while open';
+
+     document.getElementById('panel-close').click();
+     await new Promise(r => setTimeout(r, 400));
+
+     // A handle left behind under the editor resizes something nobody can see.
+     return divider.hidden && panel.hidden ? true : 'divider survived the panel closing';
+   })()`,
+);
+
+/*
+ * The bottom panel's five tabs.
+ *
+ * The assertion the unit tests cannot make is the one about identity: switching tabs must
+ * hide a body, never rebuild it. A panel that re-created the terminal on every switch would
+ * pass every unit test and lose your scrollback whenever you glanced at Problems.
+ */
+checks.panelTabsSwitchAndKeepState = await evaluate(
+  `(async () => {
+     document.querySelector('.activity[data-view="problems"]').click();
+     await new Promise((r) => setTimeout(r, 400));
+
+     const panel = document.getElementById('panel');
+     if (panel.hidden) return 'the panel did not open on Problems';
+
+     const ids = [...document.querySelectorAll('#panel-tabs .panel-tab')].map((t) => t.dataset.tab);
+     const expected = ['problems', 'output', 'debug', 'terminal', 'ports'];
+     if (ids.join(',') !== expected.join(',')) return 'tabs were [' + ids.join(',') + ']';
+
+     const bodyFor = (id) => document.getElementById('panel-body-' + id);
+     const tabFor = (id) => document.querySelector('#panel-tabs .panel-tab[data-tab="' + id + '"]');
+     if (bodyFor('problems').hidden) return 'the Problems body is hidden while its tab is active';
+
+     // The node that must survive a round trip through another tab.
+     const mounted = bodyFor('problems').firstElementChild;
+
+     tabFor('output').click();
+     await new Promise((r) => setTimeout(r, 250));
+     if (!bodyFor('problems').hidden) return 'Problems stayed visible behind Output';
+     if (bodyFor('output').hidden) return 'the Output body did not show';
+
+     tabFor('problems').click();
+     await new Promise((r) => setTimeout(r, 250));
+
+     return {
+       // Identity, not equality: a rebuilt body is a different node.
+       keptMounted: bodyFor('problems').firstElementChild === mounted,
+       onlyOneVisible: expected.filter((id) => !bodyFor(id).hidden).length === 1,
+       tabMarked: tabFor('problems').getAttribute('aria-selected') === 'true',
+       // Header controls belong to a tab: the terminal's buttons must not be on Problems.
+       actionsFollowTheTab: document.getElementById('actions-terminal').hidden,
+     };
+   })()`,
+);
+
+/*
+ * Ports: the answer to "what is already using 3000".
+ *
+ * Driven against a port ADCode itself opened, because that is the only one whose number is
+ * known in advance - and because labelling our own server is the one thing the operating
+ * system's own tools cannot do.
+ */
+checks.portsTabNamesOurOwnServer = await evaluate(
+  `(async () => {
+     const status = await window.adcode.preview.start();
+     if (!status.running) return 'the preview did not start: ' + (status.error ?? 'no reason');
+     const port = String(new URL(status.url).port);
+
+     document.querySelector('#panel-tabs .panel-tab[data-tab="ports"]').click();
+     // netstat on a loaded Windows box is genuinely slow, and the table polls on a timer.
+     await new Promise((r) => setTimeout(r, 6000));
+
+     const rows = [...document.querySelectorAll('#panel-body-ports .ports-table tbody tr')];
+     if (rows.length === 0) return 'the table listed nothing at all';
+
+     const ours = rows.find((r) => (r.querySelector('.ports-port')?.textContent ?? '').startsWith(port));
+     if (!ours) return 'our own port ' + port + ' was not listed; ' + rows.length + ' rows were';
+
+     return {
+       listed: true,
+       labelled: (ours.querySelector('.ports-label')?.textContent ?? '') === 'Live Server',
+       // Open, Copy, Stop.
+       actions: ours.querySelectorAll('.ports-action').length === 3,
+     };
+   })()`,
+);
+
+/*
+ * Output: the channels, and the fact that they carry something.
+ *
+ * The Live Server channel is checked rather than a quieter one because the preview was just
+ * started above, so there is a line to find. An empty channel would prove nothing.
+ */
+checks.outputTabCarriesRealLogs = await evaluate(
+  `(async () => {
+     document.querySelector('#panel-tabs .panel-tab[data-tab="output"]').click();
+     await new Promise((r) => setTimeout(r, 500));
+
+     const picker = document.querySelector('.output-channel');
+     if (!picker) return 'no channel picker in the panel header';
+
+     const channels = [...picker.options].map((o) => o.value);
+     picker.value = 'live-server';
+     picker.dispatchEvent(new Event('change', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const text = document.querySelector('.output-view')?.textContent ?? '';
+
+     return {
+       channels: channels.join(','),
+       // History is replayed on open: the line was printed before anyone opened the tab.
+       liveServerLogged: /serving http/.test(text),
+       pickerInHeader: picker.closest('.panel-header') !== null,
+     };
+   })()`,
+);
+
+/*
+ * The `<$>` mark is drawn, not typed, so it cannot fall back to a missing font.
+ *
+ * Fifteen paths: the ribbon body (two brackets, the dollar's S, and its stem - which
+ * is two strokes rather than one so the S is not crossed through the middle) plus ten
+ * fold accents (tip faces, edge sheen/shade, stem twists, S shadow and sheen). The
+ * count is asserted rather than just "some paths" because losing a stroke is exactly
+ * the kind of change that looks fine at 16px and wrong at 64.
+ */
+checks.brandMarkDrawn = await evaluate(
+  `(() => {
+      const mark = document.querySelector('.welcome-mark .brand-mark');
+      if (!mark) return 'no mark on the welcome screen';
+      const paths = mark.querySelectorAll('path').length;
+      const box = mark.getBoundingClientRect();
+      return paths === 15 && box.width > 0 ? true : 'paths=' + paths + ' width=' + box.width;
+    })()`,
+);
+
+/*
+ * A hidden welcome screen takes no clicks.
+ *
+ * The other half of the same problem, and the one that would be invisible: with a file open the
+ * screen is faded out but still in the DOM, directly over the editor. If it kept accepting the
+ * pointer, every click in the editor would land on it instead - the window would look perfect
+ * and be unusable, which is a bug this repository has shipped before.
+ */
+checks.hiddenWelcomeDoesNotSwallowClicks = await evaluate(
+  `(async () => {
+     const placeholder = document.getElementById('editor-placeholder');
+     if (!placeholder) return 'no placeholder';
+     if (placeholder.dataset.visible !== 'false') return 'expected a file to be open by now';
+
+     const editor = document.getElementById('editor-host').getBoundingClientRect();
+     const hit = document.elementFromPoint(
+       editor.left + editor.width / 2,
+       editor.top + editor.height / 2,
+     );
+
+     return {
+       fadedOut: getComputedStyle(placeholder).opacity === '0',
+       // Nothing at the centre of the editor belongs to the welcome screen.
+       editorReceivesTheClick: hit !== null && !placeholder.contains(hit),
+     };
+   })()`,
+);
+
+/*
+ * The welcome screen offers what it names, and can be clicked.
+ *
+ * The clickability half is the one worth asserting. `.editor-placeholder` is `position:
+ * absolute; inset: 0` with `pointer-events: none`, which was correct while it was decorative -
+ * and would have made every button on it inert. The fix puts the two properties on different
+ * elements, and the only way to know it worked is to hit-test a real button in a real window.
+ */
+checks.welcomeScreenIsUsable = await evaluate(
+  `(async () => {
+     /*
+      * Close every editor first, so the screen being measured is actually on screen.
+      *
+      * The first version of this check ran with a restored file open, which leaves the welcome
+      * screen faded out and hidden by visibility - so the hit test found the editor underneath
+      * and reported the button as unclickable. It was measuring a hidden element and calling it
+      * a failure, the mirror of the preview check that measured a hidden element and called it
+      * a pass.
+      */
+     for (const close of [...document.querySelectorAll('.tab-close')]) close.click();
+     await new Promise((r) => setTimeout(r, 500));
+
+     const placeholder = document.getElementById('editor-placeholder');
+     if (placeholder?.dataset.visible === 'false') return 'the welcome screen did not come back';
+
+     const inner = document.querySelector('.welcome-inner');
+     if (!inner) return 'no welcome screen';
+
+     const labels = [...inner.querySelectorAll('.welcome-action strong')].map((n) => n.textContent);
+     const primary = inner.querySelector('.welcome-action-primary');
+     if (!primary) return 'no primary action';
+
+     // Earlier panel-resize checks leave a short editor. The welcome card scrolls
+     // in that layout, so bring the action into view before testing its hit area.
+     primary.scrollIntoView({ block: 'nearest' });
+     await new Promise((r) => requestAnimationFrame(r));
+     const box = primary.getBoundingClientRect();
+     // What the pointer would actually reach at the button's centre.
+     const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+
+     return {
+       offers: labels.join(','),
+       primaryClickable: primary.contains(hit) || primary === hit,
+       // What the pointer reached instead, when it is not the button. Without this the
+       // failure is a bare false and every candidate looks equally likely.
+       hitWas: hit === null ? null : hit.tagName + '.' + (hit.className || '(no class)'),
+       hitId: hit?.id,
+       hitBounds: hit?.getBoundingClientRect().toJSON(),
+       buttonBounds: box.toJSON(),
+       // The version is on screen, because it is what a bug report asks for.
+       showsVersion: /Version \\d/.test(inner.querySelector('.welcome-version')?.textContent ?? ''),
+       marked: inner.querySelector('.welcome-mark svg') !== null,
+     };
+   })()`,
+);
+
+// New file and new folder, at the root, beside the folder's own name.
+checks.rootCreateButtonsExist = await evaluate(
+  `(() => {
+     const file = document.getElementById('new-root-file');
+     const folder = document.getElementById('new-root-folder');
+     if (!file || !folder) return 'missing root create buttons';
+
+     return {
+       // A folder is open in this run, so both are live rather than greyed out.
+       enabled: !file.disabled && !folder.disabled,
+       inHeader: file.closest('.sidebar-header') !== null,
+       // Right of the folder name, which is where they act on what is named beside them.
+       afterTitle:
+         file.getBoundingClientRect().left >
+         document.getElementById('sidebar-title').getBoundingClientRect().left,
+     };
+   })()`,
+);
+
+// The recents list records the folder this run opened.
+checks.recentFoldersRecorded = await evaluate(
+  `window.adcode.workspace.recents().then((list) => ({
+     count: list.length,
+     hasNames: list.every((f) => typeof f.name === 'string' && f.name.length > 0),
+   }))`,
+);
+
+// The version the welcome screen shows comes from the main process, not a constant.
+/*
+ * The signed-in address, in the corner after the version.
+ *
+ * Asserted against the bridge rather than for a particular address, because whether this
+ * machine has ever linked an account is not under this test's control. What must hold
+ * either way is that the corner agrees with `account.status()` - a linked machine shows the
+ * address, an anonymous one shows nothing at all rather than an empty slot.
+ */
+checks.statusBarSaysWhoIsSignedIn = await evaluate(
+  `(async () => {
+     const node = document.getElementById('status-account');
+     if (node === null) return 'no account slot in the status bar';
+
+     const state = await window.adcode.account.status();
+     const linked = state.state === 'linked' && (state.email ?? state.displayName) !== null;
+
+     if (!linked) {
+       return node.hidden ? true : 'shown while not signed in: ' + JSON.stringify(node.textContent);
+     }
+
+     const expected = state.email ?? state.displayName;
+     if (node.hidden) return 'hidden while signed in as ' + expected;
+
+     // The whole address, not a truncation - it is here to say which account.
+     return node.textContent === expected ? true : 'says ' + JSON.stringify(node.textContent);
+   })()`,
+);
+
+checks.appInfoIsReal = await evaluate(
+  `window.adcode.app.info().then((info) => ({
+     version: /^\\d+\\.\\d+\\.\\d+/.test(info.version),
+     electron: info.electron.length > 0,
+     node: info.node.length > 0,
+   }))`,
+);
+
+// The gutter decorations for the restored file.
+checks.gutterOrClean = await evaluate(
+  "document.querySelectorAll('.git-gutter').length >= 0",
+);
+
+/*
+ * Every icon-only control has its icon in the middle of it.
+ *
+ * This is the check the bug it was written for demanded. Four close buttons drew the
+ * character "×" in a box with no centring mechanism, and no unit test can see it: the glyph
+ * is positioned by font metrics at paint time, so the only place the truth exists is a laid
+ * out box in a real window. Measured as centres rather than as CSS, because `place-items:
+ * center` being present is not the same claim as the ink being centred - `.icon-button-
+ * chevron` had the property set and was still half a pixel off from its own border.
+ *
+ * Half a pixel of tolerance: subpixel layout means an odd-sized icon in an even-sized box
+ * lands on a .5 legitimately, and failing on that would make the check noise.
+ */
+checks.iconsCentredInTheirButtons = await evaluate(
+  `(async () => {
+     /*
+      * Sweep every view, because the measurement can only see laid-out boxes.
+      *
+      * A button in a closed panel is a button this check silently skips. The first version
+      * opened nothing and passed while \`.icon-button\` and \`.scm-stage\` were both off centre;
+      * the second opened only source control, which *replaces* the file tree - so it stopped
+      * measuring \`.tree-action\`, one of the two buttons the whole exercise started from.
+      * Sweeping after each view and taking the union is the only version that stays honest as
+      * the workbench grows.
+      */
+     const offenders = [];
+     const seen = {};
+
+     const sweep = () => {
+       for (const host of document.querySelectorAll('button, .problems-glyph, .activity')) {
+         measure(host);
+       }
+     };
+
+     function measure(host) {
+       const box = host.getBoundingClientRect();
+       if (box.width === 0 || box.height === 0) return;
+
+       const icons = host.querySelectorAll('svg');
+       // Icon-only controls. A button with a label is centred by its flex row, not by this
+       // rule, and asserting on it would be asserting the wrong geometry.
+       if (icons.length !== 1) return;
+       if ((host.textContent ?? '').trim() !== '') return;
+
+       const icon = icons[0].getBoundingClientRect();
+       if (icon.width === 0 || icon.height === 0) return;
+
+       const dx = icon.left + icon.width / 2 - (box.left + box.width / 2);
+       const dy = icon.top + icon.height / 2 - (box.top + box.height / 2);
+
+       const name = String(host.className || host.tagName).split(' ')[0];
+       seen[name] = true;
+
+       if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+         // One entry per class, not per instance: fourteen identical tree rows produced
+         // fourteen identical lines and buried the one class that mattered.
+         const line = name + ' dx=' + dx.toFixed(2) + ' dy=' + dy.toFixed(2);
+         if (!offenders.includes(line)) offenders.push(line);
+       }
+     }
+
+     // Explorer first, for the tree rows. Hovering is not needed - the row actions are laid
+     // out either way, they are only made visible by the hover.
+     document.querySelector('.activity[data-view="explorer"]')?.click();
+     await new Promise((r) => setTimeout(r, 350));
+     sweep();
+
+     // Source control, which replaces the tree, for the staging buttons.
+     document.querySelector('.activity[data-view="scm"]')?.click();
+     await new Promise((r) => setTimeout(r, 450));
+     sweep();
+
+     // The terminal panel, for its tab close buttons and toolbar.
+     document.dispatchEvent(
+       new KeyboardEvent('keydown', { key: '\`', ctrlKey: true, bubbles: true }),
+     );
+     await new Promise((r) => setTimeout(r, 600));
+     sweep();
+
+     // The two popovers, each of which owns a close button.
+     document.getElementById('open-earnings')?.click();
+     await new Promise((r) => setTimeout(r, 300));
+     sweep();
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+     document.getElementById('status-collab')?.click();
+     await new Promise((r) => setTimeout(r, 300));
+     sweep();
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+     document.querySelector('.activity[data-view="explorer"]')?.click();
+
+     if (offenders.length > 0) return 'off centre: ' + offenders.join(' | ');
+
+     // The families are reported so a future reader can tell "all centred" from "nothing was
+     // measured", which are the same \`true\` otherwise.
+     return { families: Object.keys(seen).sort().join(',') };
+   })()`,
+);
+
+/*
+ * No control draws its icon as a text character.
+ *
+ * The companion to the check above, and the one that actually catches a regression of the
+ * original bug: a button holding "×" has no `svg` at all, so the centring check skips it
+ * entirely and passes. These characters are maths operators and letters - they sit on a
+ * baseline and on the font's maths axis, so they cannot be centred in a square box by any
+ * amount of CSS. `workbench/icons.ts` exists to make a path the only option.
+ */
+checks.noTextGlyphIcons = await evaluate(
+  `(() => {
+     const banned = ['\\u00d7', '\\u2715', '\\u2716', '\\u2717', '\\u2718', '\\u274c', '\\u2713'];
+     const offenders = [];
+
+     for (const host of document.querySelectorAll('button, .problems-glyph')) {
+       const text = (host.textContent ?? '').trim();
+       if (text.length === 0) continue;
+       if (banned.includes(text)) {
+         offenders.push((host.className || host.tagName) + ' = ' + JSON.stringify(text));
+       }
+     }
+
+     return offenders.length === 0 ? true : 'glyph icons remain: ' + offenders.join(' | ');
+   })()`,
+);
+
+/*
+ * The earnings report opens, and opens as a popover rather than a view.
+ *
+ * `topmost` is asserted the same way the menu bar's check is, and for the same reason: a
+ * card can be present, positioned and painted and still sit behind the sidebar, which is a
+ * bug this repository has already shipped once.
+ */
+checks.earningsPopoverOpens = await evaluate(
+  `(async () => {
+     const button = document.getElementById('open-earnings');
+     if (!button) return 'no earnings button in the activity bar';
+
+     const problems = document.querySelector('.activity[data-view="problems"]');
+     if (!problems) return 'no problems button to sit under';
+
+     const under =
+       button.getBoundingClientRect().top > problems.getBoundingClientRect().top;
+
+     button.click();
+     await new Promise((r) => setTimeout(r, 300));
+
+     const card = document.querySelector('.earnings-card');
+     if (!card || card.closest('[data-popup-id="earnings"]')?.open !== true) return 'earnings view did not open';
+
+     const box = card.getBoundingClientRect();
+     const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+
+     const result = {
+       belowProblems: under,
+       topmost: card.contains(centre),
+       onScreen: box.left >= 0 && box.right <= window.innerWidth && box.top >= 0,
+       // A figure, or an honest dash. Never blank.
+       showsAFigure: (card.querySelector('.earnings-hero-value')?.textContent ?? '').length > 0,
+       /*
+        * The editor's own account id, copyable.
+        *
+        * This is the only place it is visible, and it is the only thing that identifies an
+        * account nobody has ever signed in to - which is what the admin panel's "queue a
+        * test ad" has to be given. Reported as a string when it is absent, because on a
+        * build with no Firebase project there is legitimately no id to show and that is a
+        * different thing from the row having broken.
+        */
+       accountId: (() => {
+         const uid = card.querySelector('.earnings-uid');
+         if (!uid) {
+           const row = card.querySelector('.earnings-account');
+           return row === null || row.hidden ? 'no account surface (no Firebase project?)' : 'account shown but no id row';
+         }
+         const full = uid.getAttribute('title') ?? '';
+         return full.length > 20 && (uid.textContent ?? '').includes('…');
+       })(),
+       // Four presets, from the server's own table.
+       presetRows: card.querySelectorAll('.earnings-preset').length,
+       earningsSelected:
+         document.getElementById('open-earnings')?.getAttribute('aria-pressed') === 'true',
+     };
+
+     // Reactivating the launcher dismisses the anchored popup and leaves the sidebar layout alone.
+     document.getElementById('open-earnings')?.click();
+     const popup = document.querySelector('[data-popup-id="earnings"]');
+     for (let attempt = 0; attempt < 10 && popup?.open === true; attempt += 1) {
+       await new Promise((r) => setTimeout(r, 40));
+     }
+     result.launcherCloseWorks = popup?.open === false;
+
+   return result;
+  })()`,
+);
+
+checks.earningsCloseButtonEvidence = await evaluate(
+  `(async () => {
+     document.getElementById('open-earnings')?.click();
+     await new Promise((r) => setTimeout(r, 300));
+
+     const card = document.querySelector('.earnings-card');
+     const popup = document.querySelector('[data-popup-id="earnings"]');
+     const surface = popup?.querySelector('.popup-shell-surface');
+     if (!card || popup?.open !== true) return 'earnings view did not open';
+
+     const close = card.querySelector('.earnings-close[aria-label="Close earnings"]');
+     const refresh = card.querySelector('.earnings-refresh[aria-label="Refresh earnings"]');
+     if (!(close instanceof HTMLElement)) return 'no dedicated earnings close button';
+     if (!(refresh instanceof HTMLElement)) return 'no separate earnings refresh button';
+
+     const cardBox = card.getBoundingClientRect();
+     const surfaceBox = surface?.getBoundingClientRect();
+     const closeBox = close.getBoundingClientRect();
+     close.focus();
+     const focused = document.activeElement === close;
+     close.click();
+     for (let attempt = 0; attempt < 10 && popup.open; attempt += 1) {
+       await new Promise((r) => setTimeout(r, 40));
+     }
+
+     return {
+       named: close.getAttribute('aria-label') === 'Close earnings',
+       separateClass: !close.classList.contains('earnings-refresh') &&
+         !refresh.classList.contains('earnings-close'),
+       nonzero: closeBox.width > 0 && closeBox.height > 0,
+       insideCard:
+         closeBox.left >= cardBox.left &&
+         closeBox.right <= cardBox.right &&
+         closeBox.top >= cardBox.top &&
+         closeBox.bottom <= cardBox.bottom,
+       insideSurface:
+         surfaceBox !== undefined &&
+         closeBox.left >= surfaceBox.left &&
+         closeBox.right <= surfaceBox.right &&
+         closeBox.top >= surfaceBox.top &&
+         closeBox.bottom <= surfaceBox.bottom,
+       insideViewport:
+         closeBox.left >= 0 &&
+         closeBox.top >= 0 &&
+         closeBox.right <= window.innerWidth &&
+         closeBox.bottom <= window.innerHeight,
+       focusable: focused,
+       dismissed: popup.open === false,
+       launcherFocused: document.activeElement?.id === 'open-earnings',
+       hitTarget: closeBox.width >= 24 && closeBox.height >= 24,
+       distinctTitles:
+         close.getAttribute('title') === 'Close earnings' &&
+         refresh.getAttribute('title') === 'Refresh earnings',
+     };
+   })()`,
+);
+checks.earningsCloseButtonVisible =
+  typeof checks.earningsCloseButtonEvidence === "object" &&
+  checks.earningsCloseButtonEvidence.named === true &&
+  checks.earningsCloseButtonEvidence.separateClass === true &&
+  checks.earningsCloseButtonEvidence.nonzero === true &&
+  checks.earningsCloseButtonEvidence.insideCard === true &&
+  checks.earningsCloseButtonEvidence.insideSurface === true &&
+  checks.earningsCloseButtonEvidence.insideViewport === true &&
+  checks.earningsCloseButtonEvidence.focusable === true &&
+  checks.earningsCloseButtonEvidence.dismissed === true &&
+  checks.earningsCloseButtonEvidence.launcherFocused === true &&
+  checks.earningsCloseButtonEvidence.hitTarget === true &&
+  checks.earningsCloseButtonEvidence.distinctTitles === true;
+
+/*
+ * The one button inside the earnings popover actually does something.
+ *
+ * It did not. "Ad settings" called \`showView("settings")\`, and settings is an overlay rather
+ * than a sidebar view - so the call matched no view, hid all four of them, and deselected every
+ * activity button. The popover closed and left an empty sidebar with nothing highlighted, which
+ * reads as the window having broken. Reported by a user as "a pop-up showed, I was not able to
+ * do anything".
+ *
+ * Both halves are asserted, because fixing only the first would still leave the sidebar blank.
+ */
+checks.earningsSettingsButtonWorks = await evaluate(
+  `(async () => {
+     document.querySelector('.activity[data-sidebar-view="explorer"]')?.click();
+     await new Promise((r) => setTimeout(r, 250));
+
+     document.getElementById('open-earnings')?.click();
+     await new Promise((r) => setTimeout(r, 300));
+
+     const card = document.querySelector('.earnings-card');
+     if (!card || card.closest('[data-popup-id="earnings"]')?.open !== true) return 'the earnings view did not open';
+
+     const button = [...card.querySelectorAll('button')].find(
+       (b) => (b.textContent ?? '').trim() === 'Ad settings',
+     );
+     if (!button) return 'no Ad settings button in the popover';
+
+     button.click();
+     await new Promise((r) => setTimeout(r, 500));
+
+     const settings = document.querySelector('.settings-sheet');
+     const settingsVisible =
+       settings instanceof HTMLElement &&
+       settings.closest('dialog[data-popup-id="settings"]')?.open === true &&
+       settings.getBoundingClientRect().height > 100;
+
+     const result = {
+       settingsOpened: settingsVisible,
+       settingsSelected:
+         document.querySelector('.activity[data-sidebar-view="settings"]')?.getAttribute('aria-pressed') === 'true',
+     };
+
+     // Put the window back.
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     return result;
+   })()`,
+);
+
+// The earnings icon is a drawn dollar sign, not the character "$".
+checks.earningsIconIsADrawnDollar = await evaluate(
+  `(() => {
+     const button = document.getElementById('open-earnings');
+     if (!button) return 'no earnings button';
+
+     if ((button.textContent ?? '').includes('$')) return 'the icon is a text character';
+
+     const paths = button.querySelectorAll('svg path');
+     if (paths.length !== 2) return 'expected an S and a bar, got ' + paths.length + ' paths';
+
+     const box = button.getBoundingClientRect();
+     const icon = button.querySelector('svg').getBoundingClientRect();
+     const dx = icon.left + icon.width / 2 - (box.left + box.width / 2);
+
+     return Math.abs(dx) <= 0.5 ? true : 'off centre by ' + dx.toFixed(2);
+   })()`,
+);
+
+/*
+ * The IDE's assistant floats over the editor instead of docking beside it: Ctrl+I shows it,
+ * the editor keeps every pixel of its width, and its own close button hides it again.
+ */
+// Code keeps the crisp motion personality: short timings, no bounce.
+checks.motionCrispInCode = await evaluate("document.documentElement.dataset.motion === 'crisp' || 'motion is ' + document.documentElement.dataset.motion");
+
+checks.ideAssistantFloats = await evaluate(
+  `(async () => {
+     const wait = async (test) => { for (let i = 0; i < 40 && !test(); i++) await new Promise((r) => setTimeout(r, 100)); };
+     const panel = () => document.getElementById('floating-assistant');
+     if (panel() && !panel().hidden) document.getElementById('ai-toggle')?.click();
+     await wait(() => !panel() || panel().hidden);
+     const editorBefore = document.getElementById('editor-host').getBoundingClientRect().width;
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'i', code: 'KeyI', ctrlKey: true, bubbles: true }));
+     await wait(() => !!panel() && !panel().hidden);
+     const shown = panel();
+     if (!shown || shown.hidden) return 'Ctrl+I did not show the assistant';
+     const box = shown.getBoundingClientRect();
+     const editorAfter = document.getElementById('editor-host').getBoundingClientRect();
+     const evidence = {
+       floats: getComputedStyle(shown).position === 'fixed' && shown.getAttribute('aria-modal') === 'false',
+       holdsTheChat: !!shown.querySelector('.chat-card .chat-input'),
+       onScreen: box.left >= 0 && box.top >= 0 && box.right <= innerWidth + 1 && box.bottom <= innerHeight + 1 && box.width >= 320,
+       editorKeepsWidth: Math.abs(editorAfter.width - editorBefore) < 2 && editorAfter.right >= innerWidth - 24,
+       noDock: !document.getElementById('assistant-dock') && !document.getElementById('splitter-assistant'),
+     };
+     shown.querySelector('.floating-panel-close')?.click();
+     await wait(() => shown.hidden);
+     evidence.closes = shown.hidden;
+     return Object.values(evidence).every(Boolean) || JSON.stringify(evidence);
+   })()`,
+);
+
+/*
+ * The preview floats over the editor - no right-hand column - and maximising it does not
+ * reload the page inside it.
+ *
+ * The last property is the whole reason the implementation looks the way it does. The
+ * obvious build - move the iframe into a bigger container - reloads the document, and a
+ * reload is invisible to every assertion except one that watches the frame's identity and
+ * its `src` across the change. So that is what this watches.
+ */
+async function closePreviewBeforeOpening() {
+  const closed = await evaluate(`(async () => {
+    const pane = document.querySelector('.preview-pane');
+    if (!pane || pane.hidden) return true;
+    pane.querySelector('.icon-button[aria-label="Close preview"]')?.click();
+    for (let attempt = 0; attempt < 100 && !pane.hidden; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
+    return pane.hidden;
+  })()`);
+  if (closed !== true) throw new Error("Preview did not close before testing its open action");
+}
+await closePreviewBeforeOpening();
+checks.previewFloatsAndMaximisesWithoutReloading = await evaluate(
+  `(async () => {
+     /*
+      * Opened through the palette, not through \`preview.start()\`.
+      *
+      * The first version of this check called the IPC method directly, which starts the
+      * server and never unhides the pane - so every assertion below ran against an element
+      * that \`[hidden]\` had collapsed to 0x0, and three of them passed for that reason. A
+      * check that measures a hidden element is not measuring the feature.
+      */
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+     if (!input) return 'palette did not open';
+     input.value = 'live preview';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 250));
+
+     const row = [...document.querySelectorAll('.palette-row')].find(
+       (r) => r.querySelector('span')?.textContent === 'Toggle Live Preview',
+     );
+     if (!row) return 'no Toggle Live Preview command';
+     row.click();
+     await new Promise((r) => setTimeout(r, 2500));
+
+     const pane = document.querySelector('.preview-pane');
+     if (!pane) return 'no preview pane';
+     if (pane.hidden) return 'pane still hidden after the toggle command';
+
+     const frameBefore = pane.querySelector('iframe');
+     if (!frameBefore) return 'no preview frame';
+     const srcBefore = frameBefore.getAttribute('src');
+
+     const box = pane.getBoundingClientRect();
+     const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+     const editor = document.getElementById('editor-host').getBoundingClientRect();
+     const floating = pane.dataset.placement === 'floating';
+     // Not hidden and not collapsed. Asserted explicitly because an earlier version of this
+     // check was silently measuring a 0x0 box.
+     const hasSize = box.width > 300 && box.height > 200;
+     const onScreen = box.left >= 0 && box.top >= 0 && box.right <= window.innerWidth + 1;
+     const topmost = pane.contains(centre);
+     // Nothing docks on the right: the editor keeps the window's full width under the card.
+     const editorFullWidth = editor.right >= window.innerWidth - 24;
+     const noDockButton = !pane.querySelector('.icon-button[aria-label="Undock preview"], .icon-button[aria-label="Dock preview"]');
+     const edges = pane.querySelectorAll('.preview-edge').length === 8;
+
+     const maximise = pane.querySelector('.icon-button[aria-label="Maximise preview"]');
+     if (!maximise) return 'no maximise button in the preview bar';
+     maximise.click();
+     await new Promise((r) => setTimeout(r, 400));
+     const big = pane.getBoundingClientRect();
+     const maximised = big.width >= window.innerWidth - 40 && big.height >= window.innerHeight - 40;
+     const frameAfter = pane.querySelector('iframe');
+     // Identity, not equality: a reparented iframe is a different node, and that is the one
+     // thing this whole implementation exists to avoid.
+     const sameFrameNode = frameAfter === frameBefore;
+     const sameSrc = frameAfter?.getAttribute('src') === srcBefore;
+     pane.querySelector('.icon-button[aria-label="Restore preview size"]')?.click();
+     await new Promise((r) => setTimeout(r, 300));
+     const restored = Math.abs(pane.getBoundingClientRect().width - box.width) < 2;
+
+     pane.querySelector('.icon-button[aria-label="Close preview"]')?.click();
+     await new Promise((r) => setTimeout(r, 600));
+
+     const evidence = { floating, hasSize, onScreen, topmost, editorFullWidth, noDockButton, edges, maximised, sameFrameNode, sameSrc, restored };
+     return Object.values(evidence).every(Boolean) || JSON.stringify(evidence);
+   })()`,
+);
+
+/*
+ * Device-size preview.
+ *
+ * The check that matters is the negative one: resizing must not reload the page. Setting a
+ * width is easy to get right and easy to get right the wrong way - wrapping the iframe, or
+ * swapping its `src`, both look correct in a screenshot and both throw away the running
+ * page. So this asserts the iframe is the same node with the same `src` afterwards, which is
+ * the same assertion the undocking check makes, for the same reason.
+ */
+await closePreviewBeforeOpening();
+checks.deviceSizingDoesNotReloadThePage = await evaluate(
+  `(async () => {
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', ctrlKey: true, shiftKey: true, bubbles: true }));
+     await new Promise((r) => setTimeout(r, 300));
+
+     const input = document.querySelector('.quickopen-input[aria-label="Command palette"]');
+     if (!input) return 'the palette did not open';
+     input.value = 'live preview';
+     input.dispatchEvent(new Event('input', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 250));
+
+     const row = [...document.querySelectorAll('.palette-row')].find(
+       (r) => r.querySelector('span')?.textContent === 'Toggle Live Preview',
+     );
+     if (!row) return 'no Toggle Live Preview command';
+     row.click();
+     await new Promise((r) => setTimeout(r, 2500));
+
+     const pane = document.querySelector('.preview-pane');
+     if (!pane || pane.hidden) return 'the preview pane did not open';
+
+     const frameBefore = pane.querySelector('iframe');
+     if (!frameBefore) return 'no preview frame';
+     const srcBefore = frameBefore.getAttribute('src');
+
+     const toggle = pane.querySelector('.icon-button[aria-label="Check other screen sizes"]');
+     if (!toggle) return 'no device button in the preview bar';
+     toggle.click();
+     await new Promise((r) => setTimeout(r, 350));
+
+     const bar = pane.querySelector('.device-bar');
+     if (!bar || bar.hidden) return 'the device bar did not show';
+
+     const size = bar.querySelector('.device-size');
+     size.value = '360x640';
+     size.dispatchEvent(new Event('change', { bubbles: true }));
+     await new Promise((r) => setTimeout(r, 350));
+
+     const frameAfter = pane.querySelector('iframe');
+     const widthAtPhone = frameAfter.style.width;
+     const preset = bar.querySelector('.device-preset')?.value;
+     const readout = bar.querySelector('.device-readout')?.textContent ?? '';
+
+     // Rotate is the only .device-action button.
+     bar.querySelector('.device-action').click();
+     await new Promise((r) => setTimeout(r, 300));
+     const widthRotated = frameAfter.style.width;
+
+     const result = {
+       // The whole design: same element, never reparented, never reloaded.
+       sameFrameNode: frameAfter === frameBefore,
+       sameSrc: frameAfter.getAttribute('src') === srcBefore,
+       tookTheWidth: widthAtPhone === '360px',
+       // 360 x 640 is a preset, so the dropdown should name it rather than say Custom.
+       recognisedPreset: preset === 'phone-small',
+       readsOutTheSize: /360/.test(readout),
+       rotates: widthRotated === '640px',
+       handlesShown: [...pane.querySelectorAll('.device-handle')].every((h) => !h.hidden),
+     };
+
+     // Off again, then closed, so later checks see the layout they expect.
+     toggle.click();
+     await new Promise((r) => setTimeout(r, 250));
+     result.turnsOff = frameAfter.style.width === '';
+
+     pane.querySelector('.icon-button[aria-label="Close preview"]')?.click();
+     await new Promise((r) => setTimeout(r, 500));
+
+     return result;
+   })()`,
+);
+
+/*
+ * A live session, started and ended in the real app.
+ *
+ * Bound to loopback rather than `lan`, so running the suite does not publish this repository to
+ * whatever network the machine is on. Everything either side of the bind is the same code path.
+ *
+ * The assertions worth having here are the ones the unit suite cannot reach: that the panel
+ * actually opens and is the topmost thing at its own centre, that the status bar changes its
+ * words rather than only a colour, and that starting a session produces a code which decodes to
+ * the port the server really bound.
+ */
+checks.collabSessionStartsAndStops = await evaluate(
+  `(async () => {
+     const button = document.getElementById('status-collab');
+     if (!button) return 'no live-session button in the status bar';
+     if ((document.getElementById('status-collab-label')?.textContent ?? '') !== 'Share') {
+       return 'the button should read "Share" before a session starts';
+     }
+
+     button.click();
+     await new Promise((r) => setTimeout(r, 300));
+
+     const card = document.querySelector('.collab-card');
+     if (!card || card.hidden) return 'the session panel did not open';
+
+     const box = card.getBoundingClientRect();
+     const centre = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+
+     const opened = {
+       topmost: card.contains(centre),
+       onScreen: box.left >= 0 && box.top >= 0 && box.bottom <= window.innerHeight + 1,
+       offersShare: /Share this folder/i.test(card.textContent ?? ''),
+       offersJoin: /Join with a code/i.test(card.textContent ?? ''),
+     };
+
+     // Close the panel, then drive the session over IPC - the confirm dialog in the click path
+     // is a deliberate speed bump for a human, not something to click through here.
+     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+     await new Promise((r) => setTimeout(r, 200));
+
+     const started = await window.adcode.collab.host({
+       bind: 'loopback',
+       port: 0,
+       displayName: 'Smoke',
+     });
+
+     if (started.mode !== 'hosting') {
+       return 'did not start: ' + (started.error ?? 'no reason given') ;
+     }
+
+     await new Promise((r) => setTimeout(r, 300));
+
+     const hosting = {
+       // The host is in its own roster, as the host.
+       roster: started.participants.length === 1 && started.participants[0].role === 'host',
+       hasInvite: typeof started.invite === 'string' && started.invite.startsWith('adcode1:'),
+       hasPort: Number.isInteger(started.port) && started.port > 0,
+       // The word, not just the colour. This is the only indicator that other people can reach
+       // these files, so it has to be legible without knowing the colour code.
+       label: document.getElementById('status-collab-label')?.textContent,
+       state: document.getElementById('status-collab')?.dataset.state,
+       // The renderer knows what it may do, and a host may do everything.
+       canAdminister: started.can?.administer === true,
+     };
+
+     // A document joins the session and comes back with real state.
+     const openDoc = await window.adcode.collab.openDoc('README.md');
+
+     const stopped = await window.adcode.collab.leave();
+
+     return {
+       ...opened,
+       ...hosting,
+       docJoined: typeof openDoc === 'string' && openDoc.length > 0,
+       stopped: stopped.mode === 'off',
+       labelAfter: document.getElementById('status-collab-label')?.textContent,
+     };
+   })()`,
+);
+
+/* ── The explanation layer (P1) ───────────────────────────────────────── */
+
+/*
+ * Every check here returns a boolean or an object of booleans, never a descriptive string.
+ * The runner only fails on `false`, `undefined`, or `THREW`, so a check that reports a real
+ * problem as prose is printed and then passes - which is the one way this script lies.
+ */
+
+/*
+ * Help > Open Source Licences, through the real command, reading the real file.
+ *
+ * "showsApache" is the one that matters: it proves main found LICENSE on disk and the text
+ * crossed IPC into the pane, rather than the tab falling back to its "could not be read"
+ * sentence - which would still open a perfectly good-looking dialog.
+ *
+ * The palette can fail to open when the window has lost focus. That is recorded as this
+ * check failing, not thrown: an uncaught throw here ends the run and takes every result
+ * already gathered with it.
+ */
+checks.licencesDialog = await (async () => {
+  try {
+    await choosePaletteCommand("help.openSourceLicences", "Open Source Licences");
+  } catch (error) {
+    return `THREW: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  await sleep(500);
+
+  const shown = await evaluate(
+    `(() => {
+       const dialog = document.querySelector('.licences-dialog');
+       const tabs = [...document.querySelectorAll('.licences-tab')].map((tab) => tab.textContent);
+       const text = document.querySelector('.licences-text')?.textContent ?? '';
+       return {
+         opened: dialog?.open === true,
+         threeTabs: tabs.join('|') === 'ADCode licence|Notice|Third-party',
+         showsApache: text.includes('Apache License') && text.includes('Version 2.0, January 2004'),
+       };
+     })()`,
+  );
+
+  await pressEscape();
+  await sleep(250);
+  const closes = await evaluate(`document.querySelector('.licences-dialog')?.open === false`);
+
+  return { ...shown, closes: closes === true };
+})();
+
+checks.helpGuideOpens = await (async () => {
+  await choosePaletteCommand("help.guide", "Feature Guide");
+  await sleep(500);
+
+  return await evaluate(
+    `(() => {
+       const sheet = document.querySelector('.help-sheet');
+       if (!sheet || sheet.hidden) return false;
+       const cards = sheet.querySelectorAll('.help-card');
+       const groups = sheet.querySelectorAll('.settings-group-title');
+       return {
+         visible: sheet.dataset.state === 'open',
+         hasManyCards: cards.length > 40,
+         hasGroups: groups.length > 5,
+         explainsInThree:
+           sheet.querySelector('.help-card-plain') !== null &&
+           sheet.querySelectorAll('.help-card-detail').length > 0,
+       };
+     })()`,
+  );
+})();
+
+checks.helpGuideSearchesByDescription = await evaluate(
+  `(() => {
+     const search = document.querySelector('.help-sheet .settings-search');
+     if (!search) return false;
+     search.value = 'grey text';
+     search.dispatchEvent(new Event('input', { bubbles: true }));
+
+     const titles = [...document.querySelectorAll('.help-sheet .help-card-title')]
+       .map((t) => t.firstChild?.textContent ?? '');
+
+     // Searching words nobody would guess the feature is named after is the whole point.
+     return titles.includes('Inline completion') && titles.length < 6;
+   })()`,
+);
+
+checks.helpGuideJumpsToSetting = await (async () => {
+  const jumped = await evaluate(
+    `(() => {
+       const search = document.querySelector('.help-sheet .settings-search');
+       search.value = 'minimap';
+       search.dispatchEvent(new Event('input', { bubbles: true }));
+
+       const jump = document.querySelector('.help-sheet .help-card-jump[data-setting-id="adcode.editing.minimap"]');
+       if (!jump) return false;
+       jump.click();
+       return true;
+     })()`,
+  );
+  if (jumped !== true) return false;
+
+  // The guide closes, settings opens, and it scrolls to the row - which is deliberately
+  // delayed past the sheet transition, so this waits longer than a click normally would.
+  await sleep(900);
+
+  checks.helpGuideJumpEvidence = await evaluate(
+    `(() => {
+       const guide = document.querySelector('.help-sheet');
+       const settings = document.querySelector('.settings-sheet:not(.help-sheet)');
+       const row = document.querySelector('[data-setting-id="adcode.editing.minimap"]');
+       return {
+         guideClosed: guide.dataset.state === undefined,
+         settingsOpen: settings?.dataset.state === 'open',
+         rowExists: row !== null,
+         rowMarked: row?.dataset.highlight === 'true',
+          rowFocused: document.activeElement === row,
+        };
+      })()`,
+  );
+
+  return (
+    typeof checks.helpGuideJumpEvidence === "object" &&
+    checks.helpGuideJumpEvidence.guideClosed === true &&
+    checks.helpGuideJumpEvidence.settingsOpen === true &&
+    checks.helpGuideJumpEvidence.rowExists === true &&
+    checks.helpGuideJumpEvidence.rowMarked === true &&
+    checks.helpGuideJumpEvidence.rowFocused === true
+  );
+})();
+
+/*
+ * The theme picker, and that picking actually repaints the window.
+ *
+ * Themes are the one setting where the unit tests can prove the *rule* and nothing else:
+ * `resolveTheme` is pure and covered, but whether Midnight reaches the DOM, whether the
+ * editor follows it, and whether the four previews render at all only exist in a laid-out
+ * window. Each has its own way of silently not happening - a stylesheet missing the new
+ * block, a Monaco theme that was never defined, an SVG built in the wrong namespace and
+ * therefore invisible.
+ *
+ * These open Settings themselves rather than inheriting whatever the previous check left
+ * behind. The first version did inherit it, found the cards, clicked one, and reported
+ * that Midnight had not applied - which was the check being wrong about the sheet's state,
+ * not the feature being broken. A check that depends on its predecessor's leftovers is a
+ * check that reports the wrong thing the moment somebody reorders the file.
+ */
+async function openSettingsSheet() {
+  const isOpen = async () =>
+    (await evaluate(
+      `(document.querySelector('.settings-sheet:not(.help-sheet)')?.dataset.state === 'open' && document.querySelector('dialog[data-popup-id="settings"]')?.open === true)`,
+    )) === true;
+
+  /*
+   * Click once, then wait.
+   *
+   * `#open-settings` toggles, so a retry loop that clicks on every pass fights itself:
+   * one click opens the sheet, the next closes it, and twelve attempts land wherever the
+   * parity falls. Clicking once and polling for the result is the only shape that works
+   * for a control whose meaning depends on the current state.
+   */
+  let open = await isOpen();
+  if (!open) {
+    await evaluate("document.getElementById('open-settings')?.click(); true");
+    for (let attempt = 0; attempt < 15; attempt += 1) {
+      await sleep(250);
+      if (await isOpen()) {
+        open = true;
+        break;
+      }
+    }
+  }
+  if (!open) return false;
+
+  checks.settingsCloseGeometry = await evaluate(
+    `(() => {
+       const dialog = document.querySelector('dialog[data-popup-id="settings"]');
+       const surface = dialog?.querySelector('.popup-shell-surface');
+       const close = dialog?.querySelector('.settings-close[aria-label="Close Settings"]');
+       if (!dialog?.open || !surface || !close) return false;
+       const surfaceBox = surface.getBoundingClientRect();
+       const closeBox = close.getBoundingClientRect();
+       return close.getAttribute('title') === 'Close Settings' &&
+         closeBox.width >= 24 && closeBox.height >= 24 &&
+         closeBox.left >= surfaceBox.left && closeBox.right <= surfaceBox.right &&
+         closeBox.top >= surfaceBox.top && closeBox.bottom <= surfaceBox.bottom &&
+         closeBox.left >= 0 && closeBox.top >= 0 &&
+         closeBox.right <= window.innerWidth && closeBox.bottom <= window.innerHeight;
+     })()`,
+  );
+  return checks.settingsCloseGeometry === true;
+}
+
+/*
+ * Does the picker draw four themes, and does clicking one record the choice?
+ *
+ * The half that needs the settings sheet open, and the only half that does. Splitting it
+ * this way is deliberate: the sheet is the flaky part of this run - it is a toggle, late
+ * in a long sequence, behind an animation - and letting it gate the paint assertions
+ * below meant a green feature reporting red because a panel did not slide out in time.
+ */
+checks.themePickerRecordsAChoice = await (async () => {
+  if ((await openSettingsSheet()) !== true) return "settings would not open";
+
+  const shape = await evaluate(
+    `(() => {
+       const picker = document.querySelector('.theme-picker');
+       if (picker === null) return 'no theme picker';
+
+       const cards = [...picker.querySelectorAll('.theme-card')];
+       const labels = cards.map((c) => c.querySelector('.theme-card-label')?.textContent);
+       // Built with createElementNS, so a namespace mistake shows up as zero rects here
+       // while the element still exists in the tree.
+       const drawn = cards.map(
+         (c) => c.querySelector('.theme-preview')?.querySelectorAll('rect').length ?? 0,
+       );
+
+       return {
+         labels: labels.join(','),
+         everyCardDrawsAPreview: drawn.every((n) => n > 10),
+         exactlyOneChecked: cards.filter((c) => c.getAttribute('aria-checked') === 'true').length === 1,
+       };
+     })()`,
+  );
+  if (typeof shape === "string") return shape;
+
+  const before = await evaluate("document.documentElement.dataset.theme");
+
+  const clicked = await evaluate(
+    `(() => {
+       const card = [...document.querySelectorAll('.theme-card')]
+         .find((c) => c.querySelector('.theme-card-label')?.textContent === 'Midnight');
+       if (!card) return 'no Midnight card';
+       card.click();
+       return 'clicked';
+     })()`,
+  );
+  if (clicked !== "clicked") return clicked;
+
+  await sleep(900);
+
+  const stored = await evaluate(
+    `(async () => (await window.adcode.settings.read())['adcode.appearance.theme'])()`,
+  );
+
+  // Put it back, so every check after this one sees the theme it was written against.
+  await evaluate(
+    `(() => {
+       const label = ${JSON.stringify("Dark")};
+       const card = [...document.querySelectorAll('.theme-card')]
+         .find((c) => c.querySelector('.theme-card-label')?.textContent === label);
+       card?.click();
+       return true;
+     })()`.replace(
+      '"Dark"',
+      JSON.stringify(before === "light" ? "Light" : "Dark"),
+    ),
+  );
+  await sleep(500);
+
+  return { ...shape, clickWroteTheSetting: stored === "midnight" };
+})();
+
+/*
+ * Does Settings say what the MCP command needs before handing it out?
+ *
+ * The command runs on the user's own Node.js - with `runAsNode` fused off, ADCode cannot be
+ * the runtime - and `claude mcp add` accepts it whether or not that Node.js exists. The
+ * failure only shows later, inside the agent. So the card has to state the requirement,
+ * and either show a command with a working Copy button or, with none to give, say why in a
+ * sentence that wraps instead of a one-line command box beside a Copy that cannot work.
+ */
+checks.settingsMcpCardStatesNode = await (async () => {
+  if ((await openSettingsSheet()) !== true) return "settings would not open";
+  // The command arrives asynchronously, after a `node --version` on Windows.
+  await sleep(1500);
+
+  return await evaluate(
+    `(() => {
+       const card = document.querySelector('.settings-sheet:not(.help-sheet) .connection-card');
+       if (!card) return { cardInDom: false };
+       const visible = (el) => el !== null && !el.hidden && el.getBoundingClientRect().height > 0;
+       const code = card.querySelector('.connection-command');
+       const actions = card.querySelector('.connection-actions');
+       const problem = card.querySelector('.connection-problem');
+       const commandShown = visible(code) && (code.textContent ?? '').startsWith('claude mcp add adcode -- node ');
+       const reasonShown = visible(problem) && !visible(code);
+       return {
+         statesRequirement: /Node\\.js \\d+\\.\\d+ or newer/.test(card.textContent ?? ''),
+         showsCommandOrReason: commandShown || reasonShown,
+         noDeadCopy: visible(code) === visible(actions),
+         noteFitsTheCard: !visible(problem) || problem.scrollWidth <= problem.clientWidth + 1,
+         commandShown,
+         note: visible(problem) ? problem.textContent : null,
+       };
+     })()`,
+  );
+})();
+
+/*
+ * Does Midnight actually repaint the window?
+ *
+ * Written directly rather than clicked, so this cannot fail for want of an open panel.
+ * The click is covered above; what is covered here is the part that only exists in a
+ * laid-out window - that the stylesheet carries a Midnight block, that the accent
+ * inverts, and that Monaco was re-themed rather than silently left on the old one.
+ */
+checks.midnightThemeRepaints = await (async () => {
+  const before = await evaluate("document.documentElement.dataset.theme");
+
+  /*
+   * Get an editor on screen first.
+   *
+   * Two things hide it this late in the run: the settings sheet is covering it, and by
+   * now the earlier checks may have closed every tab, leaving the welcome screen. Escape
+   * handles the first, clicking a tab handles the second. Without both, this measured
+   * nothing and said so in a string - which the run does not count as a failure, so the
+   * Monaco half of this check would have been dead and green forever.
+   */
+  await evaluate(
+    `(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return true; })()`,
+  );
+  await sleep(400);
+
+  await evaluate(
+    `(() => {
+       if (document.querySelector('.monaco-editor') !== null) return 'already mounted';
+       const tab = document.querySelector('.tab');
+       if (tab) { tab.click(); return 'clicked a tab'; }
+       const row = document.querySelector('#filetree .tree-row[data-kind="file"]');
+       if (row) { row.click(); return 'opened a file'; }
+       return 'nothing to open';
+     })()`,
+  );
+  await sleep(900);
+
+  await evaluate(
+    `(async () => { await window.adcode.settings.write('adcode.appearance.theme', 'midnight'); })()`,
+  );
+  await sleep(800);
+
+  const applied = await evaluate(
+    `(() => {
+       const root = document.documentElement;
+       const styles = getComputedStyle(root);
+       const editor = document.querySelector('.monaco-editor');
+       return {
+         attribute: root.dataset.theme,
+         // Read from the cascade, not from a token table: this is what proves the
+         // stylesheet actually carries a Midnight block rather than falling through.
+         app: styles.getPropertyValue('--bg-app').trim(),
+         accent: styles.getPropertyValue('--accent').trim(),
+         // Monaco paints its canvas on inner elements and leaves .monaco-editor itself
+         // transparent, so its background-color measures nothing. The theme's
+         // editor.background is published as this custom property instead.
+         editor:
+           editor === null
+             ? 'no editor mounted'
+             : getComputedStyle(editor).getPropertyValue('--vscode-editor-background').trim(),
+       };
+     })()`,
+  );
+
+  await evaluate(
+    `(async () => { await window.adcode.settings.write('adcode.appearance.theme', ${JSON.stringify("dark")}); })()`.replace(
+      '"dark"',
+      JSON.stringify(before === "midnight" ? "dark" : before),
+    ),
+  );
+  await sleep(500);
+
+  return {
+    attribute: applied.attribute === "midnight",
+    trueBlackGround: applied.app === "#000000",
+    accentInverted: applied.accent === "#f1f3f3",
+    editorFollowed:
+      applied.editor.toLowerCase() === "#08090b" ? true : applied.editor,
+    restored:
+      (await evaluate("document.documentElement.dataset.theme")) !== "midnight",
+  };
+})();
+
+checks.everySettingHasAQuestionMark = await evaluate(
+  `(() => {
+     const rows = [...document.querySelectorAll('.settings-row[data-setting-id]')];
+     if (rows.length < 40) return false;
+     const without = rows.filter((r) => r.querySelector('.help-button') === null);
+     return { rows: rows.length > 40, allExplained: without.length === 0 };
+   })()`,
+);
+
+checks.helpPopoverOpensAndCloses = await (async () => {
+  /*
+   * Make sure Settings is actually open first.
+   *
+   * The popover is anchored to a settings row, and a row inside a closed sheet measures
+   * zero - so the popover gets placed off-screen and the check reports a stacking failure
+   * that is really a sequencing one. The previous block leaves the sheet open on most runs
+   * and not all of them.
+   */
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const open = await evaluate(
+      `(document.querySelector('.settings-sheet:not(.help-sheet)')?.dataset.state === 'open')`,
+    );
+    if (open === true) break;
+
+    await evaluate(
+      `(() => {
+         document.dispatchEvent(new KeyboardEvent('keydown', { key: ',', ctrlKey: true, bubbles: true }));
+         return true;
+       })()`,
+    );
+    await sleep(500);
+  }
+
+  const opened = await evaluate(
+    `(() => {
+       const row = document.querySelector('[data-setting-id="adcode.editing.minimap"]');
+       const button = row?.querySelector('.help-button');
+       if (!button) return false;
+       button.click();
+       return true;
+     })()`,
+  );
+  if (opened !== true) return false;
+
+  await sleep(350);
+
+  const shown = await evaluate(
+    `(() => {
+       const pop = document.querySelector('.help-popover');
+       if (!pop || pop.hidden) return false;
+       const box = pop.getBoundingClientRect();
+       return {
+         visible: pop.dataset.state === 'open',
+         // The three fields, all filled - an empty popover is the failure this guards.
+         hasPlain: (pop.querySelector('.help-popover-plain')?.textContent ?? '').length > 20,
+         hasDetails:
+           [...pop.querySelectorAll('.help-popover-detail')]
+             .every((d) => (d.textContent ?? '').length > 20),
+         // Placement is measured in script, so being on-screen is a real thing to check.
+         onScreen:
+           box.top >= 0 &&
+           box.left >= 0 &&
+           box.bottom <= window.innerHeight &&
+           box.right <= window.innerWidth,
+         anchorMarked:
+           document
+             .querySelector('[data-setting-id="adcode.editing.minimap"] .help-button')
+             ?.getAttribute('aria-expanded') === 'true',
+         /*
+          * In front of the sheet it explains.
+          *
+          * It shipped at z-index 90 against the settings sheet's 100, so the explanation
+          * opened *behind* the screen it is opened from - reported by the user. Asking what
+          * is actually painted at the popover's centre is the check that would have caught
+          * it; "is it visible" did not.
+          */
+         inFront: (() => {
+           const centre = document.elementFromPoint(
+             Math.round(box.left + box.width / 2),
+             Math.round(box.top + box.height / 2),
+           );
+           return centre !== null && pop.contains(centre);
+         })(),
+       };
+     })()`,
+  );
+
+  await pressEscape();
+  await sleep(300);
+
+  const closed = await evaluate(
+    `(() => {
+       const pop = document.querySelector('.help-popover');
+       const settings = document.querySelector('.settings-sheet:not(.help-sheet)');
+       return {
+         popoverGone: pop.hidden === true,
+         // Escape closes the popover and must not also close the sheet behind it.
+         settingsStillOpen: settings?.dataset.state === 'open',
+       };
+     })()`,
+  );
+
+  // Use a real full pointer gesture on the modal backdrop. A synthetic pointerdown
+  // alone misses the shell's later click handler and cannot prove layer isolation.
+  await evaluate(`document.querySelector('[data-setting-id="adcode.editing.minimap"] .help-button')?.click(); true`);
+  const outsidePoint = await evaluate(`(() => {
+    const shell = document.querySelector('dialog[data-popup-id="settings"]');
+    const box = shell.querySelector('.popup-shell-surface').getBoundingClientRect();
+    const x = Math.max(1, Math.floor(box.left / 2));
+    return { x, y: Math.round(innerHeight / 2), outsideSurface: x < box.left,
+      helpOpen: document.querySelector('.help-popover')?.hidden === false };
+  })()`);
+  await clickAt(outsidePoint.x, outsidePoint.y);
+  await sleep(300);
+  const outside = await evaluate(`(() => {
+    const shell = document.querySelector('dialog[data-popup-id="settings"]');
+    return {
+      outsidePopoverGone: document.querySelector('.help-popover')?.hidden === true,
+      outsideSettingsStillOpen: shell?.open === true && shell.dataset.closing !== 'true' &&
+        shell.querySelector('.settings-sheet')?.dataset.state === 'open',
+      outsideFocusReturned: document.activeElement ===
+        document.querySelector('[data-setting-id="adcode.editing.minimap"] .help-button'),
+    };
+  })()`);
+
+  return { ...shown, ...closed, outsidePressStartedWithHelp: outsidePoint.helpOpen,
+    outsidePressOnBackdrop: outsidePoint.outsideSurface, ...outside };
+})();
+
+// Leave the app as this block found it, so later checks are not run against a covered window.
+await pressEscape();
+await sleep(400);
+checks.settingsEscapeRestoresLauncher = await evaluate(
+  `document.querySelector('dialog[data-popup-id="settings"]')?.open === false && document.activeElement === document.querySelector('#open-settings')`,
+);
+
+await evaluate("document.getElementById('open-settings')?.click(); true");
+await sleep(400);
+checks.settingsCloseButtonDismisses = await evaluate(
+  `(async () => {
+     const dialog = document.querySelector('dialog[data-popup-id="settings"]');
+     const close = dialog?.querySelector('.settings-close[aria-label="Close Settings"]');
+     if (!dialog?.open || !(close instanceof HTMLElement)) return false;
+     close.focus();
+      const focused = document.activeElement === close;
+      close.click();
+      for (let attempt = 0; attempt < 100 && dialog.open; attempt++) await new Promise(resolve => setTimeout(resolve, 50));
+      return focused && dialog.open === false && document.activeElement === document.querySelector('#open-settings');
+  })()`,
+);
+
+await openExpandedAssistant();
+await sleep(400);
+checks.chatConnectWorkspaceEvidence = await evaluate(
+  `(() => {
+     const chat = document.querySelector('dialog[data-popup-id="chat"]');
+     const surface = chat?.querySelector('.popup-shell-surface');
+     const card = chat?.querySelector('.chat-card');
+     const history = card?.querySelector('.chat-history');
+     const conversation = card?.querySelector('.chat-conversation');
+     // Team, schedules and activity live in a floating panel now, not inside the chat card.
+     const inspector = document.querySelector('.chat-inspector');
+     const composer = card?.querySelector('.chat-composer');
+     const header = card?.querySelector('.chat-header');
+     const historyButton = [...(header?.querySelectorAll('button') ?? [])]
+       .find((button) => button.textContent?.trim() === 'History');
+     const inspectorButton = [...(header?.querySelectorAll('button') ?? [])]
+       .find((button) => button.textContent?.trim() === 'Inspector');
+     const close = [...(header?.querySelectorAll('button') ?? [])]
+       .find((button) => button.textContent?.trim() === 'Close');
+     if (!chat?.open || !surface || !card || !history || !conversation || !inspector || !composer ||
+         !historyButton || !inspectorButton || !close) return false;
+     close.focus();
+     const surfaceBox = surface.getBoundingClientRect();
+     const closeBox = close.getBoundingClientRect();
+     const conversationBox = conversation.getBoundingClientRect();
+     const historyBox = history.getBoundingClientRect();
+     const inspectorBox = inspector.getBoundingClientRect();
+     const composerBox = composer.getBoundingClientRect();
+     // A flush grid edge is painted in 1/64 px units and can serialize either side of its
+     // containing edge. One CSS pixel covers that rounding without accepting a clipped row.
+     const composerTolerance = 1;
+     const composerBottomLimit = Math.min(surfaceBox.bottom, innerHeight);
+     return {
+       workspace: Math.abs(card.getBoundingClientRect().width - surface.clientWidth) <= 1 &&
+         Math.abs(card.getBoundingClientRect().height - surface.clientHeight) <= 1,
+       titleAndStatus: header.getBoundingClientRect().height > 20 &&
+         (header.textContent ?? '').includes('Assistant'),
+       transcriptDominant: conversationBox.width >= historyBox.width && conversationBox.width >= inspectorBox.width,
+       composerVisible: composerBox.width > 0 && composerBox.height > 0,
+       composerIntersectsSurface:
+         composerBox.top < composerBottomLimit && composerBox.bottom > surfaceBox.top,
+       composerReachable:
+         composerBox.bottom <= composerBottomLimit + composerTolerance,
+       closeGeometry: document.activeElement === close && closeBox.width > 0 && closeBox.height > 0 &&
+         closeBox.left >= surfaceBox.left && closeBox.top >= surfaceBox.top &&
+       close.getAttribute('aria-label') === 'Close Assistant' &&
+         closeBox.right <= surfaceBox.right && closeBox.bottom <= surfaceBox.bottom &&
+         closeBox.right <= innerWidth && closeBox.bottom <= innerHeight,
+     };
+   })()`,
+);
+
+async function setChatViewport(width) {
+  await send("Emulation.setDeviceMetricsOverride", {
+    width,
+    height: 800,
+    deviceScaleFactor: 1,
+    mobile: false,
+  });
+  await sleep(250);
+}
+
+async function readChatDisclosureGeometry() {
+  return evaluate(
+    `(() => {
+       const card = document.querySelector('dialog[data-popup-id="chat"] .chat-card');
+       const history = card?.querySelector('.chat-history');
+       const conversation = card?.querySelector('.chat-conversation');
+       // The inspector floats in its own panel (#floating-activity); judge the panel.
+       const inspector = document.getElementById('floating-activity');
+       const header = card?.querySelector('.chat-header');
+       const historyButton = [...(header?.querySelectorAll('button') ?? [])]
+         .find((button) => button.textContent?.trim() === 'History');
+       const inspectorButton = [...(header?.querySelectorAll('button') ?? [])]
+         .find((button) => button.textContent?.trim() === 'Inspector');
+        if (!card || !history || !conversation || !inspector || !historyButton || !inspectorButton) return false;
+        const cardBox = card.getBoundingClientRect();
+        const place = (element) => {
+          const rect = element.getBoundingClientRect();
+          const style = getComputedStyle(element);
+          const probe = document.elementFromPoint(
+            rect.left + rect.width / 2,
+            rect.top + Math.min(rect.height / 2, 120),
+          );
+          return {
+            position: style.position,
+            inside:
+              rect.left >= cardBox.left - 1 && rect.top >= cardBox.top - 1 &&
+              rect.right <= cardBox.right + 1 && rect.bottom <= cardBox.bottom + 1,
+            onTop: !!probe && (element === probe || element.contains(probe)),
+          };
+        };
+        const snapshot = () => ({
+          width: conversation.getBoundingClientRect().width,
+          historyHidden: history.hidden,
+          inspectorHidden: inspector.hidden,
+          historyOpen: card.dataset.historyOpen,
+          inspectorOpen: String(!inspector.hidden),
+          historyPlace: history.hidden ? null : place(history),
+          inspectorPlace: inspector.hidden ? null : place(inspector),
+        });
+       if (card.dataset.historyOpen !== 'true') historyButton.click();
+       if (inspector.hidden) inspectorButton.click();
+       const bothOpen = snapshot();
+       historyButton.click();
+       const historyCollapsed = snapshot();
+       inspectorButton.click();
+       const bothCollapsed = snapshot();
+       historyButton.click();
+       const inspectorCollapsed = snapshot();
+       inspectorButton.click();
+       return { viewport: innerWidth, bothOpen, historyCollapsed, bothCollapsed, inspectorCollapsed };
+     })()`,
+  );
+}
+
+function hasDisclosureState(snapshot, historyOpen, inspectorOpen) {
+  return (
+    snapshot?.historyOpen === String(historyOpen) &&
+    snapshot?.inspectorOpen === String(inspectorOpen) &&
+    snapshot?.historyHidden === !historyOpen &&
+    snapshot?.inspectorHidden === !inspectorOpen
+  );
+}
+
+function disclosureGeometryPass(result, layout) {
+  if (typeof result !== "object" || result === null) return false;
+  const { viewport, bothOpen, historyCollapsed, bothCollapsed, inspectorCollapsed } = result;
+  if (layout === "compact") {
+    // Compact: history and the floating activity sheet toggle independently, and the
+    // conversation keeps its width whatever is open.
+    return viewport <= 720 && [bothOpen, historyCollapsed, bothCollapsed, inspectorCollapsed].every(entry =>
+      entry.width > 0 &&
+      entry.historyHidden === (entry.historyOpen !== 'true') && entry.inspectorHidden === (entry.inspectorOpen !== 'true') &&
+      Math.abs(entry.width - bothOpen.width) < 4);
+  }
+  const states =
+    hasDisclosureState(bothOpen, true, true) &&
+    hasDisclosureState(historyCollapsed, false, true) &&
+    hasDisclosureState(bothCollapsed, false, false) &&
+    hasDisclosureState(inspectorCollapsed, true, false);
+  if (!states || ![bothOpen, historyCollapsed, bothCollapsed, inspectorCollapsed].every((entry) => entry.width > 0)) {
+    return false;
+  }
+  // Panels float over the conversation instead of squeezing it: the transcript
+  // keeps its full width in every state. History is an absolutely positioned card
+  // inside the chat card; Team and activity is a floating panel over the window,
+  // on top of the expanded chat rather than behind its backdrop.
+  const overlay = (entry, historyOpen, inspectorOpen) =>
+    (!historyOpen || (entry.historyPlace?.position === "absolute" && entry.historyPlace.inside && entry.historyPlace.onTop)) &&
+    (!inspectorOpen || (entry.inspectorPlace?.position === "fixed" && entry.inspectorPlace.onTop));
+  const steady = [historyCollapsed, bothCollapsed, inspectorCollapsed].every(
+    (entry) => Math.abs(entry.width - bothOpen.width) < 4,
+  );
+  if (layout === "wide") {
+    return viewport > 980 && steady &&
+      overlay(bothOpen, true, true) && overlay(historyCollapsed, false, true) &&
+      overlay(bothCollapsed, false, false) && overlay(inspectorCollapsed, true, false);
+  }
+  if (layout === "medium") {
+    return viewport > 720 && viewport <= 980 && steady &&
+      overlay(bothOpen, true, true) && overlay(historyCollapsed, false, true) &&
+      overlay(bothCollapsed, false, false) && overlay(inspectorCollapsed, true, false);
+  }
+  return viewport <= 720 &&
+    Math.abs(historyCollapsed.width - bothOpen.width) < 4 &&
+    Math.abs(bothCollapsed.width - bothOpen.width) < 4 &&
+    Math.abs(inspectorCollapsed.width - bothOpen.width) < 4;
+}
+
+await setChatViewport(1280);
+const wideDisclosureGeometry = await readChatDisclosureGeometry();
+await setChatViewport(900);
+const mediumDisclosureGeometry = await readChatDisclosureGeometry();
+await setChatViewport(640);
+const compactDisclosureGeometry = await readChatDisclosureGeometry();
+await setChatViewport(1280);
+
+checks.chatDisclosureGeometry = {
+  wide: disclosureGeometryPass(wideDisclosureGeometry, "wide"),
+};
+checks.chatDisclosureResponsiveEvidence = {
+  medium: disclosureGeometryPass(mediumDisclosureGeometry, "medium"),
+  compact: disclosureGeometryPass(compactDisclosureGeometry, "compact"),
+};
+
+checks.chatSendHistoryEvidence = await evaluate(
+  `(async () => {
+     const card = document.querySelector('dialog[data-popup-id="chat"] .chat-card');
+     const transcript = card?.querySelector('.chat-transcript');
+     const history = card?.querySelector('.chat-history');
+     const header = card?.querySelector('.chat-header');
+     const historyButton = [...(header?.querySelectorAll('button') ?? [])]
+       .find((button) => button.textContent?.trim() === 'History');
+     const reset = [...(header?.querySelectorAll('button') ?? [])]
+       .find((button) => button.getAttribute('aria-label') === 'Start a new conversation');
+     if (!transcript || !history || !historyButton || !reset) return false;
+     if (!history.hidden) historyButton.click();
+     historyButton.click();
+     for (let attempt = 0; attempt < 20; attempt += 1) {
+       if (history.querySelector('.chat-history-open') !== null) break;
+       await new Promise((resolve) => setTimeout(resolve, 100));
+     }
+     const sessions = await window.adcode.chat.sessions();
+     const persisted = sessions.some((session) => session.id === 'smoke-chat-history');
+     const row = [...history.querySelectorAll('.chat-history-open')]
+       .find((button) => button.textContent?.trim() === 'Smoke saved conversation');
+     if (!(row instanceof HTMLButtonElement)) {
+       return { savedSessionPersists: persisted, historyRow: false };
+     }
+     row.click();
+     for (let attempt = 0; attempt < 20; attempt += 1) {
+       if ((transcript.textContent ?? '').includes('Saved Chat response')) break;
+       await new Promise((resolve) => setTimeout(resolve, 100));
+     }
+     const resumed = (transcript.textContent ?? '').includes('Saved Chat request') &&
+       (transcript.textContent ?? '').includes('Saved Chat response');
+     const remembered = card.querySelector('.chat-memory')?.textContent?.includes('Carrying 2 messages') === true;
+     reset.click();
+     await new Promise((resolve) => setTimeout(resolve, 100));
+     if (history.hidden) historyButton.click();
+     for (let attempt = 0; attempt < 20; attempt += 1) {
+       if (history.querySelector('.chat-history-open') !== null) break;
+       await new Promise((resolve) => setTimeout(resolve, 100));
+     }
+     return {
+       resetClearsTranscript: transcript.childElementCount === 0,
+       resetClearsActiveHistory: history.querySelector('.chat-history-row[data-active="true"] .chat-history-open')?.textContent !== 'Smoke saved conversation',
+       resetShowsNewTitle: card.querySelector('.chat-conversation-title')?.textContent === 'New conversation',
+       savedSessionPersists: persisted,
+       historyRow: history.querySelector('.chat-history-open') !== null,
+       resumeRestoresTranscript: resumed,
+       resumeRestoresMemory: remembered,
+     };
+   })()`,
+);
+
+const chatConnectPoint = await evaluate(
+  `(() => {
+     const button = [...document.querySelectorAll('dialog[data-popup-id="chat"] .chat-header button')]
+       .find((candidate) => candidate.textContent?.trim() === 'Connect');
+     if (!(button instanceof HTMLElement)) return null;
+     const box = button.getBoundingClientRect();
+     return { x: Math.round(box.left + box.width / 2), y: Math.round(box.top + box.height / 2) };
+   })()`,
+);
+if (chatConnectPoint !== null && typeof chatConnectPoint === "object") {
+  await clickAt(chatConnectPoint.x, chatConnectPoint.y);
+}
+await sleep(500);
+const connectBackdropPoint = await evaluate(
+  `(() => {
+     const connect = document.querySelector('#popup-dependent-host dialog[data-popup-id="connect"]');
+     if (!connect?.open) return null;
+     const box = connect.getBoundingClientRect();
+     return { x: box.left + 4, y: box.top + 4 };
+   })()`,
+);
+if (connectBackdropPoint !== null && typeof connectBackdropPoint === "object") {
+  await clickAt(connectBackdropPoint.x, connectBackdropPoint.y);
+  await sleep(400);
+}
+checks.chatDependentPointerEvidence = await evaluate(
+  `(async () => {
+     const chat = document.querySelector('#popup-primary-host dialog[data-popup-id="chat"]');
+     const connect = document.querySelector('#popup-dependent-host dialog[data-popup-id="connect"]');
+     const button = [...(chat?.querySelectorAll('.chat-header button') ?? [])]
+       .find((candidate) => candidate.textContent?.trim() === 'Connect');
+      if (!chat?.open || !connect || !button) return false;
+     return {
+       dependentDismisses: connect.open === false,
+       chatRemainsOpen: chat.open === true,
+       focusReturns: document.activeElement === button,
+     };
+   })()`,
+);
+if (chatConnectPoint !== null && typeof chatConnectPoint === "object") {
+  await clickAt(chatConnectPoint.x, chatConnectPoint.y);
+}
+await sleep(500);
+checks.chatConnectLayeringEvidence = await evaluate(
+  `(async () => {
+     const chat = document.querySelector('#popup-primary-host dialog[data-popup-id="chat"]');
+     const connect = document.querySelector('#popup-dependent-host dialog[data-popup-id="connect"]');
+     const row = connect?.querySelector('.connect-row');
+     const surface = connect?.querySelector('.popup-shell-surface');
+     const close = [...(connect?.querySelectorAll('.settings-header button') ?? [])]
+       .find((button) => button.textContent?.trim() === 'Close');
+     row?.click();
+     const providerSelected = connect?.querySelector('.connect-row[data-selected="true"]') !== null;
+     close?.focus();
+     const closeBox = close?.getBoundingClientRect();
+     const surfaceBox = surface?.getBoundingClientRect();
+     const closeGeometry = document.activeElement === close && closeBox !== undefined && surfaceBox !== undefined &&
+       close.getAttribute('aria-label') === 'Close Connect a model' && closeBox.width > 0 &&
+       closeBox.height > 0 && closeBox.left >= surfaceBox.left &&
+       closeBox.top >= surfaceBox.top && closeBox.right <= surfaceBox.right &&
+       closeBox.bottom <= surfaceBox.bottom && closeBox.right <= innerWidth && closeBox.bottom <= innerHeight;
+     const stacked = chat?.open === true && connect?.open === true &&
+       Number(getComputedStyle(document.getElementById('popup-dependent-host')).zIndex) >
+         Number(getComputedStyle(document.getElementById('popup-primary-host')).zIndex);
+     return {
+       stacked,
+       closeGeometry,
+       providerSelection: row !== null && providerSelected,
+     };
+   })()`,
+);
+
+await pressEscape();
+Object.assign(checks.chatConnectLayeringEvidence, await evaluate(`(() => {
+  const chat = document.querySelector('#popup-primary-host dialog[data-popup-id="chat"]');
+  const connect = document.querySelector('#popup-dependent-host dialog[data-popup-id="connect"]');
+  const button = [...chat.querySelectorAll('.chat-header button')].find(x => x.textContent?.trim() === 'Connect');
+  return { layeredEscape: connect.open === false && chat.open === true, focusReturn: document.activeElement === button };
+})()`));
+await pressEscape();
+checks.chatConnectLayeringEvidence.chatEscape = await evaluate(
+  `document.querySelector('dialog[data-popup-id="chat"]').open === false && document.activeElement === document.querySelector('.project-tools')`,
+);
+
+checks.chatConnectWorkspace =
+  typeof checks.chatConnectWorkspaceEvidence === "object" &&
+  Object.values(checks.chatConnectWorkspaceEvidence).every((value) => value === true) &&
+  typeof checks.chatDisclosureGeometry === "object" &&
+  Object.values(checks.chatDisclosureGeometry).every((value) => value === true) &&
+  typeof checks.chatDisclosureResponsiveEvidence === "object" &&
+  Object.values(checks.chatDisclosureResponsiveEvidence).every((value) => value === true) &&
+  typeof checks.chatSendHistoryEvidence === "object" &&
+  Object.values(checks.chatSendHistoryEvidence).every((value) => value === true) &&
+  typeof checks.chatDependentPointerEvidence === "object" &&
+  Object.values(checks.chatDependentPointerEvidence).every((value) => value === true) &&
+  typeof checks.chatConnectLayeringEvidence === "object" &&
+  Object.values(checks.chatConnectLayeringEvidence).every((value) => value === true);
+
+/*
+ * Every workbench popup has one obvious way out, including at the minimum desktop width.
+ * Geometry is measured from what Chromium painted; source-level presence cannot catch the
+ * Earnings regression where a real close button existed just beyond the clipped surface.
+ */
+async function auditRequiredClose(spec, open) {
+  try {
+    await open();
+  } catch (error) {
+    await pressEscape().catch(() => {});
+    await sleep(200);
+    return {
+      launched: false,
+      inspected: false,
+      dismissed: false,
+      launchFailure: error instanceof Error ? error.message : String(error),
+    };
+  }
+  let openSettled = false;
+  for (let attempt = 0; attempt < 15 && !openSettled; attempt += 1) {
+    openSettled =
+      (await evaluate(
+        `(() => {
+           const spec = ${JSON.stringify(spec)};
+           const root = document.querySelector(spec.root);
+           const surface = document.querySelector(spec.surface);
+           const rootOpen = root instanceof HTMLDialogElement
+             ? root.open
+             : root instanceof HTMLElement && !root.hidden && root.dataset.state === 'open';
+           return rootOpen && surface instanceof HTMLElement &&
+             surface.getAnimations().every((animation) =>
+               animation.playState !== 'pending' && animation.playState !== 'running'
+             );
+         })()`,
+      )) === true;
+    if (!openSettled) await sleep(40);
+  }
+
+  const before = await evaluate(
+    `(() => {
+       const spec = ${JSON.stringify(spec)};
+       const root = document.querySelector(spec.root);
+       const surface = document.querySelector(spec.surface);
+       const close = document.querySelector(spec.close);
+       const rootFound = root instanceof HTMLElement;
+       const surfaceFound = surface instanceof HTMLElement;
+       const closeFound = close instanceof HTMLButtonElement;
+       const rootOpen = rootFound && root instanceof HTMLDialogElement
+         ? root.open
+         : rootFound && !root.hidden && root.dataset.state === 'open';
+       if (!rootFound || !surfaceFound || !closeFound || !rootOpen) {
+         return { rootFound, surfaceFound, closeFound, rootOpen };
+       }
+       const beforeFocus = close.getBoundingClientRect().toJSON();
+       close.focus();
+       const surfaceBox = surface.getBoundingClientRect();
+       const closeBox = close.getBoundingClientRect();
+       return {
+         geometry: {
+           beforeFocus, close: closeBox.toJSON(), surface: surfaceBox.toJSON(),
+           root: root.getBoundingClientRect().toJSON(),
+           viewport: { width: innerWidth, height: innerHeight, scrollX, scrollY },
+           scroll: [root, surface].map((element) => ({ top: element.scrollTop, left: element.scrollLeft })),
+           animation: surface.getAnimations().map((animation) => ({ time: animation.currentTime, state: animation.playState })),
+           presentation: { scale: getComputedStyle(surface).scale, translate: getComputedStyle(surface).translate, transform: getComputedStyle(surface).transform },
+         },
+         rootFound,
+         surfaceFound,
+         closeFound,
+         rootOpen,
+         openSettled: ${String(openSettled)},
+         named: close.getAttribute('aria-label') === spec.label,
+         focusable: document.activeElement === close && !close.disabled,
+         focusDidNotMove:
+           beforeFocus.left === closeBox.left && beforeFocus.right === closeBox.right &&
+           beforeFocus.top === closeBox.top && beforeFocus.bottom === closeBox.bottom,
+         hitTarget: closeBox.width >= 24 && closeBox.height >= 24,
+         insideSurface:
+           closeBox.left >= surfaceBox.left && closeBox.right <= surfaceBox.right &&
+           closeBox.top >= surfaceBox.top && closeBox.bottom <= surfaceBox.bottom,
+         insideViewport:
+           closeBox.left >= 0 && closeBox.right <= innerWidth &&
+           closeBox.top >= 0 && closeBox.bottom <= innerHeight,
+         distinct:
+           !close.matches('.earnings-refresh, .scm-drawer-toggle') &&
+           close.getAttribute('title') !== null,
+       };
+     })()`,
+  );
+  if (typeof before === "object" && before !== null && "geometry" in before) {
+    process.stdout.write(`  closeGeometry ${spec.name}: ${JSON.stringify(before.geometry)}\n`);
+    delete before.geometry;
+  }
+  const inspected =
+    typeof before === "object" &&
+    before !== null &&
+    before.rootFound === true &&
+    before.surfaceFound === true &&
+    before.closeFound === true &&
+    before.rootOpen === true;
+  if (!inspected) {
+    await pressEscape();
+    await sleep(200);
+    return {
+      launched: true,
+      inspected: false,
+      dismissed: false,
+      ...(typeof before === "object" && before !== null ? before : {}),
+    };
+  }
+
+  await evaluate(`document.querySelector(${JSON.stringify(spec.close)})?.click(); true`);
+  let closeSettled = false;
+  for (let attempt = 0; attempt < 15 && !closeSettled; attempt += 1) {
+    closeSettled =
+      (await evaluate(
+        `(() => {
+           const spec = ${JSON.stringify(spec)};
+           const root = document.querySelector(spec.root);
+           const dismissed = root instanceof HTMLDialogElement
+             ? root.open === false
+             : root instanceof HTMLElement && root.hidden === true;
+           const ownerStayedOpen = spec.owner === undefined ||
+             document.querySelector(spec.owner)?.open === true;
+           const expected = document.querySelector(spec.restore) ??
+             (spec.restoreFallback === undefined
+               ? null
+               : document.querySelector(spec.restoreFallback));
+           return dismissed && ownerStayedOpen && expected instanceof HTMLElement &&
+             document.activeElement === expected;
+         })()`,
+      )) === true;
+    if (!closeSettled) await sleep(40);
+  }
+
+  const after = await evaluate(
+    `(() => {
+       const spec = ${JSON.stringify(spec)};
+       const root = document.querySelector(spec.root);
+       const dismissed = root instanceof HTMLDialogElement
+         ? root.open === false
+         : root?.hidden === true;
+       const ownerStayedOpen = spec.owner === undefined ||
+         document.querySelector(spec.owner)?.open === true;
+       const expected = document.querySelector(spec.restore) ??
+         (spec.restoreFallback === undefined
+           ? null
+           : document.querySelector(spec.restoreFallback));
+       return {
+         focusTelemetry: {
+           expectedFound: expected instanceof HTMLElement,
+           expected: expected instanceof HTMLElement
+             ? { tag: expected.tagName, id: expected.id, className: expected.className }
+             : null,
+           active: document.activeElement instanceof HTMLElement
+             ? { tag: document.activeElement.tagName, id: document.activeElement.id, className: document.activeElement.className }
+             : null,
+         },
+         dismissed,
+         intendedLayer: dismissed && ownerStayedOpen,
+         focusRestored: expected instanceof HTMLElement && document.activeElement === expected,
+         closeSettled: ${String(closeSettled)},
+       };
+     })()`,
+  );
+  if (typeof after === "object" && after !== null && "focusTelemetry" in after) {
+    process.stdout.write(`  closeFocus ${spec.name}: ${JSON.stringify(after.focusTelemetry)}\n`);
+    delete after.focusTelemetry;
+  }
+  return typeof after === "object" && after !== null
+    ? { launched: true, inspected: true, ...before, ...after }
+    : after;
+}
+
+await send("Emulation.setDeviceMetricsOverride", {
+  width: 680,
+  height: 800,
+  deviceScaleFactor: 1,
+  mobile: false,
+});
+await sleep(250);
+
+checks.dialogCloseAudit = {};
+checks.dialogCloseAudit.structure = await auditRequiredClose(
+  {
+    name: 'Structure',
+    label: "Close Structure",
+    root: 'dialog[data-popup-id="structure"]',
+    surface: 'dialog[data-popup-id="structure"] .popup-shell-surface',
+    close: '.structure-popup-close',
+    restore: '#open-structure',
+  },
+  () => evaluate("document.getElementById('open-structure')?.click(); true"),
+);
+checks.dialogCloseAudit.earnings = await auditRequiredClose(
+  {
+    name: 'Earnings',
+    label: "Close earnings",
+    root: 'dialog[data-popup-id="earnings"]',
+    surface: 'dialog[data-popup-id="earnings"] .popup-shell-surface',
+    close: '.earnings-close',
+    restore: '#open-earnings',
+  },
+  () => evaluate("document.getElementById('open-earnings')?.click(); true"),
+);
+checks.dialogCloseAudit.sourceControl = await auditRequiredClose(
+  {
+    name: 'Source Control',
+    label: "Close Source Control",
+    root: 'dialog[data-popup-id="source-control"]',
+    surface: 'dialog[data-popup-id="source-control"] .popup-shell-surface',
+    close: '.scm-close',
+    restore: '.activity[data-view="scm"]',
+  },
+  () => evaluate("document.querySelector('.activity[data-view=\"scm\"]')?.click(); true"),
+);
+checks.dialogCloseAudit.features = await auditRequiredClose(
+  {
+    name: 'All Features',
+    label: "Close All Features",
+    root: 'dialog[data-popup-id="features"]',
+    surface: 'dialog[data-popup-id="features"] .popup-shell-surface',
+    close: '.feature-library-close',
+    restore: '#open-features',
+  },
+  () => evaluate("document.getElementById('open-features')?.click(); true"),
+);
+checks.dialogCloseAudit.settings = await auditRequiredClose(
+  {
+    name: 'Settings',
+    label: "Close Settings",
+    root: 'dialog[data-popup-id="settings"]',
+    surface: 'dialog[data-popup-id="settings"] .popup-shell-surface',
+    close: '.settings-close',
+    restore: '#open-settings',
+  },
+  () => evaluate("document.getElementById('open-settings')?.click(); true"),
+);
+checks.dialogCloseAudit.chat = await auditRequiredClose(
+  {
+    name: 'Assistant',
+    label: "Close Assistant",
+    root: 'dialog[data-popup-id="chat"]',
+    surface: 'dialog[data-popup-id="chat"] .popup-shell-surface',
+    close: 'dialog[data-popup-id="chat"] [aria-label="Close Assistant"]',
+    restore: '.project-tools',
+  },
+  openExpandedAssistant,
+);
+checks.dialogCloseAudit.connect = await auditRequiredClose(
+  {
+    name: 'Connect a model',
+    label: "Close Connect a model",
+    root: '#popup-dependent-host dialog[data-popup-id="connect"]',
+    surface: '#popup-dependent-host dialog[data-popup-id="connect"] .popup-shell-surface',
+    close: '#popup-dependent-host dialog[data-popup-id="connect"] [aria-label="Close Connect a model"]',
+    owner: '#popup-primary-host dialog[data-popup-id="chat"]',
+    restore: '#popup-primary-host dialog[data-popup-id="chat"] button[title="Choose a provider and model"]',
+  },
+  async () => {
+    await openExpandedAssistant();
+    await sleep(300);
+    await evaluate(
+      `(() => {
+         const button = [...document.querySelectorAll('dialog[data-popup-id="chat"] .chat-header button')]
+           .find((candidate) => candidate.textContent?.trim() === 'Connect');
+         button?.click();
+         return true;
+       })()`,
+    );
+  },
+);
+await pressEscape();
+await sleep(250);
+
+checks.dialogCloseAudit.help = await auditRequiredClose(
+  {
+    name: 'ADCode Guide',
+    label: "Close ADCode Guide",
+    root: '.help-sheet',
+    surface: '.help-guide-panel',
+    close: '.help-guide-close',
+    restore: '#editor-host .native-edit-context',
+    restoreFallback: '#editor-host .monaco-editor textarea.inputarea',
+  },
+  () => choosePaletteCommand("help.guide", "Feature Guide"),
+);
+checks.dialogCloseAudit.shortcuts = await auditRequiredClose(
+  {
+    name: 'Keyboard Shortcuts',
+    label: "Close Keyboard Shortcuts",
+    root: 'dialog.shortcuts-dialog',
+    surface: '.shortcuts-card',
+    close: '.shortcuts-close',
+    restore: '#editor-host .native-edit-context',
+    restoreFallback: '#editor-host .monaco-editor textarea.inputarea',
+  },
+  () => choosePaletteCommand("help.shortcuts", "Keyboard Shortcuts"),
+);
+
+checks.dialogCloseAuditPass = Object.values(checks.dialogCloseAudit).every(
+  (result) =>
+    typeof result === "object" &&
+    result !== null &&
+    Object.values(result).every((value) => value === true),
+);
+
+/*
+ * Updates you can see: a check walks the simulated updater to "ready", the status bar says
+ * Restart to update, and asking to restart answers without quitting. Last, so the ready
+ * card it raises cannot land on top of another check's toasts.
+ */
+// The card waits for a focused window; automation has none unless it is emulated.
+await send("Emulation.setFocusEmulationEnabled", { enabled: true });
+if (packaged) {
+  // A distributed build must use its real feed and must ignore simulation flags.
+  // Do not install anything from a smoke run or imply that this tested an upgrade.
+  checks.packagedUpdateFeed = await evaluate(`(async () => {
+    const checked = await window.adcode.updates.check();
+    return { checkedCurrent: checked.state === 'current', ignoresSimulation: checked.version !== '9.9.9', state: checked.state };
+  })()`);
+} else {
+checks.updateReadyVisible = await evaluate(`(async () => {
+  const wait = async (test) => { for (let i = 0; i < 60 && !test(); i++) await new Promise((r) => setTimeout(r, 100)); };
+  const card = () => [...document.querySelectorAll('.toast')].find((node) => /9\\.9\\.9 is ready/.test(node.textContent ?? ''));
+  const checked = await window.adcode.updates.check();
+  const item = document.getElementById('status-update');
+  await wait(() => item?.textContent === 'Restart to update');
+  // An earlier check's keystroke can still count as typing; the card waits that out.
+  await new Promise((r) => setTimeout(r, 4200));
+  window.dispatchEvent(new Event('focus'));
+  await wait(() => card() !== undefined);
+  const shown = card();
+  const buttons = [...(shown?.querySelectorAll('.toast-actions button') ?? [])].map((b) => b.textContent);
+  const after = await window.adcode.updates.install();
+  return {
+    checkedReady: checked.state === 'ready' && checked.version === '9.9.9',
+    statusBarSays: item?.textContent === 'Restart to update' && item.hidden === false && item.disabled === false,
+    cardShown: shown !== undefined,
+    cardOffersRestart: buttons.join('|') === 'Restart now|Later',
+    restartAnswers: after.state === 'ready',
+  };
+})()`);
+}
+
+await send("Emulation.setDeviceMetricsOverride", {
+  width: 1280,
+  height: 800,
+  deviceScaleFactor: 1,
+  mobile: false,
+});
+
+/*
+ * Exactly one anonymous account, and made on the mock. Zero means identity went back to
+ * production; two means one install became two accounts.
+ */
+const signUps = backend.server.signUpCount();
+checks.accountMadeLocally = signUps === 1 ? true : `${signUps} sign-ups reached the mock, expected 1`;
+if (authTrace !== null) clearInterval(authTrace);
+
+socket.close();
+child.kill();
+await sleep(500);
+await backend.server.close().catch(() => {});
+await rm(SCM_SMOKE_FILE, { force: true }).catch(() => {});
+await rm(userData, { recursive: true, force: true }).catch(() => {});
+
+const bad = output
+  .split(/\r?\n/)
+  .filter((line) =>
+    /ERROR|Uncaught|Unhandled|Failed to load|Refused to|is not defined|Cannot read|TypeError|SyntaxError/i.test(
+      line,
+    ),
+  )
+  // Chromium's GPU and cache chatter on a headless Windows box is noise.
+  .filter(
+    (line) =>
+      !/gpu|dxgi|passthrough|swiftshader|d3d|vulkan|GLES|cache_util|net[\\/]disk_cache|registration_protocol|Autofill|DevTools listening|AttachConsole/i.test(
+        line,
+      ),
+  );
+
+for (const [name, value] of Object.entries(checks)) {
+  process.stdout.write(`  ${name}: ${JSON.stringify(value)}\n`);
+}
+process.stdout.write(`\n--- ${bad.length} suspicious log line(s) ---\n`);
+for (const line of bad) process.stdout.write(`  ${line}\n`);
+
+// These values are observations printed alongside assertions. Other strings are
+// failure explanations returned by checks and must not silently count as passes.
+const observations = new Set([
+  "title", "restoredWorkspace", "branch", "quickOpenRanks", "scmShowsBranch",
+  "conflictsSaysNone", "conflictsStatusLine", "paletteFinds", "multipleTerminals",
+  "terminalContextMenu", "problemsRowJumpsToTheColumn",
+]);
+const requiredEvidence = {
+  treeSitterColoursByMeaning: ["painted", "foundBoth", "toldApart"],
+  terminalOffersSharedMemory: ["shown", "namesTheAgent", "carriesTheCommand", "offersCopy"],
+  settingsMcpCardStatesNode: ["statesRequirement", "showsCommandOrReason", "noDeadCopy", "noteFitsTheCard"],
+  peekShowsTheDefinition: ["opened", "saysHowItWasFound", "matchedByName", "showsSource", "namesTheFile"],
+  welcomeScreenIsUsable: ["primaryClickable", "showsVersion", "marked"],
+  earningsSettingsButtonWorks: ["settingsOpened", "settingsSelected"],
+  updateReadyVisible: ["checkedReady", "statusBarSays", "cardShown", "cardOffersRestart", "restartAnswers"],
+  packagedUpdateFeed: ["checkedCurrent", "ignoresSimulation"],
+  licencesDialog: ["opened", "threeTabs", "showsApache", "closes"],
+};
+const failed = Object.entries(checks).filter(
+  ([name, value]) =>
+    value === false || value === undefined || String(value).startsWith("THREW") ||
+    (typeof value === "string" && !observations.has(name)) ||
+    (requiredEvidence[name]?.some((key) => value?.[key] !== true) ?? false),
+);
+if (failed.length > 0)
+  process.stdout.write(`\nfailed: ${failed.map(([n]) => n).join(", ")}\n`);
+
+process.exit(bad.length === 0 && failed.length === 0 ? 0 : 1);

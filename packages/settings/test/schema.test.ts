@@ -1,0 +1,296 @@
+import { describe, it, expect } from "vitest";
+import {
+  SETTINGS_SCHEMA,
+  SETTINGS_VERSION,
+  GROUPS,
+  defaultSettings,
+  validateSettings,
+  migrate,
+  settingsForGroup,
+  searchSettings,
+  type SettingId,
+} from "../src/index.ts";
+
+const byId = new Map(SETTINGS_SCHEMA.map((s) => [s.id, s]));
+
+describe("schema completeness", () => {
+  // Brief §4: "every item has an `adcode.*` boolean or enum setting so the user can
+  // switch it off." Defaults below are quoted from §4 directly.
+  const REQUIRED: ReadonlyArray<[string, boolean]> = [
+    ["adcode.editing.bracketPairColorization", true],
+    ["adcode.editing.inlineErrorLens", false],
+    ["adcode.editing.inlineGitBlame", false],
+    ["adcode.editing.stickyScroll", false],
+    ["adcode.editing.indentGuides", true],
+    ["adcode.editing.todoHighlighting", true],
+    ["adcode.editing.autoRenamePairedTag", true],
+    ["adcode.editing.pathAutocomplete", true],
+    ["adcode.editing.trailingWhitespace", false],
+    ["adcode.editing.minimap", false],
+    ["adcode.editing.codeFolding", true],
+    ["adcode.editing.multiCursor", true],
+
+    ["adcode.formatting.formatter", true],
+    ["adcode.formatting.formatOnSave", false],
+    ["adcode.formatting.lintDiagnostics", true],
+    ["adcode.formatting.organizeImportsOnSave", false],
+
+    ["adcode.git.gutterDiff", true],
+    ["adcode.git.blame", false],
+    ["adcode.git.stageCommitUi", true],
+    ["adcode.git.branchSwitcher", true],
+    ["adcode.git.mergeConflict", true],
+    ["adcode.git.fileTimeline", true],
+
+    ["adcode.navigation.fuzzyFileOpen", true],
+    ["adcode.navigation.symbolSearch", true],
+    ["adcode.navigation.globalSearch", true],
+    ["adcode.navigation.goToDefinition", true],
+    ["adcode.navigation.breadcrumbs", true],
+    ["adcode.navigation.outline", true],
+
+    ["adcode.language.lspClient", true],
+    ["adcode.language.dapClient", true],
+    ["adcode.language.treeSitterHighlighting", true],
+
+    ["adcode.session.workspaceRestore", true],
+    ["adcode.session.autoSave", false],
+    ["adcode.session.localFileHistory", true],
+    ["adcode.session.crashRecovery", true],
+
+    ["adcode.ai.chatWidget", true],
+    ["adcode.ai.inlineCompletion", false],
+    ["adcode.ai.terminalAgentDetection", true],
+    ["adcode.ai.memoryCapture", true],
+    ["adcode.ai.mcpServer", true],
+    ["adcode.ai.isolatedWorkspaces", true],
+  ];
+
+  for (const [id, expected] of REQUIRED) {
+    it(`${id} exists and defaults to ${expected}`, () => {
+      const setting = byId.get(id as SettingId);
+      expect(setting, `${id} must exist`).toBeDefined();
+      expect(setting?.kind).toBe("boolean");
+      expect(setting?.default).toBe(expected);
+    });
+  }
+
+  it("covers every §4 feature and nothing is orphaned from a group", () => {
+    for (const setting of SETTINGS_SCHEMA) {
+      expect(GROUPS.map((g) => g.id)).toContain(setting.group);
+      expect(setting.id.startsWith("adcode.")).toBe(true);
+      expect(setting.label.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("has unique ids", () => {
+    const ids = SETTINGS_SCHEMA.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+describe("ads settings", () => {
+  it("exposes a local kill switch, per §1", () => {
+    // "Remote kill switch plus a local `adcode.ads.enabled` setting. Either stops
+    // everything."
+    const setting = byId.get("adcode.ads.enabled" as SettingId);
+    expect(setting?.kind).toBe("boolean");
+    expect(setting?.default).toBe(true);
+  });
+
+  it("offers exactly the four frequency presets from §8.1, defaulting to standard", () => {
+    const setting = byId.get("adcode.ads.frequency" as SettingId);
+    expect(setting?.kind).toBe("enum");
+    if (setting?.kind === "enum") {
+      expect(setting.options.map((o) => o.value)).toEqual(["off", "light", "standard", "max"]);
+    }
+    expect(setting?.default).toBe("standard");
+  });
+
+  it("keeps off as a real option", () => {
+    // §8.1: "`off` is a real option and disables earnings accordingly."
+    const setting = byId.get("adcode.ads.frequency" as SettingId);
+    if (setting?.kind === "enum") {
+      expect(setting.options.some((o) => o.value === "off")).toBe(true);
+    }
+  });
+});
+
+describe("appearance", () => {
+  it("makes density a setting rather than a decision, per §3", () => {
+    const setting = byId.get("adcode.appearance.density" as SettingId);
+    expect(setting?.kind).toBe("enum");
+    if (setting?.kind === "enum") {
+      expect(setting.options.map((o) => o.value)).toEqual(["comfortable", "compact"]);
+    }
+    expect(setting?.default).toBe("comfortable");
+  });
+});
+
+describe("AI workspace settings", () => {
+  it("edits the project directly with file tools on by default", () => {
+    expect(byId.get("adcode.ai.isolatedWorkspaces" as SettingId)?.default).toBe(true);
+    expect(byId.get("adcode.ai.autoContinue" as SettingId)?.default).toBe(false);
+    expect(byId.get("adcode.ai.autoContinue" as SettingId)?.available).toBe(true);
+    expect(byId.get("adcode.ai.autoContinueRetries" as SettingId)?.default).toBe("3");
+    expect(byId.get("adcode.ai.scheduledMessages" as SettingId)?.default).toBe(true);
+
+    const expected = new Map([
+      ["adcode.ai.editPolicy", ["trusted", "review"]],
+      ["adcode.ai.autoContinueRetries", ["1", "3", "5"]],
+      ["adcode.ai.sandboxQuota", ["1gb", "5gb", "10gb"]],
+      ["adcode.ai.sandboxRetention", ["1d", "7d", "30d"]],
+      ["adcode.ai.checkpointRetention", ["7d", "30d", "90d"]],
+      ["adcode.ai.parallelAgents", ["1", "2", "3", "4", "5", "6"]],
+      ["adcode.ai.autoCompactAt", ["70", "80", "90"]],
+    ]);
+    for (const [id, options] of expected) {
+      const setting = byId.get(id as SettingId);
+      expect(setting?.kind).toBe("enum");
+      if (setting?.kind === "enum") expect(setting.options.map((option) => option.value)).toEqual(options);
+      expect(setting?.available).toBe(true);
+    }
+
+    // Task budgets are paused while the assistant edits directly: no isolated
+    // tasks are created, so there is nothing to cap. The rows stay visible but
+    // disabled until Team task controls need them.
+    const budget = byId.get("adcode.ai.taskTokenBudget" as SettingId);
+    expect(budget?.kind).toBe("enum");
+    if (budget?.kind === "enum") {
+      expect(budget.options.map((option) => option.value)).toEqual(["unlimited", "25000", "100000", "250000"]);
+    }
+    expect(budget?.available).toBe(false);
+    expect(byId.get("adcode.ai.taskTokenBudgetCustom" as SettingId)?.available).toBe(false);
+
+    expect(byId.get("adcode.ai.taskTokenBudget" as SettingId)?.default).toBe("unlimited");
+    // Results first: edits land as the assistant works, every turn can be undone, and it
+    // carries on past its step limit instead of stopping to ask.
+    expect(byId.get("adcode.ai.editPolicy" as SettingId)?.default).toBe("trusted");
+    expect(byId.get("adcode.ai.keepGoing" as SettingId)?.default).toBe(true);
+    expect(byId.get("adcode.ai.sandboxQuota" as SettingId)?.default).toBe("5gb");
+    expect(byId.get("adcode.ai.sandboxRetention" as SettingId)?.default).toBe("7d");
+    expect(byId.get("adcode.ai.checkpointRetention" as SettingId)?.default).toBe("30d");
+    // Three agents at once: fast enough to feel parallel, gentle on a provider's rate limits.
+    expect(byId.get("adcode.ai.parallelAgents" as SettingId)?.default).toBe("3");
+    // Long chats keep going on their own: compaction is on, at 80% of the model's context.
+    expect(byId.get("adcode.ai.autoCompact" as SettingId)).toMatchObject({ kind: "boolean", default: true, available: true, group: "ai" });
+    expect(byId.get("adcode.ai.autoCompactAt" as SettingId)?.default).toBe("80");
+  });
+
+  it("keeps automatic compaction beside the other automation", () => {
+    const ids = SETTINGS_SCHEMA.map((setting) => setting.id as string);
+    const scheduled = ids.indexOf("adcode.ai.scheduledMessages");
+    expect(ids.slice(scheduled + 1, scheduled + 3)).toEqual(["adcode.ai.autoCompact", "adcode.ai.autoCompactAt"]);
+  });
+});
+
+describe("defaultSettings", () => {
+  it("returns a value for every setting in the schema", () => {
+    const defaults = defaultSettings();
+    expect(Object.keys(defaults).length).toBe(SETTINGS_SCHEMA.length);
+
+    for (const setting of SETTINGS_SCHEMA) {
+      expect(defaults[setting.id]).toBe(setting.default);
+    }
+  });
+});
+
+describe("validateSettings", () => {
+  it("fills missing keys from defaults", () => {
+    const result = validateSettings({ "adcode.editing.minimap": true });
+    expect(result["adcode.editing.minimap"]).toBe(true);
+    expect(result["adcode.editing.stickyScroll"]).toBe(false);
+  });
+
+  it("drops unknown keys rather than storing them", () => {
+    const result = validateSettings({ "adcode.not.a.real.setting": true });
+    expect("adcode.not.a.real.setting" in result).toBe(false);
+  });
+
+  it("rejects a wrong type and falls back to the default", () => {
+    const result = validateSettings({ "adcode.editing.minimap": "yes" });
+    expect(result["adcode.editing.minimap"]).toBe(false);
+  });
+
+  it("rejects an out-of-range enum value", () => {
+    const result = validateSettings({ "adcode.ads.frequency": "constant" });
+    expect(result["adcode.ads.frequency"]).toBe("standard");
+  });
+
+  it("survives hostile input without throwing", () => {
+    for (const hostile of [null, undefined, 42, "text", [], { __proto__: { polluted: true } }]) {
+      expect(() => validateSettings(hostile)).not.toThrow();
+    }
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
+
+  it("never returns a prototype-polluting key", () => {
+    const result = validateSettings(JSON.parse('{"__proto__":{"polluted":true}}'));
+    expect(Object.hasOwn(result, "__proto__")).toBe(false);
+  });
+});
+
+describe("migrate", () => {
+  it("stamps the current version onto unversioned data", () => {
+    const result = migrate({ version: undefined, values: { "adcode.editing.minimap": false } });
+    expect(result.version).toBe(SETTINGS_VERSION);
+    expect(result.values["adcode.editing.minimap"]).toBe(false);
+  });
+
+  it("returns defaults for data from a future version rather than guessing", () => {
+    // Downgrading is real: a user on two machines with different builds. Guessing at a
+    // schema this build has never seen would corrupt their settings silently.
+    const result = migrate({ version: SETTINGS_VERSION + 99, values: { anything: true } });
+    expect(result.version).toBe(SETTINGS_VERSION);
+    expect(result.values).toEqual(defaultSettings());
+  });
+
+  it("moves version 1 files onto automatic edits and keep going", () => {
+    // Version 1 wrote every value, defaults included, so a stored "review" is almost
+    // always the old default rather than a choice. Everything else is kept.
+    const result = migrate({
+      version: 1,
+      values: { "adcode.ai.editPolicy": "review", "adcode.ai.keepGoing": false, "adcode.editing.minimap": false },
+    });
+    expect(result.values["adcode.ai.editPolicy"]).toBe("trusted");
+    expect(result.values["adcode.ai.keepGoing"]).toBe(true);
+    expect(result.values["adcode.editing.minimap"]).toBe(false);
+  });
+
+  it("keeps Review once it is chosen on the current version", () => {
+    const result = migrate({ version: SETTINGS_VERSION, values: { "adcode.ai.editPolicy": "review", "adcode.ai.keepGoing": false } });
+    expect(result.values["adcode.ai.editPolicy"]).toBe("review");
+    expect(result.values["adcode.ai.keepGoing"]).toBe(false);
+  });
+
+  it("is idempotent", () => {
+    const once = migrate({ version: SETTINGS_VERSION, values: defaultSettings() });
+    const twice = migrate(once);
+    expect(twice).toEqual(once);
+  });
+});
+
+describe("grouping and search", () => {
+  it("returns settings for a group in schema order", () => {
+    const editing = settingsForGroup("editing");
+    expect(editing.length).toBe(21);
+    expect(editing.every((s) => s.group === "editing")).toBe(true);
+  });
+
+  it("finds settings by label, not just by id", () => {
+    const hits = searchSettings("minimap");
+    expect(hits.some((s) => s.id === "adcode.editing.minimap")).toBe(true);
+  });
+
+  it("is case- and whitespace-insensitive", () => {
+    expect(searchSettings("  MINIMAP ").length).toBeGreaterThan(0);
+  });
+
+  it("returns everything for an empty query", () => {
+    expect(searchSettings("").length).toBe(SETTINGS_SCHEMA.length);
+  });
+
+  it("returns nothing for a query that matches nothing", () => {
+    expect(searchSettings("zzzznope")).toEqual([]);
+  });
+});

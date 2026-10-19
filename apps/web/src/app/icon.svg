@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!--
+    The Agentfly mark on its own plate. Same fly as `components/Mark.tsx`.
+    Next serves this file as the favicon by the `icon.svg` name in `app/`.
+  -->
+  <rect width="1024" height="1024" rx="224" fill="#14120b"/>
+  <g fill="#f4f1ea">
+    <path d="M488 520C280 250 70 200 128 450C178 670 340 720 470 548C508 488 522 460 488 520Z"/>
+    <path d="M536 520C744 250 954 200 896 450C846 670 684 720 554 548C516 488 502 460 536 520Z"/>
+    <path d="M512 360c-40 0-64 78-64 176 0 140 26 268 64 340 38-72 64-200 64-340 0-98-24-176-64-176Z"/>
+    <circle cx="512" cy="318" r="52"/>
+  </g>
+</svg>

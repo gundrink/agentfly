@@ -1,0 +1,1247 @@
+/**
+ * The only place the renderer can reach the main process.
+ *
+ * Each handler validates its own arguments. The renderer is hostile by assumption
+ * (brief §1), so "the preload only sends well-formed messages" is not a safety property
+ * - a compromised renderer talks to `ipcRenderer` directly.
+ */
+import { stat } from "node:fs/promises";
+import { createProjectFolder } from "./newProject.ts";
+import { recordMilestone } from "./milestones.ts";
+import { GEMINI_KEY_PAGE, OLLAMA_DOWNLOAD_PAGE } from "../shared/quickConnect.ts";
+import { BrowserWindow, app, clipboard, dialog, ipcMain, shell } from "electron";
+import { isInsideWorkspace } from "./pathSafety.ts";
+import { clearAiUsage, readAiUsage } from "./aiUsage.ts";
+import { readTagflowAllowance, submitTagflowFeedback, tagflowAudience } from "./tagflowAi.ts";
+import {
+  detectPreviewProject,
+  previewLog,
+  previewStatus,
+  startPreview,
+  stopPreview,
+} from "./preview.ts";
+import { stripAnsi } from "./devCommand.ts";
+import { listListeningPorts, stopPort } from "./ports.ts";
+import { appendOutput, appendOutputEvent, outputHistory, setOutputSink } from "./output.ts";
+import {
+  completionAt,
+  definitionAt,
+  formattingFor,
+  configureLsp,
+  documentChanged,
+  documentClosed,
+  documentOpened,
+  hoverAt,
+  languageServerStates,
+  setCustomServers,
+  setLspEnabled,
+  setLspWorkspace,
+  toWireCompletion,
+} from "./lsp.ts";
+import { parseCustomServers } from "@adcode/lsp";
+import { restoreSession, saveSession } from "./session.ts";
+import type { SessionState } from "./sessionStore.ts";
+import {
+  clearDraft,
+  recordSave,
+  historyRead,
+  historyVersions,
+  recordDraft,
+  recoverableDrafts,
+} from "./history.ts";
+import { trackDraftWrite } from "./draftWrites.ts";
+import {
+  currentDebugState,
+  debugBreakpoints,
+  debugPause,
+  debugEvaluate,
+  debugProperties,
+  debugResume,
+  debugScopes,
+  debugStepInto,
+  debugStepOut,
+  debugStepOver,
+  startDebug,
+  stopDebug,
+  toggleBreakpoint,
+} from "./debug.ts";
+import { CHANNELS, IDE_VIEW_COMMANDS, type IdeView, type PreviewStatus, type RuntimeCheckView } from "../shared/api.ts";
+import { downloadUrlFor, installCommandFor, runtimeById, runtimeFor } from "../shared/runtimes.ts";
+import {
+  onKeybindingsChanged,
+  readKeybindings,
+  resetKeybindings,
+  writeKeybinding,
+} from "./keybindings.ts";
+import { findExecutable } from "./executables.ts";
+import { getAdRuntime } from "./adRuntime.ts";
+import {
+  currentSettings,
+  onSettingsChanged,
+  readSettings,
+  resetSettings,
+  writeSetting,
+} from "./settings.ts";
+import { mcpConnection, memoryList, memoryRemove, memoryWrite } from "./memory.ts";
+import { parseMemoryName, parseMemoryWrite } from "./memoryIpcValidation.ts";
+import { assistantControls } from "./assistantControls.ts";
+import { registerGitIpc } from "./gitIpc.ts";
+import { installApplicationMenu } from "./menu.ts";
+import { clearRecents, forgetRecent, recentFolders, rememberRecent } from "./recents.ts";
+import { collabFileChanged, disposeCollab, registerCollabIpc } from "./collabIpc.ts";
+import { gitAt, invalidateFileCache } from "./sourceControl.ts";
+import {
+  aiAnswerAnyway,
+  aiUndoCheckpoint,
+  aiSessionCheckpoints,
+  aiCancel,
+  aiCancelCompletion,
+  aiCancelInlineEdit,
+  aiCompletion,
+  aiInlineEdit,
+  aiReset,
+  aiSend,
+  aiStatus,
+  aiModelSettingsChanged,
+  aiStopToolProcesses,
+  aiCompact,
+  aiContextUsage,
+  clearProviderKey,
+  setProviderKey,
+  aiClearSessions,
+  aiCurrentSession,
+  aiDeleteSession,
+  aiRenameSession,
+  aiResumeSession,
+  aiSessions,
+  aiWorkspaceApply,
+  aiWorkspaceChanges,
+  aiWorkspaceDiscard,
+  aiWorkspaceRemove,
+  aiWorkspaceRollback,
+  aiAutomationCreate,
+  aiAutomationList,
+  aiAutomationClaimDue,
+  aiAutomationComplete,
+  aiAutomationMiss,
+  aiAutomationRetry,
+  aiAutomationCancel,
+  aiAutomationConfirmMissed,
+  aiAutomationMarkDueMissed,
+  aiWorkspaceTasks,
+  aiWorkspaceTraces,
+  aiCurrentWorkspaceTask,
+  checkProviderKey,
+  aiQuickConnect,
+  aiDetectOllama,
+  aiStartOllama,
+  aiTeamCancel,
+  aiTeamConfigure,
+  aiTeamList,
+  aiTeamRead,
+  aiTeamRemove,
+  aiTeamStart,
+  aiTeamSuggestion,
+  aiTeamTraces,
+  createAiTeamId,
+} from "./ai.ts";
+import { parseAiAttachments } from "./aiAttachmentsIpcValidation.ts";
+import { parseAiEditorContext } from "./aiWorkspaceContext.ts";
+import { parseAiCompletionInput, parseAiInlineEditInput } from "./aiCompletionIpcValidation.ts";
+import {
+  parseAiAutomationCreate,
+  validAiAutomationId,
+} from "./aiAutomationIpcValidation.ts";
+import {
+  parseAiWorkspaceApply,
+  validAiWorkspaceTaskId,
+} from "./aiWorkspaceIpcValidation.ts";
+import {
+  parseAiTeamConfigure,
+  parseAiTeamSuggestion,
+  validAiTeamId,
+} from "./aiTeamIpcValidation.ts";
+import {
+  createTerminal,
+  detectProfiles,
+  disposeTerminal,
+  resizeTerminal,
+  writeTerminal,
+} from "./terminal.ts";
+import {
+  currentWorkspace,
+  listDirectory,
+  onWorkspaceRootChanged,
+  openWorkspace,
+  openWorkspaceAt,
+  pickFileToOpen,
+  readImageFile,
+  readTextFile,
+  saveTextFileAs,
+  setWorkspaceRoot,
+  writeTextFile,
+} from "./workspace.ts";
+import {
+  copyEntry,
+  createFile,
+  createFolder,
+  deleteEntry,
+  duplicateEntry,
+  importEntry,
+  moveEntry,
+  renameEntry,
+  revealEntry,
+  trashEntry,
+} from "./fileOps.ts";
+
+const isString = (value: unknown): value is string => typeof value === "string";
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value);
+
+function broadcast(channel: string, ...args: unknown[]): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send(channel, ...args);
+  }
+}
+
+/**
+ * The preview's state can change without the renderer asking - closing a folder stops the
+ * server. The toolbar has to hear about that, or it sits there offering to open a URL that
+ * no longer answers.
+ */
+function broadcastPreview(status: PreviewStatus): void {
+  broadcast(CHANNELS.previewChanged, status);
+
+  // The transitions, in words. The static server produces no output of its own, so
+  // without this its channel would be permanently empty and its failures invisible.
+  if (status.error !== null && status.error !== undefined) {
+    appendOutputEvent(previewChannel(status), `failed: ${status.error}`);
+  } else if (status.running && status.url !== null) {
+    appendOutputEvent(previewChannel(status), `serving ${status.url}`);
+  }
+}
+
+/**
+ * The address is ours or it is not opened.
+ *
+ * A project's dev server chooses its own port and prints its own address, and that string
+ * ends up here on its way to `shell.openExternal`. `startsWith("http://127.0.0.1:")` was
+ * enough while ADCode bound the socket itself; it is not enough now that the string came
+ * out of somebody else's stdout. Parsed rather than pattern-matched, because
+ * `http://127.0.0.1:3000@evil.example` starts with exactly the right prefix.
+ */
+function isLoopback(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+
+    return ["127.0.0.1", "localhost", "[::1]", "::1"].includes(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The dev server's output, streamed to whoever is showing the log drawer.
+ *
+ * Status changes arrive on the same path because a project preview's URL is not known when
+ * `start` returns - it appears when the toolchain prints it, which can be a minute later.
+ */
+/**
+ * §4's escape hatch, applied.
+ *
+ * Both rows restart every running server, because neither can be honoured by one that is
+ * already up: turning the client off has to stop them, and changing the custom list changes
+ * which program a language should be talking to. They start again on the next edit.
+ */
+function applyLanguageSettings(values: Record<string, unknown>): void {
+  const enabled = values["adcode.language.lspClient"] !== false;
+  const custom = values["adcode.language.customServers"];
+
+  setCustomServers(
+    enabled && typeof custom === "string" ? parseCustomServers(custom) : [],
+  );
+  setLspEnabled(enabled);
+}
+
+const previewEvents = {
+  onStatus: (status: PreviewStatus) => broadcastPreview(status),
+  onOutput: (chunk: string) => {
+    const text = stripAnsi(chunk);
+    // Both surfaces, deliberately. The preview drawer shows this while you are looking at
+    // the preview; the Output panel keeps it so it can still be read afterwards.
+    broadcast(CHANNELS.previewOutput, text);
+    appendOutput("dev-server", text);
+  },
+};
+
+/** Which Output channel a preview status belongs in. */
+const previewChannel = (status: PreviewStatus) =>
+  status.mode === "project" ? "dev-server" : "live-server";
+
+export function registerIpc(openWindow: (role: "vibe" | "ide", file?: string, command?: string) => void): void {
+  let ideSession: SessionState | null = null;
+  // Output produced before this point is still recorded; it is replayed by `output:history`
+  // when a panel first opens.
+  setOutputSink((line) => broadcast(CHANNELS.outputAppend, line));
+
+  registerGitIpc();
+  registerCollabIpc({ workspaceRoot: () => currentWorkspace()?.root ?? null });
+
+  /*
+   * A session shares one folder, so changing the folder ends the session.
+   *
+   * Subscribed at the source for the same reason the LSP notification below is: the route that
+   * gets forgotten is session restore, because no user action triggers it. Leaving a session
+   * running across a folder change would leave guests editing documents backed by files the
+   * host is no longer looking at.
+   */
+  onWorkspaceRootChanged(() => {
+    void disposeCollab();
+    ideSession = null;
+  });
+
+  /*
+   * Language servers are per-workspace: rust-analyzer indexes a crate, pyright resolves
+   * against a project root. Pointing an existing one at a new folder is not something the
+   * protocol supports, so the old servers stop and new ones start on demand.
+   *
+   * Subscribed at the source rather than wired into each handler. The three routes that
+   * change the root are the open dialog, closing the folder, and session restore - and
+   * restore is the one that gets forgotten, because no user action triggers it, so the
+   * per-handler version worked everywhere except on every launch after the first.
+   */
+  onWorkspaceRootChanged((root) => setLspWorkspace(root));
+  setLspWorkspace(currentWorkspace()?.root ?? null);
+
+  // A dev server the assistant started belongs to the folder it started in, and so does the
+  // page its browser had open.
+  onWorkspaceRootChanged(() => aiStopToolProcesses());
+
+  /*
+   * The recent folders are part of the menu now, so every change to the list has to
+   * reach the menu the main process owns.
+   *
+   * Fire-and-forget, and never allowed to fail the operation it follows: rebuilding a menu
+   * is a cosmetic consequence of opening a folder, and a folder that opened successfully
+   * must not report an error because the File menu could not be redrawn afterwards.
+   */
+  const rebuildMenu = (): void => {
+    void installApplicationMenu().catch(() => {
+      /* the menu keeps whatever it had */
+    });
+  };
+
+  const remember = async (root: string): Promise<void> => {
+    await rememberRecent(root);
+    rebuildMenu();
+  };
+
+  ipcMain.handle(CHANNELS.workspaceOpen, async (event) => {
+    const opened = await openWorkspace();
+    if (opened !== null) {
+      await remember(opened.root);
+      for (const window of BrowserWindow.getAllWindows()) if (window.webContents !== event.sender) window.webContents.send(CHANNELS.workspaceChanged, opened);
+    }
+    return opened;
+  });
+
+  ipcMain.handle(CHANNELS.workspaceOpenPath, async (event, root: unknown) => {
+    if (!isString(root)) throw new Error("expected a folder path");
+
+    /*
+     * Checked before opening, so a stale recents row cannot set the workspace to a path that
+     * is not there. Without this the tree would render empty against a root that does not
+     * exist, which reads as the folder being empty rather than gone.
+     */
+    try {
+      const info = await stat(root);
+      if (!info.isDirectory()) return null;
+    } catch {
+      return null;
+    }
+
+    const opened = openWorkspaceAt(root);
+    if (opened !== null) {
+      await remember(opened.root);
+      for (const window of BrowserWindow.getAllWindows()) if (window.webContents !== event.sender) window.webContents.send(CHANNELS.workspaceChanged, opened);
+    }
+    return opened;
+  });
+
+  /*
+   * A new project from an idea: a fresh folder in Documents/ADCode Projects, opened the same
+   * way a recent folder is, so the tree, the recents list and every other window agree.
+   */
+  ipcMain.handle(CHANNELS.workspaceCreateProject, async (event, idea: unknown) => {
+    const root = await createProjectFolder(isString(idea) ? idea.slice(0, 500) : "");
+    // Tracked from the first file, so Changes shows what the assistant built and every edit
+    // can be reverted or committed. A machine without git still gets its project.
+    await gitAt(root).init().catch(() => undefined);
+    const opened = openWorkspaceAt(root);
+    if (opened !== null) {
+      await remember(opened.root);
+      for (const window of BrowserWindow.getAllWindows()) if (window.webContents !== event.sender) window.webContents.send(CHANNELS.workspaceChanged, opened);
+    }
+    return opened;
+  });
+
+
+  ipcMain.handle(CHANNELS.workspaceCurrent, () => currentWorkspace());
+  ipcMain.handle(CHANNELS.workspaceRecents, () => recentFolders());
+
+  ipcMain.handle(CHANNELS.workspaceForgetRecent, (_event, root: unknown) =>
+    isString(root) ? forgetRecent(root).finally(rebuildMenu) : recentFolders(),
+  );
+
+  ipcMain.handle(CHANNELS.workspaceClearRecents, () => clearRecents().finally(rebuildMenu));
+
+  ipcMain.handle(CHANNELS.filesOpenDialog, () => pickFileToOpen());
+
+  ipcMain.handle(CHANNELS.appInfo, () => ({
+    version: app.getVersion(),
+    electron: process.versions["electron"] ?? "",
+    chrome: process.versions["chrome"] ?? "",
+    node: process.versions["node"] ?? "",
+    platform: `${process.platform}-${process.arch}`,
+  }));
+
+  ipcMain.handle(CHANNELS.fsSaveAs, (_event, text: unknown, suggestedName: unknown) =>
+    isString(text) && isString(suggestedName) ? saveTextFileAs(text, suggestedName) : null,
+  );
+
+  ipcMain.handle(CHANNELS.workspaceClose, async (event) => {
+    setWorkspaceRoot(null);
+    for (const window of BrowserWindow.getAllWindows()) if (window.webContents !== event.sender) window.webContents.send(CHANNELS.workspaceChanged, null);
+    // The quick-open index and the git handle were both bound to the old root. The
+    // language servers were too, and `onWorkspaceRootChanged` above has already heard.
+    invalidateFileCache();
+
+    // So was the preview. Left running it would keep serving a folder the user has closed,
+    // over a URL that is still live in whatever browser tab they opened it in - and in
+    // project mode it would leave a dev server holding a port for the rest of the session.
+    broadcastPreview(await stopPreview());
+  });
+
+  ipcMain.handle(CHANNELS.sessionRestore, async () => {
+    const restored = await restoreSession();
+    ideSession ??= restored;
+
+    /*
+     * A restored folder counts as recently opened.
+     *
+     * Without this the list stays empty for anyone who only ever reopens the same project,
+     * because restoring never goes through the open dialog - so the one feature meant to save
+     * them from the folder picker would be blank for exactly the person who needs it least
+     * often and notice it most.
+     */
+    if (restored.root !== null) await remember(restored.root);
+
+    return restored;
+  });
+
+  /* ── Window ───────────────────────────────────────────────────────────── */
+
+  ipcMain.on(CHANNELS.windowFullScreen, (event) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    window?.setFullScreen(!window.isFullScreen());
+  });
+
+  ipcMain.on(CHANNELS.windowDevTools, (event) => {
+    event.sender.toggleDevTools();
+  });
+
+  ipcMain.on(CHANNELS.windowZoom, (event, direction: unknown) => {
+    if (typeof direction !== "number") return;
+
+    // Electron's zoom level is logarithmic; ±0.5 steps land on the same sequence of sizes
+    // the browser's own zoom uses, and clamping stops the UI from becoming unusable.
+    const next = direction === 0 ? 0 : event.sender.getZoomLevel() + Math.sign(direction) * 0.5;
+    event.sender.setZoomLevel(Math.max(-3, Math.min(4, next)));
+  });
+
+  // The Zoom setting, applied. A factor rather than a level, because the setting is a
+  // percentage people read; clamped to the setting's own range so a bad value cannot
+  // shrink the window past reading or blow it past fitting.
+  ipcMain.on(CHANNELS.windowSetZoom, (event, factor: unknown) => {
+    if (typeof factor !== "number" || !Number.isFinite(factor)) return;
+    event.sender.setZoomFactor(Math.max(0.5, Math.min(3, factor)));
+  });
+
+  ipcMain.handle(CHANNELS.aiUsageRead, (_event, range: unknown) => readAiUsage(range));
+  ipcMain.handle(CHANNELS.aiUsageAllowance, () => readTagflowAllowance());
+  ipcMain.handle(CHANNELS.aiModelFeedback, (_event, input: unknown) => submitTagflowFeedback(input));
+  ipcMain.handle(CHANNELS.aiAudience, (_event, input: unknown) => tagflowAudience(input));
+  ipcMain.handle(CHANNELS.aiUsageClear, () => clearAiUsage());
+
+  ipcMain.handle(CHANNELS.windowOpenIde, (_event, file: unknown, view: unknown) => {
+    const root = currentWorkspace()?.root ?? null;
+    const safeFile = typeof file === "string" && isInsideWorkspace(root, file) ? file : undefined;
+    const command = typeof view === "string" && Object.hasOwn(IDE_VIEW_COMMANDS, view)
+      ? IDE_VIEW_COMMANDS[view as IdeView]
+      : undefined;
+    openWindow("ide", safeFile, command);
+  });
+  ipcMain.handle(CHANNELS.windowOpenVibe, () => openWindow("vibe"));
+
+  ipcMain.handle(CHANNELS.historyVersions, (_event, path: unknown) =>
+    typeof path === "string" ? historyVersions(path) : [],
+  );
+
+  ipcMain.handle(CHANNELS.historyRead, (_event, path: unknown, id: unknown) =>
+    typeof path === "string" && typeof id === "string" ? historyRead(path, id) : null,
+  );
+
+  ipcMain.handle(CHANNELS.historyDrafts, () => recoverableDrafts());
+
+  ipcMain.on(CHANNELS.historyDraft, (_event, path: unknown, text: unknown) => {
+    // Tracked so a restart for an update can wait for it to reach disk (see draftWrites.ts).
+    if (typeof path === "string" && typeof text === "string") trackDraftWrite(recordDraft(path, text));
+  });
+
+  ipcMain.on(CHANNELS.historyClearDraft, (_event, path: unknown) => {
+    if (typeof path === "string") void clearDraft(path);
+  });
+
+  ipcMain.on(CHANNELS.sessionSave, (event, state: unknown) => {
+    const raw = (state ?? {}) as Record<string, unknown>;
+    const asString = (value: unknown): string | null =>
+      typeof value === "string" && value.length > 0 ? value : null;
+
+    // Shape only. `sessionStore` decides what a usable layout is, and the renderer
+    // clamps it to the real window - neither of which this layer can judge.
+    const layout = raw["layout"];
+
+    const root = currentWorkspace()?.root ?? null;
+    const parsed: SessionState = {
+      root,
+      openFiles: Array.isArray(raw["openFiles"])
+        ? raw["openFiles"].filter((value): value is string => typeof value === "string" && isInsideWorkspace(root, value))
+        : [],
+      activeFile: isInsideWorkspace(root, asString(raw["activeFile"]) ?? "") ? asString(raw["activeFile"]) : null,
+      workspaceMode: "vibe",
+      ...(typeof layout === "object" && layout !== null
+        ? {
+            layout: {
+              sidebarWidth: Number((layout as Record<string, unknown>)["sidebarWidth"]),
+              panelHeight: Number((layout as Record<string, unknown>)["panelHeight"]),
+            },
+          }
+        : {}),
+    };
+    const fromIde = event.sender.getURL().endsWith("#/ide");
+    if (fromIde) ideSession = parsed;
+    const editorState = !fromIde && ideSession?.root === root ? ideSession : parsed;
+    void saveSession({
+      ...editorState,
+      root,
+      workspaceMode: "vibe",
+    });
+  });
+
+  ipcMain.handle(CHANNELS.fsList, (_event, dirPath: unknown) => {
+    if (!isString(dirPath)) throw new Error("expected a path");
+    return listDirectory(dirPath);
+  });
+
+  ipcMain.handle(CHANNELS.fsRead, (_event, filePath: unknown) => {
+    if (!isString(filePath)) throw new Error("expected a path");
+    return readTextFile(filePath);
+  });
+
+  ipcMain.handle(CHANNELS.fsReadImage, (_event, filePath: unknown) => {
+    if (!isString(filePath)) throw new Error("expected a path");
+    return readImageFile(filePath);
+  });
+
+  ipcMain.handle(CHANNELS.fsWrite, async (_event, filePath: unknown, text: unknown) => {
+    if (!isString(filePath) || !isString(text)) throw new Error("expected a path and text");
+
+    const result = await writeTextFile(filePath, text);
+    // §4: local history records what was saved, not what was attempted - and a failed
+    // save leaves the draft in place, because the unsaved text is still the only copy.
+    if (result.ok) {
+      await recordSave(filePath, text);
+
+      /*
+       * Tell any running session the file moved underneath it.
+       *
+       * This is the ordinary save path - the one a host uses when they press Ctrl+S on a file
+       * they happen to be sharing. Without this the shared document keeps the text it had
+       * before the write, and the next save from any peer puts it back, silently reverting
+       * whatever just landed on disk.
+       */
+      await collabFileChanged(filePath);
+    }
+    return result;
+  });
+
+  /*
+   * Structural file operations.
+   *
+   * The arguments are only shape-checked here; `fileOps` owns the rules that matter -
+   * the name is one storable segment, the path stays inside the workspace, and neither
+   * the workspace root nor anything in `.git` can be renamed or deleted. Each returns an
+   * outcome rather than throwing, so the renderer always has something to report.
+   */
+  ipcMain.handle(CHANNELS.fsCreateFile, (_event, parentDir: unknown, name: unknown) =>
+    createFile(parentDir, name),
+  );
+
+  ipcMain.handle(CHANNELS.fsCreateFolder, (_event, parentDir: unknown, name: unknown) =>
+    createFolder(parentDir, name),
+  );
+
+  ipcMain.handle(CHANNELS.fsRename, (_event, target: unknown, name: unknown) =>
+    renameEntry(target, name),
+  );
+
+  ipcMain.handle(CHANNELS.fsTrash, (_event, target: unknown) => trashEntry(target));
+
+  ipcMain.handle(CHANNELS.fsDelete, (_event, target: unknown) => deleteEntry(target));
+
+  ipcMain.handle(CHANNELS.fsDuplicate, (_event, target: unknown) => duplicateEntry(target));
+
+  ipcMain.handle(CHANNELS.fsCopy, (_event, source: unknown, targetDir: unknown) =>
+    copyEntry(source, targetDir),
+  );
+
+  ipcMain.handle(CHANNELS.fsMove, (_event, source: unknown, targetDir: unknown) =>
+    moveEntry(source, targetDir),
+  );
+
+  ipcMain.handle(CHANNELS.fsImport, (_event, source: unknown, targetDir: unknown) =>
+    importEntry(source, targetDir),
+  );
+
+  ipcMain.handle(CHANNELS.fsReveal, (_event, target: unknown) => revealEntry(target));
+
+  ipcMain.handle(CHANNELS.clipboardWrite, (_event, text: unknown) => {
+    if (!isString(text)) throw new Error("expected text");
+    clipboard.writeText(text);
+  });
+
+  ipcMain.handle(CHANNELS.clipboardRead, () => clipboard.readText());
+
+  /* ── Chat history ─────────────────────────────────────────────────────── */
+
+  ipcMain.handle(CHANNELS.aiSessions, () => aiSessions());
+  ipcMain.handle(CHANNELS.aiSessionChanged, () => aiCurrentSession());
+
+  ipcMain.handle(CHANNELS.aiResumeSession, (_event, id: unknown) =>
+    isString(id) ? aiResumeSession(id) : null,
+  );
+
+  ipcMain.handle(CHANNELS.aiRenameSession, (_event, id: unknown, title: unknown) =>
+    isString(id) && isString(title) ? aiRenameSession(id, title) : aiSessions(),
+  );
+
+  ipcMain.handle(CHANNELS.aiDeleteSession, (_event, id: unknown) =>
+    isString(id) ? aiDeleteSession(id) : aiSessions(),
+  );
+
+  ipcMain.handle(CHANNELS.aiClearSessions, () => aiClearSessions());
+
+  ipcMain.handle(CHANNELS.aiCheckKey, (_event, provider: unknown, key: unknown) =>
+    isString(provider) && isString(key)
+      ? checkProviderKey(provider, key)
+      : { ok: false, message: "Nothing to check." },
+  );
+
+  ipcMain.handle(CHANNELS.aiQuickConnect, (_event, provider: unknown, key: unknown, model: unknown) =>
+    isString(provider) && isString(key) && key.length <= 1000
+      ? aiQuickConnect(provider, key, isString(model) ? model.slice(0, 200) : null)
+      : { ok: false, message: "Nothing to connect." },
+  );
+
+  ipcMain.handle(CHANNELS.aiDetectOllama, () => aiDetectOllama());
+  // Start Ollama on the person's click: the executable is found here, never named by the renderer.
+  ipcMain.handle(CHANNELS.aiStartOllama, () => aiStartOllama());
+
+  /*
+   * Where to get a key, by intent rather than by URL - the same rule as every other
+   * `shell.openExternal` here: a renderer that could pass any string would be a way out.
+   */
+  ipcMain.handle(CHANNELS.aiOpenKeyPage, async (_event, intent: unknown) => {
+    const url = intent === "gemini" ? GEMINI_KEY_PAGE : intent === "ollama" ? OLLAMA_DOWNLOAD_PAGE : null;
+    if (url !== null) await shell.openExternal(url);
+  });
+
+  /* ── Debugging ────────────────────────────────────────────────────────── */
+
+  ipcMain.handle(CHANNELS.debugState, () => currentDebugState());
+
+  ipcMain.handle(CHANNELS.debugStart, async (_event, path: unknown, languageId: unknown) => {
+    if (!isString(path) || !isString(languageId)) return;
+    await startDebug(path, languageId, currentWorkspace()?.root ?? null);
+  });
+
+  ipcMain.handle(CHANNELS.debugStop, () => stopDebug());
+
+  /*
+   * One channel, a closed set of verbs.
+   *
+   * The renderer is treated as hostile (§1), so the verb is checked against a map here
+   * rather than used to look up a method by name - which would be a way to call anything
+   * this module exports.
+   */
+  const CONTROLS: Readonly<Record<string, () => Promise<void>>> = {
+    resume: debugResume,
+    stepOver: debugStepOver,
+    stepInto: debugStepInto,
+    stepOut: debugStepOut,
+    pause: debugPause,
+  };
+
+  ipcMain.handle(CHANNELS.debugControl, async (_event, verb: unknown) => {
+    if (!isString(verb)) return;
+    const control = Object.hasOwn(CONTROLS, verb) ? CONTROLS[verb] : undefined;
+    await control?.();
+  });
+
+  ipcMain.handle(CHANNELS.debugToggleBreakpoint, (_event, path: unknown, line: unknown) => {
+    if (!isString(path) || !isFiniteNumber(line) || line < 1) return debugBreakpoints();
+    return toggleBreakpoint(path, Math.floor(line));
+  });
+
+  ipcMain.handle(CHANNELS.debugBreakpoints, () => debugBreakpoints());
+
+  ipcMain.handle(CHANNELS.debugEvaluate, async (_event, frameId: unknown, expression: unknown) => {
+    if (!isString(frameId) || !isString(expression) || expression.trim() === "") {
+      return { value: "Nothing to evaluate.", type: "error", error: true };
+    }
+    return debugEvaluate(frameId, expression);
+  });
+
+  ipcMain.handle(CHANNELS.debugScopes, (_event, frameId: unknown) =>
+    isString(frameId) ? debugScopes(frameId) : [],
+  );
+
+  ipcMain.handle(CHANNELS.debugProperties, (_event, objectId: unknown) =>
+    isString(objectId) ? debugProperties(objectId) : [],
+  );
+
+  ipcMain.handle(CHANNELS.terminalProfiles, () => detectProfiles());
+
+  ipcMain.handle(CHANNELS.terminalCreate, (_event, options: unknown) => {
+    const o = (options ?? {}) as Record<string, unknown>;
+    if (!isFiniteNumber(o["cols"]) || !isFiniteNumber(o["rows"])) {
+      throw new Error("expected cols and rows");
+    }
+
+    return createTerminal(
+      {
+        ...(isString(o["profileId"]) ? { profileId: o["profileId"] } : {}),
+        ...(isString(o["cwd"]) ? { cwd: o["cwd"] } : {}),
+        cols: o["cols"],
+        rows: o["rows"],
+      },
+      {
+        onData: (id, data) => broadcast(CHANNELS.terminalData, id, data),
+        onExit: (id, exitCode) => broadcast(CHANNELS.terminalExit, id, exitCode),
+      },
+    );
+  });
+
+  ipcMain.on(CHANNELS.terminalWrite, (_event, id: unknown, data: unknown) => {
+    if (isString(id) && isString(data)) writeTerminal(id, data);
+  });
+
+  ipcMain.on(CHANNELS.terminalResize, (_event, id: unknown, cols: unknown, rows: unknown) => {
+    if (isString(id) && isFiniteNumber(cols) && isFiniteNumber(rows)) resizeTerminal(id, cols, rows);
+  });
+
+  ipcMain.on(CHANNELS.terminalDispose, (_event, id: unknown) => {
+    if (isString(id)) disposeTerminal(id);
+  });
+
+  /*
+   * A link clicked in the terminal, on its way to the system browser.
+   *
+   * Every other `shell.openExternal` route takes no URL at all, because a renderer that
+   * can hand one over is a way out of the sandbox. The terminal is the exception: the
+   * address came out of the user's own shell output and there is nothing to look it up
+   * against. So it is parsed rather than pattern-matched, and only http and https leave
+   * - `file://` and anything stranger stop here.
+   */
+  ipcMain.handle(CHANNELS.terminalOpenLink, async (_event, url: unknown) => {
+    if (!isString(url)) return;
+
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return;
+      await shell.openExternal(parsed.toString());
+    } catch {
+      // Not a URL. xterm's matcher can disagree with `new URL`; a no-op is the right answer.
+    }
+  });
+
+  ipcMain.handle(CHANNELS.platformInfo, () => ({
+    platform: process.platform,
+    isPackaged: app.isPackaged,
+  }));
+
+  /* ── Live preview ─────────────────────────────────────────────────────── */
+
+  ipcMain.handle(CHANNELS.previewStart, async (_event, mode: unknown) => {
+    // The renderer is hostile by assumption: anything that is not one of the two known
+    // modes is read as "no preference" rather than passed along.
+    const requested = mode === "static" || mode === "project" ? mode : undefined;
+
+    const status = await startPreview(currentWorkspace()?.root ?? null, requested, previewEvents);
+    broadcastPreview(status);
+    if (status.running || status.starting) recordMilestone("preview_opened");
+    return status;
+  });
+
+  ipcMain.handle(CHANNELS.previewStop, async () => {
+    const status = await stopPreview();
+    broadcastPreview(status);
+    return status;
+  });
+
+  ipcMain.handle(CHANNELS.previewStatus, () => previewStatus());
+  ipcMain.handle(CHANNELS.previewLog, () => previewLog());
+
+  ipcMain.handle(CHANNELS.previewDetect, () =>
+    detectPreviewProject(currentWorkspace()?.root ?? null),
+  );
+
+  /*
+   * The renderer names the intent and supplies nothing. Accepting a URL here would hand a
+   * compromised renderer `shell.openExternal(anything)`, which is a way out of the sandbox
+   * wearing the costume of a convenience - and the only address worth opening is the one
+   * this process just bound anyway.
+   */
+  ipcMain.handle(CHANNELS.previewOpenExternal, async () => {
+    const { url } = previewStatus();
+    if (url === null || !isLoopback(url)) return;
+
+    await shell.openExternal(url);
+  });
+
+  /* ── Ports and output ─────────────────────────────────────────────────── */
+
+  /*
+   * The ports ADCode itself is holding, so the panel can say "Live Server" instead of
+   * leaving the user to recognise a pid. Read fresh on every call rather than cached: the
+   * preview starts and stops constantly and a stale label is worse than none.
+   */
+  const ownedPorts = (): Map<number, string> => {
+    const owned = new Map<number, string>();
+    const { url, running, mode } = previewStatus();
+    if (running && url !== null) {
+      const port = Number(new URL(url).port);
+      if (Number.isInteger(port) && port > 0) {
+        owned.set(port, mode === "project" ? "Dev Server" : "Live Server");
+      }
+    }
+    return owned;
+  };
+
+  ipcMain.handle(CHANNELS.portsList, () => listListeningPorts(ownedPorts()));
+
+  ipcMain.handle(CHANNELS.portsStop, async (_event, pid: unknown) => {
+    // The renderer is hostile by assumption. `stopPort` re-checks this, and additionally
+    // refuses ADCode's own pid, which no amount of validation here would catch.
+    if (!isFiniteNumber(pid)) return { ok: false, error: "Not a process id." };
+    return stopPort(pid);
+  });
+
+  /*
+   * A port number in, a loopback URL out. The renderer never supplies the address, so
+   * there is no string it can pass that reaches anywhere but this machine.
+   */
+  ipcMain.handle(CHANNELS.portsOpen, async (_event, port: unknown) => {
+    if (!isFiniteNumber(port) || !Number.isInteger(port) || port < 1 || port > 65535) return;
+    await shell.openExternal(`http://localhost:${port}`);
+  });
+
+  ipcMain.handle(CHANNELS.outputHistory, () => outputHistory());
+
+  /* ── Runtimes ─────────────────────────────────────────────────────────── */
+
+  /*
+   * "Is Python installed?", asked before the Run button types anything.
+   *
+   * The lookup is `findExecutable`, the same PATH-and-PATHEXT walk the language servers
+   * use - which matters on Windows, where an npm-installed tool is a `.cmd` shim that
+   * `spawn` cannot see without consulting PATHEXT. A check that reported "not installed"
+   * for a program the user has would be worse than no check at all.
+   *
+   * A command with no entry in the table returns null: ADCode has nothing useful to say
+   * about it, and the run goes ahead untouched.
+   */
+  ipcMain.handle(CHANNELS.runtimeCheck, (_event, command: unknown): RuntimeCheckView | null => {
+    if (!isString(command)) return null;
+
+    const runtime = runtimeFor(command);
+    if (runtime === null) return null;
+
+    return {
+      id: runtime.id,
+      label: runtime.label,
+      command,
+      found: findExecutable(command, process.platform) !== null,
+      url: downloadUrlFor(runtime, process.platform),
+      install: installCommandFor(runtime, process.platform),
+    };
+  });
+
+  /*
+   * The renderer names a runtime; this process owns the address.
+   *
+   * Same rule as `preview:open-external` above, for the same reason: a handler that opened
+   * whatever URL it was handed would be a way out of the sandbox wearing the costume of a
+   * convenience. The id is looked up here, and the result is checked to be https even
+   * though every entry in the table already is - the check is what keeps that true.
+   */
+  ipcMain.handle(CHANNELS.runtimeOpenInstall, async (_event, id: unknown) => {
+    if (!isString(id)) return;
+
+    const runtime = runtimeById(id);
+    if (runtime === null) return;
+
+    const url = downloadUrlFor(runtime, process.platform);
+    if (!url.startsWith("https://")) return;
+
+    await shell.openExternal(url);
+  });
+
+  /* ── Language servers ─────────────────────────────────────────────────── */
+
+  /*
+   * Every handler validates its own arguments, and these more carefully than most: they
+   * are on the keystroke path, they name a file and a language, and what they reach is a
+   * subprocess. A malformed path here would be forwarded to a language server as a URI.
+   */
+  ipcMain.on(CHANNELS.lspOpened, (_event, path: unknown, languageId: unknown, text: unknown) => {
+    if (isString(path) && isString(languageId) && isString(text)) {
+      documentOpened(path, languageId, text);
+    }
+  });
+
+  ipcMain.on(CHANNELS.lspChanged, (_event, path: unknown, languageId: unknown, text: unknown) => {
+    if (isString(path) && isString(languageId) && isString(text)) {
+      documentChanged(path, languageId, text);
+    }
+  });
+
+  ipcMain.on(CHANNELS.lspClosed, (_event, path: unknown, languageId: unknown) => {
+    if (isString(path) && isString(languageId)) documentClosed(path, languageId);
+  });
+
+  ipcMain.handle(
+    CHANNELS.lspCompletion,
+    async (_event, path: unknown, languageId: unknown, line: unknown, column: unknown) => {
+      if (!isString(path) || !isString(languageId)) return [];
+      if (!isFiniteNumber(line) || !isFiniteNumber(column)) return [];
+
+      const items = await completionAt(path, languageId, line, column);
+      return items.map(toWireCompletion).filter((item) => item !== null);
+    },
+  );
+
+  ipcMain.handle(
+    CHANNELS.lspDefinition,
+    async (_event, path: unknown, languageId: unknown, line: unknown, column: unknown) => {
+      if (!isString(path) || !isString(languageId)) return null;
+      if (!isFiniteNumber(line) || !isFiniteNumber(column)) return null;
+
+      return definitionAt(path, languageId, line, column);
+    },
+  );
+
+  ipcMain.handle(
+    CHANNELS.lspFormatting,
+    async (_event, path: unknown, languageId: unknown, options: unknown) => {
+      if (!isString(path) || !isString(languageId)) return null;
+
+      // The renderer's numbers are checked here rather than trusted: they end up in a
+      // request to a subprocess, and §1 treats the renderer as hostile.
+      const raw = (options ?? {}) as { tabSize?: unknown; insertSpaces?: unknown };
+      const tabSize = isFiniteNumber(raw.tabSize) ? Math.min(16, Math.max(1, raw.tabSize)) : 2;
+      const insertSpaces = raw.insertSpaces !== false;
+
+      return formattingFor(path, languageId, { tabSize, insertSpaces });
+    },
+  );
+
+  ipcMain.handle(
+    CHANNELS.lspHover,
+    (_event, path: unknown, languageId: unknown, line: unknown, column: unknown) => {
+      if (!isString(path) || !isString(languageId)) return null;
+      if (!isFiniteNumber(line) || !isFiniteNumber(column)) return null;
+
+      return hoverAt(path, languageId, line, column);
+    },
+  );
+
+  ipcMain.handle(CHANNELS.lspStates, () => languageServerStates());
+
+  configureLsp({
+    onDiagnostics: (file, diagnostics) => broadcast(CHANNELS.lspDiagnostics, file, diagnostics),
+    onState: (list) => broadcast(CHANNELS.lspStateChanged, list),
+  });
+
+  ipcMain.handle(CHANNELS.memoryConnection, () => mcpConnection());
+  ipcMain.handle(CHANNELS.memoryList, () => memoryList());
+  ipcMain.handle(CHANNELS.memoryWrite, (_event, raw: unknown) => {
+    const input = parseMemoryWrite(raw);
+    return input === null ? null : memoryWrite(input);
+  });
+  ipcMain.handle(CHANNELS.memoryRemove, (_event, raw: unknown) => {
+    const name = parseMemoryName(raw);
+    return name === null ? false : memoryRemove(name);
+  });
+
+  ipcMain.handle(CHANNELS.settingsRead, () => readSettings());
+
+  ipcMain.handle(CHANNELS.settingsWrite, (_event, id: unknown, value: unknown) => {
+    if (!isString(id)) throw new Error("expected a setting id");
+    if (typeof value !== "boolean" && !isString(value)) throw new Error("expected a value");
+    return writeSetting(id, value);
+  });
+
+  ipcMain.handle(CHANNELS.settingsReset, () => resetSettings());
+
+  /* ── Keyboard shortcuts ───────────────────────────────────────────────── */
+
+  ipcMain.handle(CHANNELS.keybindingsRead, () => readKeybindings());
+
+  ipcMain.handle(CHANNELS.keybindingsWrite, (_event, command: unknown, chord: unknown) => {
+    if (!isString(command)) throw new Error("expected a command id");
+    if (chord !== null && !isString(chord)) throw new Error("expected a chord or null");
+
+    // The store validates the chord itself and drops an unbindable one. Doing it there
+    // rather than here is what makes a hand-edited file safe too, and there is no second
+    // rule for what counts as bindable.
+    return writeKeybinding(command, chord);
+  });
+
+  ipcMain.handle(CHANNELS.keybindingsReset, (_event, command: unknown) =>
+    resetKeybindings(isString(command) ? command : undefined),
+  );
+
+  /*
+   * Every change rebuilds the application menu.
+   *
+   * Not an optimisation to skip: Electron registers accelerators from the menu, so until
+   * this runs the old chord is still live and the new one does nothing. Rebuilding is the
+   * whole mechanism by which a remap takes effect without a restart.
+   */
+  onKeybindingsChanged((overrides) => {
+    broadcast(CHANNELS.keybindingsChanged, overrides);
+    void installApplicationMenu();
+  });
+
+
+  onSettingsChanged((values) => {
+    aiModelSettingsChanged();
+    broadcast(CHANNELS.settingsChanged, values);
+    applyLanguageSettings(values);
+  });
+
+  // The cached values rather than a read: this runs during registration, and the first
+  // `onSettingsChanged` will correct it the moment the file has actually been loaded.
+  applyLanguageSettings(currentSettings());
+
+  ipcMain.handle(CHANNELS.aiProviders, () => aiStatus());
+  ipcMain.handle(CHANNELS.aiControlsRead, () => assistantControls().snapshot());
+  ipcMain.handle(CHANNELS.aiControlsAction, (_event, input: unknown) => assistantControls().action(input));
+  ipcMain.handle(CHANNELS.aiControlsPreviewSkill, (_event, id: unknown) => {
+    if (typeof id !== "string" || id.length > 2048) throw new Error("Invalid skill ID.");
+    return assistantControls().previewSkill(id);
+  });
+
+  ipcMain.handle(CHANNELS.aiSetKey, (_event, provider: unknown, key: unknown) => {
+    if (!isString(provider) || !isString(key)) throw new Error("expected a provider and key");
+    return setProviderKey(provider, key);
+  });
+
+  ipcMain.handle(CHANNELS.aiClearKey, (_event, provider: unknown) => {
+    if (!isString(provider)) throw new Error("expected a provider");
+    return clearProviderKey(provider);
+  });
+
+  ipcMain.handle(CHANNELS.aiSend, (_event, text: unknown, attachments: unknown, editor: unknown) => {
+    if (!isString(text)) throw new Error("expected text");
+    return aiSend(text, parseAiAttachments(attachments), parseAiEditorContext(editor));
+  });
+
+  ipcMain.handle(CHANNELS.aiCompletion, (_event, input: unknown) =>
+    aiCompletion(parseAiCompletionInput(input)),
+  );
+  ipcMain.on(CHANNELS.aiCancelCompletion, (_event, requestId: unknown) => {
+    if (Number.isSafeInteger(requestId) && (requestId as number) >= 0) {
+      aiCancelCompletion(requestId as number);
+    }
+  });
+
+  ipcMain.handle(CHANNELS.aiInlineEdit, (_event, input: unknown) =>
+    aiInlineEdit(parseAiInlineEditInput(input)),
+  );
+  ipcMain.on(CHANNELS.aiCancelInlineEdit, () => aiCancelInlineEdit());
+
+  ipcMain.on(CHANNELS.aiCancel, () => aiCancel());
+  ipcMain.on(CHANNELS.aiReset, () => aiReset());
+  // The focus is checked in aiCompact: anything but a short string is refused there.
+  ipcMain.handle(CHANNELS.aiCompact, (_event, focus: unknown) => aiCompact(focus));
+  ipcMain.handle(CHANNELS.aiContextUsage, () => aiContextUsage());
+  ipcMain.on(CHANNELS.aiAnswerAnyway, () => aiAnswerAnyway());
+
+  ipcMain.handle(CHANNELS.aiCheckpointUndo, (_event, id: unknown, force: unknown) =>
+    typeof id === "string"
+      ? aiUndoCheckpoint(id, force === true)
+      : { ok: false, restored: [], conflicts: [], message: "Nothing to undo." },
+  );
+  ipcMain.handle(CHANNELS.aiCheckpoints, (_event, sessionId: unknown) =>
+    typeof sessionId === "string" ? aiSessionCheckpoints(sessionId) : [],
+  );
+
+  ipcMain.handle(CHANNELS.aiWorkspaceList, () => aiWorkspaceTasks());
+  ipcMain.handle(CHANNELS.aiWorkspaceCurrent, () => aiCurrentWorkspaceTask());
+  ipcMain.handle(CHANNELS.aiWorkspaceChanges, (_event, taskId: unknown) => {
+    if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+    return aiWorkspaceChanges(taskId);
+  });
+  ipcMain.handle(CHANNELS.aiWorkspaceTraces, (_event, taskId: unknown) => {
+    if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+    return aiWorkspaceTraces(taskId);
+  });
+  ipcMain.handle(
+    CHANNELS.aiWorkspaceApply,
+    (_event, taskId: unknown, rawSelections: unknown) => {
+      if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+      const selections = parseAiWorkspaceApply(rawSelections);
+      if (selections === null) throw new Error("expected reviewed hunk selections");
+      return aiWorkspaceApply(taskId, selections);
+    },
+  );
+  ipcMain.handle(CHANNELS.aiWorkspaceDiscard, (_event, taskId: unknown) => {
+    if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+    return aiWorkspaceDiscard(taskId);
+  });
+  ipcMain.handle(CHANNELS.aiWorkspaceRemove, (_event, taskId: unknown) => {
+    if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+    return aiWorkspaceRemove(taskId);
+  });
+  ipcMain.handle(CHANNELS.aiWorkspaceRollback, (_event, taskId: unknown) => {
+    if (!validAiWorkspaceTaskId(taskId)) throw new Error("expected a task id");
+    return aiWorkspaceRollback(taskId);
+  });
+  ipcMain.handle(CHANNELS.aiAutomationCreate, (_event, raw: unknown) => {
+    const input = parseAiAutomationCreate(raw);
+    if (input === null) throw new Error("expected a bounded AI schedule");
+    return aiAutomationCreate(input);
+  });
+  ipcMain.handle(CHANNELS.aiAutomationList, () => aiAutomationList());
+  ipcMain.handle(CHANNELS.aiAutomationClaim, () => aiAutomationClaimDue());
+  ipcMain.handle(CHANNELS.aiAutomationComplete, (_event, id: unknown) => {
+    if (!validAiAutomationId(id)) throw new Error("expected an automation id");
+    return aiAutomationComplete(id);
+  });
+  ipcMain.handle(CHANNELS.aiAutomationMiss, (_event, id: unknown, reason: unknown) => {
+    if (!validAiAutomationId(id) || !isString(reason)) {
+      throw new Error("expected an automation id and reason");
+    }
+    return aiAutomationMiss(id, reason);
+  });
+  ipcMain.handle(
+    CHANNELS.aiAutomationRetry,
+    (_event, id: unknown, reason: unknown, dueAt: unknown) => {
+      if (!validAiAutomationId(id) || !isString(reason) || !isFiniteNumber(dueAt)) {
+        throw new Error("expected an automation retry");
+      }
+      return aiAutomationRetry(id, reason, dueAt);
+    },
+  );
+  ipcMain.handle(CHANNELS.aiAutomationCancel, (_event, id: unknown) => {
+    if (!validAiAutomationId(id)) throw new Error("expected an automation id");
+    return aiAutomationCancel(id);
+  });
+  ipcMain.handle(CHANNELS.aiAutomationConfirmMissed, (_event, id: unknown) => {
+    if (!validAiAutomationId(id)) throw new Error("expected an automation id");
+    return aiAutomationConfirmMissed(id);
+  });
+  ipcMain.handle(CHANNELS.aiAutomationMarkDueMissed, () => aiAutomationMarkDueMissed());
+  ipcMain.handle(CHANNELS.aiTeamSuggest, (_event, raw: unknown) => {
+    const input = parseAiTeamSuggestion(raw);
+    return input === null ? null : aiTeamSuggestion(input);
+  });
+  ipcMain.handle(CHANNELS.aiTeamConfigure, (_event, raw: unknown) => {
+    const id = createAiTeamId();
+    const input = parseAiTeamConfigure(raw, id);
+    if (input === null) throw new Error("expected a bounded Team plan");
+    return aiTeamConfigure(id, input);
+  });
+  ipcMain.handle(CHANNELS.aiTeamList, () => aiTeamList());
+  ipcMain.handle(CHANNELS.aiTeamRead, (_event, id: unknown) => {
+    if (!validAiTeamId(id)) throw new Error("expected a Team id");
+    return aiTeamRead(id);
+  });
+  ipcMain.handle(CHANNELS.aiTeamStart, (_event, id: unknown) => {
+    if (!validAiTeamId(id)) throw new Error("expected a Team id");
+    return aiTeamStart(id);
+  });
+  ipcMain.handle(CHANNELS.aiTeamCancel, (_event, id: unknown) => {
+    if (!validAiTeamId(id)) throw new Error("expected a Team id");
+    return aiTeamCancel(id);
+  });
+  ipcMain.handle(CHANNELS.aiTeamTraces, (_event, id: unknown) => {
+    if (!validAiTeamId(id)) throw new Error("expected a Team id");
+    return aiTeamTraces(id);
+  });
+  ipcMain.handle(CHANNELS.aiTeamRemove, (_event, id: unknown) => {
+    if (!validAiTeamId(id)) throw new Error("expected a Team id");
+    return aiTeamRemove(id);
+  });
+
+  const ads = getAdRuntime();
+
+  ipcMain.on(CHANNELS.adPainted, (_event, creativeId: unknown) => {
+    if (isString(creativeId)) ads.notePainted(creativeId);
+  });
+
+  ipcMain.on(CHANNELS.adDismissed, (_event, creativeId: unknown) => {
+    if (isString(creativeId)) ads.noteDismissed(creativeId);
+  });
+
+  ipcMain.on(CHANNELS.adClicked, (_event, creativeId: unknown) => {
+    if (isString(creativeId)) ads.noteClicked(creativeId);
+  });
+
+  ipcMain.on(CHANNELS.adSuppressionChanged, (_event, suppressed: unknown) => {
+    if (typeof suppressed === "boolean") ads.setSuppressed(suppressed);
+  });
+
+  /*
+   * The editor describing itself to the ad client.
+   *
+   * Validated field by field rather than trusted, and each field applied independently:
+   * a renderer that somehow sends a good theme and a malformed file list should still get
+   * its logo in the right colour. Anything unrecognised is dropped, never coerced - the
+   * tagger intersects against a compiled-in vocabulary anyway, so the worst a bad value
+   * can do here is contribute no tags.
+   */
+  ipcMain.on(CHANNELS.adSignals, (_event, signals: unknown) => {
+    if (typeof signals !== "object" || signals === null) return;
+    const value = signals as Record<string, unknown>;
+
+    const theme = value["themeKind"];
+    if (theme === "light" || theme === "dark") ads.setThemeKind(theme);
+
+    const languageIds = value["languageIds"];
+    const filenames = value["filenames"];
+    if (
+      Array.isArray(languageIds) &&
+      languageIds.every(isString) &&
+      Array.isArray(filenames) &&
+      filenames.every(isString)
+    ) {
+      ads.setWorkspaceSignals(languageIds, filenames);
+    }
+  });
+
+  ipcMain.handle(CHANNELS.adRefreshEarnings, () => ads.refreshEarnings());
+}

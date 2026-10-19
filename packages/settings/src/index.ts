@@ -1,0 +1,793 @@
+/**
+ * Settings schema, defaults, and migration.
+ *
+ * Brief §4: "every item has an `adcode.*` boolean or enum setting so the user can switch
+ * it off." This file is the single place that promise is written down, and §3 makes the
+ * settings screen "where the 'turn anything off' promise is actually kept."
+ *
+ * Plain TypeScript: no Electron, no DOM, no I/O. Persistence belongs to the main process;
+ * this package only says what a setting is, what it defaults to, and whether some
+ * arbitrary JSON off the disk is a valid value for it.
+ *
+ * `available: false` marks a setting whose feature is not built yet. Showing the toggle
+ * keeps the screen honest about the full §4 roster; disabling it keeps the screen honest
+ * about what actually works today. Silently listing a switch that does nothing would be
+ * worse than either.
+ */
+
+/** 2: AI edits apply automatically and Keep going is on (see `migrate`). */
+export const SETTINGS_VERSION = 2;
+
+export type SettingGroupId =
+  | "editing"
+  | "formatting"
+  | "git"
+  | "navigation"
+  | "structure"
+  | "language"
+  | "session"
+  | "ai"
+  | "appearance"
+  | "updates"
+  | "ads";
+
+export interface SettingGroup {
+  readonly id: SettingGroupId;
+  readonly title: string;
+  readonly caption: string;
+}
+
+/**
+ * §3 says "the six feature groups in §4", but §4 lists seven (Editing, Formatting, Git,
+ * Navigation, Language, Session, AI) - AI is cross-referenced to §5, which is probably
+ * why it was not counted. All seven appear here, plus Appearance for §3's density
+ * setting and Ads for §1's local kill switch and §8.1's frequency presets.
+ */
+export const GROUPS: readonly SettingGroup[] = [
+  { id: "ads", title: "Ads & Earnings", caption: "Sponsored messages appear on your terms. Turning them off is a real option." },
+  { id: "appearance", title: "Appearance", caption: "iOS spacing is generous; a 13-inch laptop is not. Density is yours to choose." },
+  { id: "editing", title: "Editing", caption: "The editing surface itself." },
+  { id: "formatting", title: "Formatting", caption: "Formatting and diagnostics." },
+  { id: "git", title: "Git", caption: "Source control, built in." },
+  { id: "navigation", title: "Navigation", caption: "Finding your way around a codebase." },
+  { id: "structure", title: "Structure", caption: "Reading the shape of a project, and what connects to what." },
+  { id: "language", title: "Language", caption: "Language servers, debugging, and highlighting." },
+  { id: "session", title: "Session", caption: "What survives a restart." },
+  { id: "updates", title: "Updates", caption: "New versions install quietly and apply when you next restart." },
+  { id: "ai", title: "AI", caption: "One memory, shared by every AI you work with." },
+];
+
+interface BaseSetting {
+  readonly id: string;
+  readonly group: SettingGroupId;
+  readonly label: string;
+  readonly description: string;
+  /** False when the feature is not built yet; the row renders disabled. */
+  readonly available: boolean;
+}
+
+export interface BooleanSetting extends BaseSetting {
+  readonly kind: "boolean";
+  readonly default: boolean;
+}
+
+export interface EnumOption {
+  readonly value: string;
+  readonly label: string;
+  readonly detail?: string;
+}
+
+export interface EnumSetting extends BaseSetting {
+  readonly kind: "enum";
+  readonly default: string;
+  readonly options: readonly EnumOption[];
+}
+
+/**
+ * A free-text setting.
+ *
+ * Exists for one row: the language-server escape hatch §4 describes as "the escape hatch
+ * that replaces an extension system for languages you did not bundle". There is no way to
+ * express "run this command for this language" as a checkbox or a dropdown, and inventing
+ * a whole editor for it would be a worse answer than a text box people can paste into.
+ *
+ * `maxLength` is not decoration. This value is read off disk, and every character of it
+ * eventually reaches a command line.
+ */
+export interface TextSetting extends BaseSetting {
+  readonly kind: "text";
+  readonly default: string;
+  readonly placeholder: string;
+  readonly multiline: boolean;
+  readonly maxLength: number;
+}
+
+export type Setting = BooleanSetting | EnumSetting | TextSetting;
+export type SettingValue = boolean | string;
+export type SettingId = string;
+export type SettingsValues = Record<SettingId, SettingValue>;
+
+const bool = (
+  id: string,
+  group: SettingGroupId,
+  label: string,
+  description: string,
+  defaultValue: boolean,
+  available = false,
+): BooleanSetting => ({ id, group, label, description, kind: "boolean", default: defaultValue, available });
+
+export const SETTINGS_SCHEMA: readonly Setting[] = [
+  /* ── Updates ────────────────────────────────────────────────────────── */
+  bool(
+    "adcode.updates.auto",
+    "updates",
+    "Install updates automatically",
+    "Downloads new versions in the background and applies them the next time you restart. ADCode never restarts itself or interrupts you to ask.",
+    true,
+    true,
+  ),
+
+  bool(
+    "adcode.updates.announce",
+    "updates",
+    "Tell me what changed",
+    "After an update installs, show a short note about what is new. Once per version, never while you are typing or running something, and only for releases worth mentioning. What's New under Help has every note whether this is on or off.",
+    true,
+    true,
+  ),
+
+  /* ── Ads (§1, §8.1) ─────────────────────────────────────────────────── */
+  bool(
+    "adcode.ads.enabled",
+    "ads",
+    "Sponsored messages",
+    "A local kill switch. Turning this off stops everything on this machine, whatever the server says.",
+    true,
+    true,
+  ),
+  {
+    id: "adcode.ads.frequency",
+    group: "ads",
+    kind: "enum",
+    label: "Frequency",
+    description:
+      "Caps are enforced on this machine. The server may only ever tighten them, never loosen them.",
+    default: "standard",
+    available: true,
+    options: [
+      { value: "off", label: "Off", detail: "Never" },
+      { value: "light", label: "Light", detail: "30 min · 8/day" },
+      { value: "standard", label: "Standard", detail: "10 min · 24/day" },
+      { value: "max", label: "Max", detail: "5 min · 60/day" },
+    ],
+  },
+
+  /* ── Appearance (§3) ────────────────────────────────────────────────── */
+  {
+    id: "adcode.appearance.density",
+    group: "appearance",
+    kind: "enum",
+    label: "Density",
+    description: "Row height and spacing throughout the workbench.",
+    default: "comfortable",
+    available: true,
+    options: [
+      { value: "comfortable", label: "Comfortable" },
+      { value: "compact", label: "Compact" },
+    ],
+  },
+  {
+    id: "adcode.appearance.theme",
+    group: "appearance",
+    kind: "enum",
+    label: "Appearance",
+    description: "Dark by default. Choose Light, Midnight, or follow your system.",
+    default: "dark",
+    available: true,
+    options: [
+      { value: "system", label: "System" },
+      { value: "light", label: "Light" },
+      { value: "dark", label: "Dark" },
+      // Not a brightness. Midnight is the palette adcode.dev wears - true black, greyscale
+      // chrome, green reserved for money - so it deliberately does not follow the system.
+      { value: "midnight", label: "Midnight" },
+    ],
+  },
+  /*
+   * Zoom and text size are two settings rather than one because they answer two
+   * complaints. "Everything is tiny on this screen" wants the whole window bigger, chrome
+   * included. "I can't read the code" wants the words bigger and the layout left alone -
+   * zooming the window to read the editor costs a third of the sidebar for no reason.
+   * Both are values in Settings, not just shortcuts, so the size survives a restart and the
+   * row shows what the shortcuts did.
+   */
+  {
+    id: "adcode.appearance.zoom",
+    group: "appearance",
+    kind: "enum",
+    label: "Zoom",
+    description: "The size of the whole window - menus, panels, text and all. Ctrl+= and Ctrl+- step through these; Ctrl+0 goes back to 100%.",
+    default: "100",
+    available: true,
+    options: [
+      { value: "80", label: "80%" },
+      { value: "90", label: "90%" },
+      { value: "100", label: "100%", detail: "Default" },
+      { value: "110", label: "110%" },
+      { value: "125", label: "125%" },
+      { value: "150", label: "150%" },
+      { value: "175", label: "175%" },
+      { value: "200", label: "200%" },
+    ],
+  },
+  {
+    id: "adcode.appearance.textSize",
+    group: "appearance",
+    kind: "enum",
+    label: "Text size",
+    description: "The size of what you read - code in the editor, the terminal, and chat messages - without zooming the rest of the window. Ctrl+Alt+= and Ctrl+Alt+- change it; Ctrl+Alt+0 resets it.",
+    default: "default",
+    available: true,
+    options: [
+      { value: "small", label: "Small" },
+      { value: "default", label: "Default" },
+      { value: "large", label: "Large" },
+      { value: "larger", label: "Larger" },
+      { value: "largest", label: "Largest" },
+    ],
+  },
+  {
+    id: "adcode.appearance.motion",
+    group: "appearance",
+    kind: "enum",
+    label: "Motion",
+    description: "Animation in the window: messages rising in, mascots moving, code typing in. Follow system uses your computer's reduce-motion setting.",
+    default: "system",
+    available: true,
+    options: [
+      { value: "system", label: "Follow system" },
+      { value: "reduce", label: "Reduce", detail: "Still, instant changes" },
+      { value: "full", label: "Full" },
+    ],
+  },
+
+  /*
+   * How agents look in the chat. The assistant's name and face are the user's to pick:
+   * a chat that answers as "Assistant" in a blue circle forever is somebody else's product.
+   * Named agents already carry their own look (the agent editor), so these rows are for the
+   * built-in assistant and for how every agent's replies are laid out.
+   */
+  {
+    id: "adcode.appearance.assistantName",
+    group: "appearance",
+    kind: "text",
+    label: "Assistant name",
+    description: "What the built-in assistant is called in the chat - above its replies, on its live window, and while it is writing.",
+    default: "Assistant",
+    available: true,
+    placeholder: "Assistant",
+    multiline: false,
+    maxLength: 40,
+  },
+  {
+    id: "adcode.appearance.assistantShape",
+    group: "appearance",
+    kind: "enum",
+    label: "Assistant shape",
+    description: "The built-in assistant's mascot shape in the chat.",
+    default: "circle",
+    available: true,
+    options: [
+      { value: "circle", label: "Circle" },
+      { value: "capsule", label: "Capsule" },
+      { value: "pebble", label: "Pebble" },
+      { value: "drop", label: "Drop" },
+      { value: "hexagon", label: "Hexagon" },
+      { value: "cloud", label: "Cloud" },
+      { value: "squircle", label: "Squircle" },
+      { value: "egg", label: "Egg" },
+    ],
+  },
+  {
+    id: "adcode.appearance.assistantColor",
+    group: "appearance",
+    kind: "enum",
+    label: "Assistant colour",
+    description: "The built-in assistant's mascot colour in the chat.",
+    default: "blue",
+    available: true,
+    options: [
+      { value: "blue", label: "Blue" },
+      { value: "teal", label: "Teal" },
+      { value: "green", label: "Green" },
+      { value: "lime", label: "Lime" },
+      { value: "amber", label: "Amber" },
+      { value: "orange", label: "Orange" },
+      { value: "coral", label: "Coral" },
+      { value: "pink", label: "Pink" },
+      { value: "violet", label: "Violet" },
+      { value: "slate", label: "Slate" },
+    ],
+  },
+  bool("adcode.appearance.agentAvatars", "appearance", "Show who is replying", "Put the agent's face and name above its replies in the chat, and on the line that says it is writing.", true, true),
+  {
+    id: "adcode.appearance.messageStyle",
+    group: "appearance",
+    kind: "enum",
+    label: "Reply style",
+    description: "How replies sit in the chat. Document runs replies full width, like a page; Bubbles puts each reply in a soft card, like a messaging app; Compact tightens the spacing to fit more on screen.",
+    default: "document",
+    available: true,
+    options: [
+      { value: "document", label: "Document" },
+      { value: "bubbles", label: "Bubbles" },
+      { value: "compact", label: "Compact" },
+    ],
+  },
+
+  /* ── Editing (§4) ───────────────────────────────────────────────────── */
+  bool("adcode.editing.bracketPairColorization", "editing", "Bracket pair colorization", "Colour matching brackets by depth.", true, true),
+  bool("adcode.editing.inlineErrorLens", "editing", "Inline error and warning lens", "Show diagnostics at the end of the line they belong to. One per line, and never on the line you are typing on.", false, true),
+  bool("adcode.editing.inlineGitBlame", "editing", "Inline git blame", "Show the last author and commit beside the cursor's line.", false, true),
+  bool("adcode.editing.stickyScroll", "editing", "Sticky scroll", "Pin enclosing scopes to the top of the editor while scrolling.", false, true),
+  bool("adcode.editing.indentGuides", "editing", "Indent guides", "Vertical rules showing indentation depth.", true, true),
+  bool("adcode.editing.todoHighlighting", "editing", "TODO and FIXME highlighting", "Highlight TODO, FIXME, HACK, XXX and NOTE - inside comments only, never the word appearing in code.", true, true),
+  bool("adcode.editing.spellCheck", "editing", "Check spelling in comments", "Underline misspelled words in comments and offer the fix. Only words with a known correction are flagged - an unfamiliar name, library, or abbreviation is left alone rather than underlined, so this never has to be switched off to stop the noise. Code is never checked; an identifier is named, not spelled.", false, true),
+  bool("adcode.editing.commentTones", "editing", "Colour comments by intent", "Colour a comment by the character it starts with: ! for a warning, ? for an open question, * for the part worth reading first, and a repeated // for code you commented out. Line comments only - a /** block */ begins with * by convention, and colouring those would mark every documented function in a project.", false, true),
+  bool("adcode.editing.autoCloseTags", "editing", "Close tags automatically", "Typing the end of an opening tag writes its closing tag, and typing </ completes the tag that is still open.", true, true),
+  bool("adcode.editing.fileTemplates", "editing", "Start new files from a template", "A new file opens with the boilerplate its language always begins with - a doctype for HTML, a main function for C. Ctrl+Z undoes it.", true, true),
+  bool("adcode.editing.autoRenamePairedTag", "editing", "Auto-rename paired tag", "Renaming an opening tag renames its closing tag, in the same undo step.", true, true),
+  bool("adcode.editing.pathAutocomplete", "editing", "Path autocomplete", "Complete file paths inside strings and imports, from the files that are really there.", true, true),
+  bool("adcode.editing.trailingWhitespace", "editing", "Render trailing whitespace", "Make trailing spaces visible.", false, true),
+  bool("adcode.editing.minimap", "editing", "Minimap", "The scaled overview down the right-hand edge.", false, true),
+  bool("adcode.editing.codeFolding", "editing", "Code folding", "Collapse and expand regions.", true, true),
+  bool("adcode.editing.multiCursor", "editing", "Multi-cursor", "Place more than one cursor with Ctrl+click, Ctrl+D, and Ctrl+Alt+Up/Down.", true, true),
+  // Its own row rather than a rider on multi-cursor, and off by default, because column
+  // select is a *mode*: while it is on, every mouse drag selects a rectangular block
+  // instead of the text it crosses. Shipping it on turned dragging across a line into a
+  // box selection for everyone, which is not a preference anybody chose.
+  bool("adcode.editing.columnSelection", "editing", "Column selection mode", "Dragging with the mouse selects a rectangular block instead of flowing text.", false, true),
+
+  /*
+   * Suggestions and plain-English errors.
+   *
+   * `acceptOnEnter` is its own row rather than folded into `suggestions` because it is the
+   * one with a real cost: with the widget open, Enter takes the suggestion instead of
+   * starting a new line. That is what makes it fast, and it is also the thing a user who
+   * dislikes it needs to be able to switch off without losing suggestions entirely.
+   */
+  bool("adcode.editing.suggestions", "editing", "Suggestions as you type", "Offer completions while typing. Press Tab or Enter to take one.", true, true),
+  bool("adcode.editing.acceptOnEnter", "editing", "Accept suggestion with Enter", "Enter takes the highlighted suggestion. Turn off to make Enter always start a new line.", false, true),
+  bool("adcode.editing.wordSuggestions", "editing", "Suggest words already in the file", "The fallback for languages with no built-in intelligence.", true, true),
+  bool("adcode.editing.plainEnglishErrors", "editing", "Explain errors in plain English", "Rewrite compiler messages in the Problems panel and on hover. The original wording is always kept underneath.", true, true),
+
+  /* ── Formatting (§4) ────────────────────────────────────────────────── */
+  bool("adcode.formatting.formatter", "formatting", "Built-in formatter", "Formatting with no extension to install. A language server is asked first where one is running; otherwise ADCode re-prints JSON and CSS, and fixes indentation and whitespace everywhere else.", true, true),
+  bool("adcode.formatting.formatOnSave", "formatting", "Format on save", "Run the formatter every time a file is saved. A language ADCode cannot format is saved exactly as you wrote it.", false, true),
+  bool("adcode.formatting.lintDiagnostics", "formatting", "Lint diagnostics", "Report problems in the Problems panel, the badge, and beside the line. Off silences all three without stopping the compiler.", true, true),
+  bool("adcode.formatting.organizeImportsOnSave", "formatting", "Organize imports on save", "Sort the import block when saving, and drop an import nothing in the file uses. Off by default, because deleting a line you did not ask to delete deserves to be a choice.", false, true),
+
+  /* ── Git (§4) ───────────────────────────────────────────────────────── */
+  bool("adcode.git.gutterDiff", "git", "Gutter diff decorations", "Mark added, changed, and deleted lines in the gutter.", true, true),
+  bool("adcode.git.blame", "git", "Blame", "Attribute each line to its last commit.", false, true),
+  bool("adcode.git.stageCommitUi", "git", "Stage, unstage, and commit", "Source-control UI for staging and committing.", true, true),
+  bool("adcode.git.branchSwitcher", "git", "Branch switcher", "Switch and create branches from the status bar.", true, true),
+  bool("adcode.git.mergeConflict", "git", "Merge conflict resolution", "Inline resolution for conflicted files.", true, true),
+  bool("adcode.git.fileTimeline", "git", "File timeline", "The commit history of the open file.", true, true),
+
+  /* ── Navigation (§4) ────────────────────────────────────────────────── */
+  bool("adcode.navigation.fuzzyFileOpen", "navigation", "Fuzzy file open", "Open any file by typing part of its name.", true, true),
+  bool("adcode.navigation.symbolSearch", "navigation", "Symbol search", "Jump to any function, class, or variable across the workspace with Ctrl+T. Nothing is indexed; the project is searched when you ask.", true, true),
+  bool("adcode.navigation.globalSearch", "navigation", "Global search and replace", "Regex search and replace across the workspace.", true, true),
+  bool("adcode.navigation.goToDefinition", "navigation", "Go to definition and references", "F12 or Alt+click previews a definition inline; Ctrl+click goes there. ADCode says whether a language server resolved it or it matched by name.", true, true),
+  bool("adcode.navigation.breadcrumbs", "navigation", "Breadcrumbs", "The path and symbol trail above the editor. Every part of it is a button.", true, true),
+  bool("adcode.navigation.outline", "navigation", "Outline", "The symbol tree for the open file, drawn with connecting lines in the Structure popup.", true, true),
+
+  /* ── Structure ──────────────────────────────────────────────────────── */
+  bool("adcode.structure.projectTreeLines", "structure", "Draw trees with connecting lines", "Show the lines that join a row to the folder it is inside. Off leaves plain indentation.", true, true),
+  bool("adcode.structure.elementToRules", "structure", "Show the rules that style an element", "Click an element in markup to see every CSS rule that applies to it.", true, true),
+  bool("adcode.structure.selectorToElements", "structure", "Show the elements a rule styles", "Click a rule in a stylesheet to see the elements it actually affects.", true, true),
+  /*
+   * Off by default, and the description says why rather than hiding it. On a project using
+   * CSS modules or utility classes this list is long and wrong, because matching by name
+   * cannot see a name that is generated.
+   */
+  bool("adcode.structure.unusedSelectors", "structure", "Point out rules that style nothing", "Report a CSS rule that matches no element in the project. Off by default: it cannot see class names built at runtime, so on some projects it is wrong more often than right.", false, true),
+  bool("adcode.structure.missingClasses", "structure", "Point out classes nothing defines", "Report a class used in markup that no stylesheet defines - usually a typo, which nothing else in a project ever catches.", true, true),
+
+  /* ── Language (§4) ──────────────────────────────────────────────────── */
+  /*
+   * `available: true` now, with an honest description.
+   *
+   * The client is built and works against a server that is on PATH. What is *not* built is
+   * bundling the servers into the installer, so the description says "installed" rather
+   * than "bundled" - the roster's job is to describe what the toggle actually does, and
+   * claiming bundled servers would be the exact failure `available: false` exists to avoid.
+   */
+  bool("adcode.language.lspClient", "language", "Language server intelligence", "Completion, diagnostics, and hover from language servers installed on this machine.", true, true),
+  {
+    id: "adcode.language.customServers",
+    group: "language",
+    kind: "text",
+    label: "Additional language servers",
+    description:
+      "One per line, as `language: command args`. This is what replaces an extension system for languages ADCode does not know about.",
+    default: "",
+    available: true,
+    placeholder: "zig: zls\nelm: elm-language-server --stdio",
+    multiline: true,
+    maxLength: 4000,
+  },
+  bool("adcode.language.dapClient", "language", "Debugger", "Breakpoints, stepping, the call stack, and variables - for JavaScript and TypeScript with nothing to install. Python needs debugpy, and ADCode says so rather than failing.", true, true),
+  bool("adcode.language.treeSitterHighlighting", "language", "Tree-sitter highlighting", "Syntax highlighting driven by a real parse tree, for 11 languages. A language without one keeps the built-in colouring.", true, true),
+
+  /* ── Session (§4) ───────────────────────────────────────────────────── */
+  bool("adcode.session.workspaceRestore", "session", "Restore workspace", "Reopen the last folder and editors on launch.", true, true),
+  bool("adcode.session.autoSave", "session", "Auto-save after delay", "Save automatically once typing pauses.", false, true),
+  bool("adcode.session.localFileHistory", "session", "Local file history", "Keep local versions of edited files.", true, true),
+  bool("adcode.session.crashRecovery", "session", "Crash recovery", "Recover unsaved buffers after an unexpected exit.", true, true),
+
+  /* ── AI (§5) ────────────────────────────────────────────────────────── */
+  { id: "adcode.ai.connections", group: "ai", kind: "text", label: "Model connections", description: "Named API connection profiles. Configure endpoints, models and shared RPM in Connect a model. Keys are stored separately.", default: "[]", available: true, placeholder: "[]", multiline: true, maxLength: 100000 },
+  { id: "adcode.ai.agentProfiles", group: "ai", kind: "text", label: "Named agents", description: "Reusable agent names, instructions and model routes. Configure these in Chat Teams.", default: "[]", available: true, placeholder: "[]", multiline: true, maxLength: 100000 },
+  {
+    id: "adcode.ai.provider",
+    group: "ai",
+    kind: "text",
+    placeholder: "tagflow", multiline: false, maxLength: 120,
+    label: "Provider",
+    description:
+      "Included Tagflow AI is selected by default when available. Sign in with a verified account to chat, or choose your own provider key or a local model. Your keys stay in the OS keychain.",
+    default: "tagflow",
+    available: true,
+  },
+  /*
+   * Free text rather than a fixed list.
+   *
+   * It used to be an enum of six, which meant the dropdown offered models a key could not
+   * reach and hid ones it could - and a new model could not be used until the app shipped
+   * again. The Connect screen picks from the real catalogue and writes the id here, so the
+   * set of valid values is "whatever your provider actually offers".
+   */
+  {
+    id: "adcode.ai.model",
+    group: "ai",
+    kind: "text",
+    label: "Model",
+    description:
+      "Which model the built-in chat uses. Leave empty to use the provider's recommended model; included Tagflow uses the administrator's default. Switching takes effect on your next message.",
+    default: "",
+    available: true,
+    placeholder: "Provider default",
+    multiline: false,
+    maxLength: 120,
+  },
+  {
+    id: "adcode.ai.effort",
+    group: "ai",
+    kind: "enum",
+    label: "Thinking effort",
+    description:
+      "How hard reasoning models think before answering. Auto lets the provider decide; higher efforts answer harder questions better and cost more. Applies to reasoning models from OpenAI and Anthropic.",
+    default: "auto",
+    available: true,
+    options: [
+      { value: "auto", label: "Auto", detail: "Provider decides" },
+      { value: "low", label: "Low", detail: "Fast, cheap" },
+      { value: "medium", label: "Medium", detail: "Balanced" },
+      { value: "high", label: "High", detail: "Harder questions" },
+      { value: "max", label: "Max", detail: "Strongest reasoning" },
+    ],
+  },
+  {
+    id: "adcode.ai.customBaseUrl",
+    group: "ai",
+    kind: "text",
+    label: "Custom endpoint",
+    description:
+      "Any address that speaks the OpenAI format - a gateway, a hosted provider, or a model running on this machine. Used when Provider is set to Custom.",
+    default: "",
+    available: true,
+    placeholder: "https://openrouter.ai/api/v1",
+    multiline: false,
+    maxLength: 400,
+  },
+  bool(
+    "adcode.ai.isolatedWorkspaces",
+    "ai",
+    "AI file tools",
+    "Let the assistant read, edit and run commands in the open project. AI edit approval decides whether edits land as it works or wait for you. Off keeps chat available but disables file tools.",
+    true,
+    true,
+  ),
+  {
+    id: "adcode.ai.parallelAgents",
+    group: "ai",
+    kind: "enum",
+    label: "Agents working at once",
+    description:
+      "How many agents on the Agents board, and Team roles, may work at the same time. More runs wait their turn as Queued. Higher finishes a pile of tasks sooner but spends faster and is likelier to hit a provider's rate limit.",
+    default: "3",
+    available: true,
+    options: [
+      { value: "1", label: "1", detail: "One at a time" },
+      { value: "2", label: "2" },
+      { value: "3", label: "3", detail: "Recommended" },
+      { value: "4", label: "4" },
+      { value: "5", label: "5" },
+      { value: "6", label: "6", detail: "Fastest, spends fastest" },
+    ],
+  },
+  {
+    id: "adcode.ai.editPolicy",
+    group: "ai",
+    kind: "enum",
+    label: "AI edit approval",
+    description:
+      "Let the assistant apply edits as it works, with Undo on every turn in the chat - or hold each turn's changes until you apply them.",
+    default: "trusted",
+    available: true,
+    options: [
+      { value: "trusted", label: "Apply automatically", detail: "Recommended · undo any turn" },
+      { value: "review", label: "Review every change", detail: "Changes wait for Apply" },
+    ],
+  },
+  bool(
+    "adcode.ai.keepGoing",
+    "ai",
+    "Keep going until done",
+    "When the assistant stops at its step limit, continue automatically - up to five times - instead of waiting for you.",
+    true,
+    true,
+  ),
+  {
+    id: "adcode.ai.taskTokenBudget",
+    group: "ai",
+    kind: "enum",
+    label: "Task token budget",
+    description: "Paused while the assistant edits directly: caps apply to isolated tasks only, and none are created. Kept for a future Team task control.",
+    default: "unlimited",
+    available: false,
+    options: [
+      { value: "unlimited", label: "Unlimited", detail: "Recommended" },
+      { value: "25000", label: "25k", detail: "Small fixes" },
+      { value: "100000", label: "100k", detail: "Large tasks" },
+      { value: "250000", label: "250k", detail: "Long runs" },
+    ],
+  },
+  {
+    id: "adcode.ai.taskTokenBudgetCustom",
+    group: "ai",
+    kind: "text",
+    label: "Custom token budget",
+    description: "Paused while the assistant edits directly. Must be 1000 to 10000000 when caps return.",
+    default: "",
+    available: false,
+    placeholder: "e.g. 50000",
+    multiline: false,
+    maxLength: 10,
+  },
+  {
+    id: "adcode.ai.sandboxQuota",
+    group: "ai",
+    kind: "enum",
+    label: "Sandbox storage",
+    description: "Maximum local space for isolated task workspaces. Terminal tasks are cleaned first.",
+    default: "5gb",
+    available: true,
+    options: [
+      { value: "1gb", label: "1 GB" },
+      { value: "5gb", label: "5 GB", detail: "Recommended" },
+      { value: "10gb", label: "10 GB" },
+    ],
+  },
+  {
+    id: "adcode.ai.sandboxRetention",
+    group: "ai",
+    kind: "enum",
+    label: "Keep finished sandboxes",
+    description: "How long discarded, failed, and rolled-back task sandboxes remain on this machine.",
+    default: "7d",
+    available: true,
+    options: [
+      { value: "1d", label: "1 day" },
+      { value: "7d", label: "7 days", detail: "Recommended" },
+      { value: "30d", label: "30 days" },
+    ],
+  },
+  {
+    id: "adcode.ai.checkpointRetention",
+    group: "ai",
+    kind: "enum",
+    label: "Keep rollback checkpoints",
+    description: "Applied-task checkpoints outlive sandboxes and are never removed while they are the task's only rollback source.",
+    default: "30d",
+    available: true,
+    options: [
+      { value: "7d", label: "7 days" },
+      { value: "30d", label: "30 days", detail: "Recommended" },
+      { value: "90d", label: "90 days" },
+    ],
+  },
+  bool("adcode.ai.chatWidget", "ai", "Chat widget", "The floating chat card, summoned by keyboard shortcut.", true, true),
+  bool("adcode.ai.inlineCompletion", "ai", "Inline completion", "Cancellable ghost text after an idle pause, accepted with Tab or requested with Alt+\\.", false, true),
+  bool("adcode.ai.terminalAgentDetection", "ai", "Terminal agent detection", "Recognise an AI agent started in the built-in terminal and offer to share this project's memory with it. Recognised from the command you typed - nothing else is inspected.", true, true),
+  bool(
+    "adcode.ai.autoContinue",
+    "ai",
+    "Continue terminal AI after limits",
+    "When a detected terminal AI reports a usage or rate limit, wait for its retry time and send the literal message 'continue'. Works only while ADCode is open.",
+    false,
+    true,
+  ),
+  {
+    id: "adcode.ai.autoContinueRetries",
+    group: "ai",
+    kind: "enum",
+    label: "Maximum automatic continuations",
+    description: "Stop a terminal AI after this many usage-limit continuations in one detected session.",
+    default: "3",
+    available: true,
+    options: [
+      { value: "1", label: "1" },
+      { value: "3", label: "3", detail: "Recommended" },
+      { value: "5", label: "5" },
+    ],
+  },
+  bool(
+    "adcode.ai.scheduledMessages",
+    "ai",
+    "Scheduled AI messages",
+    "Deliver locally scheduled prompts while ADCode is open and their project and target adapter are available.",
+    true,
+    true,
+  ),
+  bool(
+    "adcode.ai.autoCompact",
+    "ai",
+    "Auto-compact long conversations",
+    "When a chat or an agent run nears the model's context size, summarise the older part so the conversation keeps going. The newest turns stay word for word, and the chat remembers everything in the summary.",
+    true,
+    true,
+  ),
+  {
+    id: "adcode.ai.autoCompactAt",
+    group: "ai",
+    kind: "enum",
+    label: "Compact at",
+    description:
+      "How full the model's context gets before ADCode compacts the conversation. Earlier leaves more room for long answers and large files; later keeps more of the conversation word for word.",
+    default: "80",
+    available: true,
+    options: [
+      { value: "70", label: "70%", detail: "More room for big files" },
+      { value: "80", label: "80%", detail: "Recommended" },
+      { value: "90", label: "90%", detail: "Keep the most word for word" },
+    ],
+  },
+  /*
+   * On by default because the failure it prevents is the default: asked for a page, a
+   * model reaches for the same purple gradient, centred hero and three equal cards every
+   * time. The guide is read only when the work is a user interface, so a question about a
+   * build error never pays for it.
+   */
+  bool(
+    "adcode.ai.designTaste",
+    "ai",
+    "Product design guidance",
+    "Give the assistant and agents practical guidance for visual hierarchy, styling, animation, accessibility and release checks. Includes ADCode's production guide and taste-skill (MIT), while keeping your project's stack and style.",
+    true,
+    true,
+  ),
+  bool("adcode.ai.memoryCapture", "ai", "Memory capture", "Record decisions and conventions to the shared project memory.", true, true),
+  bool("adcode.ai.mcpServer", "ai", "MCP server", "Let external agents read and write the same memory.", true, true),
+  bool("adcode.ai.liveAgentView", "ai", "Live agent view", "Show every agent at work in the chat: code typing in as it is written, commands running, and the messages agents send each other.", true, true),
+];
+
+const BY_ID = new Map<SettingId, Setting>(SETTINGS_SCHEMA.map((s) => [s.id, s]));
+
+/** Keys that must never become own properties of a settings object. */
+const POLLUTING = new Set(["__proto__", "constructor", "prototype"]);
+
+export function getSetting(id: SettingId): Setting | undefined {
+  return BY_ID.get(id);
+}
+
+export function defaultSettings(): SettingsValues {
+  const values: SettingsValues = Object.create(null) as SettingsValues;
+  for (const setting of SETTINGS_SCHEMA) values[setting.id] = setting.default;
+  return { ...values };
+}
+
+/**
+ * Is this a value that setting may hold?
+ *
+ * Exported because the main process asks the same question before persisting a write, and
+ * it used to answer it with its own copy of this logic - which then did not learn about the
+ * `text` kind and rejected every write to it. One implementation, one place to update.
+ */
+export function isValidSettingValue(setting: Setting, value: unknown): value is SettingValue {
+  if (setting.kind === "boolean") return typeof value === "boolean";
+
+  if (setting.kind === "text") {
+    // Length is checked here rather than at the point of use, because "at the point of
+    // use" is a command line and by then it is too late to be picky about it.
+    return typeof value === "string" && value.length <= setting.maxLength;
+  }
+
+  return typeof value === "string" && setting.options.some((option) => option.value === value);
+}
+
+/**
+ * Coerce arbitrary JSON off the disk into a valid settings object.
+ *
+ * Unknown keys are dropped rather than preserved: a settings file is user-editable, and
+ * carrying unrecognised keys forward would let a typo survive upgrades forever, looking
+ * like a setting that simply does not work.
+ */
+export function validateSettings(raw: unknown): SettingsValues {
+  const result = defaultSettings();
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return result;
+
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (POLLUTING.has(key)) continue;
+
+    const setting = BY_ID.get(key);
+    if (setting === undefined) continue;
+    if (!isValidSettingValue(setting, value)) continue;
+
+    result[key] = value;
+  }
+
+  return result;
+}
+
+export interface StoredSettings {
+  readonly version: number | undefined;
+  readonly values: Record<string, unknown>;
+}
+
+export interface MigratedSettings {
+  readonly version: number;
+  readonly values: SettingsValues;
+}
+
+/**
+ * Bring stored settings up to the current schema version.
+ *
+ * Data from a *future* version is discarded rather than interpreted. Running two builds
+ * against one settings file is normal - two machines, or a downgrade - and guessing at a
+ * shape this build has never seen would silently corrupt the user's choices. Losing the
+ * customisation is recoverable; writing nonsense back over it is not.
+ */
+export function migrate(stored: StoredSettings): MigratedSettings {
+  if (typeof stored.version === "number" && stored.version > SETTINGS_VERSION) {
+    return { version: SETTINGS_VERSION, values: defaultSettings() };
+  }
+
+  const values = validateSettings(stored.values);
+  // Version 1 persisted every value, defaults included, so its "review" and "off" are
+  // the old defaults far more often than choices. ADCode now gets out of the way: edits
+  // land as the assistant works (every turn can be undone) and it keeps going to the end.
+  // Anyone who wants Review back is one click from it, and it sticks from here on.
+  if (stored.version === undefined || stored.version < 2) {
+    values["adcode.ai.editPolicy"] = "trusted";
+    values["adcode.ai.keepGoing"] = true;
+  }
+  return { version: SETTINGS_VERSION, values };
+}
+
+export function settingsForGroup(group: SettingGroupId): readonly Setting[] {
+  return SETTINGS_SCHEMA.filter((setting) => setting.group === group);
+}
+
+/** §3: the settings screen has a search field at the top. */
+export function searchSettings(query: string): readonly Setting[] {
+  const needle = query.trim().toLowerCase();
+  if (needle.length === 0) return SETTINGS_SCHEMA;
+
+  return SETTINGS_SCHEMA.filter((setting) => {
+    const haystack = `${setting.id} ${setting.label} ${setting.description}`.toLowerCase();
+    return haystack.includes(needle);
+  });
+}

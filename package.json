@@ -1,0 +1,105 @@
+{
+  "name": "adcode",
+  "version": "2.3.2",
+  "bin": {
+    "adcode": "scripts/adcode.mjs"
+  },
+  "type": "module",
+  "private": true,
+  "description": "ADCode - an ad-supported, AI-native IDE",
+  "author": "ADCode",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluethenics/adcode.git"
+  },
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11"
+  },
+  "//workspaces": "NOT npm workspaces: the repo lives on a FAT32 volume, which has no symlinks, and npm workspace linking is symlink-based (EISDIR on install). Package boundaries are enforced by dependency-cruiser + tsconfig paths instead. See docs/specs/2026-08-16-ad-core-design.md deviation D6.",
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "dev": "npm --prefix apps/desktop run dev",
+    "package": "node scripts/package.mjs",
+    "package:store": "node scripts/package-store.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/desktop/tsconfig.json && tsc --noEmit -p apps/web/tsconfig.json",
+    "desktop": "npm --prefix apps/desktop run dev",
+    "desktop:build": "npm --prefix apps/desktop run build",
+    "firewall": "depcruise --config .dependency-cruiser.cjs packages mock-server apps services",
+    "test": "vitest run --maxWorkers 4",
+    "test:watch": "vitest",
+    "test:emulator": "firebase emulators:exec --only firestore --project adcode-test \"vitest run services/api/test/emulator\"",
+    "mock-server": "node mock-server/src/cli.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:ads": "node scripts/smoke-ads.mjs",
+    "smoke:agent": "node scripts/smoke-agent-tools.mjs",
+    "smoke:commands": "node scripts/smoke-chat-commands.mjs",
+    "smoke:live": "node scripts/smoke-live-agents.mjs",
+    "record:hero": "node scripts/record-hero.mjs",
+    "smoke:first-run": "node scripts/smoke-first-run.mjs",
+    "smoke:all": "node scripts/smoke.mjs && node scripts/smoke-ads.mjs",
+    "design:check": "node scripts/design-system-check.cjs",
+    "release-note": "node scripts/release-note.mjs",
+    "verify": "npm run typecheck && npm run firewall && npm run test",
+    "icons": "electron scripts/make-icons.mjs",
+    "web": "npm --prefix apps/web run dev",
+    "web:build": "npm --prefix apps/web run build",
+    "web:preview": "npm --prefix apps/web run preview",
+    "web:deploy": "npm --prefix apps/web run deploy",
+    "seo-audit": "node scripts/seo-audit.mjs",
+    "smoke:vibe": "node scripts/smoke-vibe.mjs",
+    "models:check": "node scripts/models-check.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@types/ws": "^8.18.1",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-search": "^0.16.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "axe-core": "4.14.0",
+    "dependency-cruiser": "^18.2.0",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "fast-check": "^4.9.0",
+    "monaco-editor": "^0.56.0",
+    "tree-sitter-wasms": "^0.1.13",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.10"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true,
+    "esbuild@0.28.2": true,
+    "node-pty@1.1.0": true,
+    "electron@43.4.0": true
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.117.1",
+    "@modelcontextprotocol/sdk": "^1.30.1",
+    "@supabase/supabase-js": "^2.112.3",
+    "@xterm/addon-web-links": "^0.12.0",
+    "electron-updater": "^6.8.9",
+    "firebase": "^12.18.0",
+    "next": "~16.3.8",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "web-tree-sitter": "^0.20.8",
+    "ws": "^8.21.3",
+    "yjs": "^13.6.32"
+  },
+  "optionalDependencies": {
+    "firebase-admin": "^14.2.0"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.14.6",
+    "monaco-editor": {
+      "dompurify": "3.4.16"
+    }
+  }
+}

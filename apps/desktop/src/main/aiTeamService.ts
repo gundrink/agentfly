@@ -1,0 +1,660 @@
+/** Main-process allocation of confirmed Team roles onto immutable child workspaces. */
+import { randomUUID } from "node:crypto";
+import { realpath, rm } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  completeTeamNode,
+  createTeamHandoff,
+  failTeamNode,
+  pauseRunningTeamNodes,
+  planTeamMerge,
+  reserveTeamBudget,
+  resumeTeamNode,
+  settleTeamReservation,
+  startTeamNode,
+  teamGraphState,
+  type FileClaim,
+  type TeamBudgetLedger,
+  type TeamBudgetReservation,
+  type TeamBudgetBlockReason,
+  type TeamHandoff,
+  type TeamPlan,
+} from "@adcode/ai";
+import { captureAiSandboxBase, type CapturedAiSandboxBase } from "./aiSandbox.ts";
+import {
+  confirmAiTeamRecord,
+  aiTeamWorkspaceIdentity,
+  createAiTeamRecord,
+  createAiTeamStore,
+  transitionAiTeamRecord,
+  type AiTeamRecord,
+  type AiTeamRouteRecord,
+  type AiTeamStore,
+  type AiTeamTraceKind,
+} from "./aiTeamStore.ts";
+import type { AiWorkspaceService, StartAiWorkspaceInput } from "./aiWorkspaceService.ts";
+
+export interface ConfigureAiTeamInput {
+  readonly id: string;
+  readonly workspaceRoot: string;
+  readonly plan: TeamPlan;
+  readonly claims: readonly FileClaim[];
+  readonly budget: TeamBudgetLedger;
+}
+
+export interface AiWorkspaceAllocator {
+  start(input: StartAiWorkspaceInput): ReturnType<AiWorkspaceService["start"]>;
+  read(taskId: string): ReturnType<AiWorkspaceService["read"]>;
+  writeFromSandboxBase(
+    taskId: string,
+    path: string,
+    contents: string,
+  ): ReturnType<AiWorkspaceService["writeFromSandboxBase"]>;
+  importChange(
+    taskId: string,
+    change: Parameters<AiWorkspaceService["importChange"]>[1],
+  ): ReturnType<AiWorkspaceService["importChange"]>;
+  discard(taskId: string): ReturnType<AiWorkspaceService["discard"]>;
+  reject(taskId: string, path: string): ReturnType<AiWorkspaceService["reject"]>;
+}
+
+export interface AiTeamServiceOptions {
+  readonly userDataDirectory: string;
+  readonly workspaceService: AiWorkspaceAllocator;
+  readonly now?: () => number;
+  readonly traceId?: () => string;
+  readonly onChanged?: (team: AiTeamRecord) => void | Promise<void>;
+}
+
+export interface AiTeamService {
+  configure(input: ConfigureAiTeamInput): Promise<AiTeamRecord>;
+  read(id: string): Promise<AiTeamRecord | null>;
+  list(workspaceRoot: string): Promise<AiTeamRecord[]>;
+  startConfirmed(id: string): Promise<AiTeamRecord>;
+  resume(id: string): Promise<AiTeamRecord>;
+  startNode(id: string, nodeId: string): Promise<AiTeamRecord>;
+  completeNode(id: string, handoff: TeamHandoff): Promise<AiTeamRecord>;
+  failNode(id: string, nodeId: string, reason: string): Promise<AiTeamRecord>;
+  recordRoute(id: string, nodeId: string, route: AiTeamRouteRecord): Promise<AiTeamRecord>;
+  reserveRequest(
+    id: string,
+    reservation: TeamBudgetReservation,
+  ): Promise<
+    | { readonly ok: true; readonly team: AiTeamRecord }
+    | { readonly ok: false; readonly team: AiTeamRecord; readonly reason: TeamBudgetBlockReason }
+  >;
+  settleRequest(
+    id: string,
+    reservationId: string,
+    actual: { readonly tokens: number; readonly costMicros: number } | null,
+  ): Promise<AiTeamRecord>;
+  pause(id: string, reason: string): Promise<AiTeamRecord>;
+  fail(id: string, reason: string): Promise<AiTeamRecord>;
+  cancel(id: string): Promise<AiTeamRecord>;
+  remove(id: string): Promise<boolean>;
+  buildCombinedReview(id: string): Promise<AiTeamRecord>;
+  completeReview(id: string, combinedTaskId: string): Promise<AiTeamRecord>;
+  traces(id: string): ReturnType<AiTeamStore["traces"]>;
+  recoverActive(): Promise<AiTeamRecord[]>;
+}
+
+export function createAiTeamService(options: AiTeamServiceOptions): AiTeamService {
+  const now = options.now ?? Date.now;
+  const traceId = options.traceId ?? (() => `trace-${randomUUID()}`);
+  const durableStore = createAiTeamStore(options.userDataDirectory);
+  const store: AiTeamStore = {
+    ...durableStore,
+    async save(team): Promise<void> {
+      await durableStore.save(team);
+      try {
+        await options.onChanged?.(team);
+      } catch {
+        // Renderer notifications are observability, never durable Team authority.
+      }
+    },
+  };
+
+  async function trace(
+    team: AiTeamRecord,
+    summary: string,
+    outcome: "ok" | "blocked" | "failed",
+    detail = "",
+    nodeId: string | null = null,
+    kind: AiTeamTraceKind = outcome === "failed" ? "error" : "state",
+  ): Promise<void> {
+    try {
+      await store.appendTrace({
+        id: traceId(),
+        teamId: team.id,
+        nodeId,
+        at: now(),
+        kind,
+        summary,
+        detail,
+        outcome,
+      });
+    } catch {
+      // Traces are observability, not authority. Team state remains the durable truth.
+    }
+  }
+
+  async function cleanPrivateResources(
+    team: AiTeamRecord,
+    includeCombined: boolean,
+  ): Promise<AiTeamRecord> {
+    const taskIds = new Set(Object.values(team.childTaskIds));
+    if (includeCombined && team.merge.combinedTaskId !== null) taskIds.add(team.merge.combinedTaskId);
+    await Promise.allSettled(
+      [...taskIds].map(async (taskId) => {
+        const task = await options.workspaceService.read(taskId);
+        // Accepted human-workspace edits keep their checkpoint until the user rolls back.
+        if (task?.checkpoint !== null && task?.checkpoint !== undefined) return;
+        await options.workspaceService.discard(taskId);
+      }),
+    );
+    let baseRemoved = team.base === null || team.base.kind === "git-revision";
+    if (team.base?.kind === "shadow-base") {
+      try {
+        await rm(join(options.userDataDirectory, "ai-teams", team.id, "base"), {
+          recursive: true,
+          force: true,
+        });
+        baseRemoved = true;
+      } catch {
+        // A locked Windows directory remains recorded so startup recovery can retry it.
+      }
+    }
+    const cleaned = {
+      ...team,
+      base: baseRemoved ? null : team.base,
+      updatedAt: Math.max(now(), team.updatedAt),
+    };
+    await store.save(cleaned);
+    return cleaned;
+  }
+
+  return {
+    async configure(input): Promise<AiTeamRecord> {
+      if ((await store.read(input.id)) !== null) throw new Error("AI Team id already exists");
+      const root = await realpath(input.workspaceRoot);
+      const team = createAiTeamRecord({
+        id: input.id,
+        workspaceRoot: root,
+        plan: input.plan,
+        claims: input.claims,
+        budget: input.budget,
+        now: now(),
+      });
+      await store.save(team);
+      await trace(team, "Configured Team; waiting for confirmation", "ok");
+      return team;
+    },
+
+    read: (id) => store.read(id),
+    async list(workspaceRoot): Promise<AiTeamRecord[]> {
+      const root = await realpath(workspaceRoot);
+      return store.list(aiTeamWorkspaceIdentity(root));
+    },
+
+    async startConfirmed(id): Promise<AiTeamRecord> {
+      const existing = await store.read(id);
+      if (existing === null) throw new Error("AI Team was not found");
+      let team = confirmAiTeamRecord(existing, now());
+      await store.save(team);
+      await trace(team, "Team start confirmed", "ok");
+
+      let capturedBase: CapturedAiSandboxBase | null = null;
+      try {
+        const captured = await captureAiSandboxBase({
+          userDataDirectory: options.userDataDirectory,
+          teamId: team.id,
+          workspaceRoot: team.workspaceRoot,
+        });
+        capturedBase = captured;
+        team = { ...team, base: captured.record, updatedAt: now() };
+        await store.save(team);
+
+        const perRoleTokens = Math.max(1, Math.floor(team.budget.tokenLimit / team.plan.roles.length));
+        for (const role of team.plan.roles) {
+          const child = await options.workspaceService.start({
+            workspaceRoot: team.workspaceRoot,
+            prompt: `${team.plan.prompt}\n\nRole: ${role.label}\n${role.objective}`,
+            parentTeamId: team.id,
+            reviewable: false,
+            tokenLimit: perRoleTokens,
+            costMicrosLimit: team.budget.costMicrosLimit,
+            sandboxSource: captured.source,
+            reservedStorageBytes: captured.record.sizeBytes,
+          });
+          team = {
+            ...team,
+            childTaskIds: { ...team.childTaskIds, [role.id]: child.id },
+            updatedAt: now(),
+          };
+          await store.save(team);
+        }
+
+        team = transitionAiTeamRecord(team, "running", now());
+        await store.save(team);
+        await trace(team, `Allocated ${String(team.plan.roles.length)} isolated role workspaces`, "ok");
+        return team;
+      } catch (error) {
+        if (
+          capturedBase?.record.kind === "shadow-base" &&
+          Object.keys(team.childTaskIds).length === 0
+        ) {
+          await capturedBase.cleanup().catch(() => undefined);
+          team = { ...team, base: null, updatedAt: now() };
+        }
+        team = transitionAiTeamRecord(team, "paused", now());
+        await store.save(team);
+        await trace(
+          team,
+          "Team paused during isolated workspace allocation",
+          "blocked",
+          error instanceof Error ? error.message : "workspace allocation failed",
+        );
+        return team;
+      }
+    },
+
+    async resume(id): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "paused" || team.confirmedAt === null) {
+        throw new Error("AI Team cannot resume");
+      }
+      if (team.base === null) throw new Error("AI Team immutable base is unavailable");
+      const reserved = team.budget.reservations.reduce(
+        (total, reservation) => ({
+          tokens: total.tokens + reservation.tokens,
+          costMicros: total.costMicros + reservation.costMicros,
+        }),
+        { tokens: 0, costMicros: 0 },
+      );
+      if (
+        team.budget.usedTokens + reserved.tokens >= team.budget.tokenLimit ||
+        team.budget.usedCostMicros + reserved.costMicros >= team.budget.costMicrosLimit
+      ) {
+        throw new Error("AI Team budget is exhausted");
+      }
+      const base = team.base;
+      const source =
+        base.kind === "git-revision"
+          ? { kind: "git-revision" as const, revision: base.revision }
+          : {
+              kind: "shadow-base" as const,
+              root: join(options.userDataDirectory, "ai-teams", team.id, "base"),
+            };
+      const perRoleTokens = Math.max(1, Math.floor(team.budget.tokenLimit / team.plan.roles.length));
+      for (const role of team.plan.roles) {
+        const existingId = team.childTaskIds[role.id];
+        if (existingId !== undefined) {
+          const child = await options.workspaceService.read(existingId);
+          if (
+            child === null ||
+            child.parentTeamId !== team.id ||
+            child.reviewable ||
+            ["discarded", "failed", "rolled-back"].includes(child.state)
+          ) {
+            throw new Error(`AI Team role ${role.id} workspace is unavailable`);
+          }
+          continue;
+        }
+        const child = await options.workspaceService.start({
+          workspaceRoot: team.workspaceRoot,
+          prompt: `${team.plan.prompt}\n\nRole: ${role.label}\n${role.objective}`,
+          parentTeamId: team.id,
+          reviewable: false,
+          tokenLimit: perRoleTokens,
+          costMicrosLimit: team.budget.costMicrosLimit,
+          sandboxSource: source,
+          reservedStorageBytes: base.sizeBytes,
+        });
+        team = {
+          ...team,
+          childTaskIds: { ...team.childTaskIds, [role.id]: child.id },
+          updatedAt: Math.max(now(), team.updatedAt),
+        };
+        await store.save(team);
+      }
+      let graph = team.graph;
+      for (const node of graph.nodes.filter((candidate) => candidate.state === "paused")) {
+        graph = resumeTeamNode(graph, node.id, Math.max(now(), graph.updatedAt));
+      }
+      if (teamGraphState(graph) !== "active") throw new Error("AI Team has no resumable work");
+      team = transitionAiTeamRecord({ ...team, graph }, "running", Math.max(now(), team.updatedAt));
+      await store.save(team);
+      await trace(team, "Team resumed after revalidating budget and role workspaces", "ok");
+      return team;
+    },
+
+    async startNode(id, nodeId): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running") throw new Error("AI Team cannot start a node");
+      team = { ...team, graph: startTeamNode(team.graph, nodeId, now()), updatedAt: now() };
+      await store.save(team);
+      await trace(team, `Started ${nodeId}`, "ok", "", nodeId);
+      return team;
+    },
+
+    async completeNode(id, handoffInput): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running") throw new Error("AI Team cannot complete a node");
+      const handoff = createTeamHandoff(handoffInput);
+      if (!team.plan.nodes.some((node) => node.id === handoff.nodeId)) {
+        throw new Error("AI Team handoff node was not found");
+      }
+      team = {
+        ...team,
+        graph: completeTeamNode(team.graph, handoff.nodeId, now()),
+        handoffs: [...team.handoffs.filter((existing) => existing.nodeId !== handoff.nodeId), handoff],
+        updatedAt: now(),
+      };
+      await store.save(team);
+      await trace(team, handoff.summary, "ok", handoff.changedPaths.join(", "), handoff.nodeId);
+      return team;
+    },
+
+    async failNode(id, nodeId, reason): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running") throw new Error("AI Team cannot fail a node");
+      team = { ...team, graph: failTeamNode(team.graph, nodeId, reason, now()), updatedAt: now() };
+      await store.save(team);
+      await trace(team, `Failed ${nodeId}`, "failed", reason, nodeId, "agent");
+      return team;
+    },
+
+    async recordRoute(id, nodeId, route): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running") throw new Error("AI Team cannot route a node");
+      if (!team.plan.nodes.some((node) => node.id === nodeId)) throw new Error("AI Team route node was not found");
+      team = { ...team, routes: { ...team.routes, [nodeId]: route }, updatedAt: now() };
+      await store.save(team);
+      await trace(team, `Routed ${nodeId} to ${route.providerId}/${route.modelId}`, "ok", route.reason, nodeId, "route");
+      return team;
+    },
+
+    async reserveRequest(id, reservation) {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running") throw new Error("AI Team cannot reserve a request");
+      if (!team.plan.nodes.some((node) => node.id === reservation.agentId)) {
+        throw new Error("AI Team budget node was not found");
+      }
+      if (team.graph.nodes.find((node) => node.id === reservation.agentId)?.state !== "running") {
+        throw new Error("AI Team budget node is not running");
+      }
+      const result = reserveTeamBudget(team.budget, reservation);
+      if (!result.ok) {
+        await trace(team, `Blocked request for ${reservation.agentId}`, "blocked", result.reason, reservation.agentId, "budget");
+        return { ok: false as const, team, reason: result.reason };
+      }
+      team = { ...team, budget: result.ledger, updatedAt: now() };
+      await store.save(team);
+      await trace(
+        team,
+        `Reserved ${String(reservation.tokens)} tokens for ${reservation.agentId}`,
+        "ok",
+        reservation.id,
+        reservation.agentId,
+        "budget",
+      );
+      return { ok: true as const, team };
+    },
+
+    async settleRequest(id, reservationId, actual): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null) throw new Error("AI Team was not found");
+      const reservation = team.budget.reservations.find((candidate) => candidate.id === reservationId);
+      if (reservation === undefined) return team;
+      const settled = actual ?? { tokens: reservation.tokens, costMicros: reservation.costMicros };
+      team = {
+        ...team,
+        budget: settleTeamReservation(team.budget, reservationId, settled),
+        updatedAt: now(),
+      };
+      await store.save(team);
+      await trace(
+        team,
+        `Settled ${String(settled.tokens)} tokens for ${reservation.agentId}`,
+        "ok",
+        reservationId,
+        reservation.agentId,
+        "budget",
+      );
+      return team;
+    },
+
+    async pause(id, reason): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null) throw new Error("AI Team was not found");
+      if (team.state === "paused") return team;
+      const pausedAt = now();
+      team = {
+        ...transitionAiTeamRecord(team, "paused", pausedAt),
+        graph: pauseRunningTeamNodes(team.graph, pausedAt),
+      };
+      await store.save(team);
+      await trace(team, "Team paused", "blocked", reason);
+      return team;
+    },
+
+    async fail(id, reason): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null) throw new Error("AI Team was not found");
+      if (team.state === "failed") return team;
+      team = transitionAiTeamRecord(team, "failed", now());
+      await store.save(team);
+      await trace(team, "Team failed", "failed", reason);
+      return team;
+    },
+
+    async cancel(id): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null) throw new Error("AI Team was not found");
+      if (team.state === "cancelled") return cleanPrivateResources(team, true);
+      const cancelledAt = now();
+      team = {
+        ...transitionAiTeamRecord(team, "cancelled", cancelledAt),
+        graph: pauseRunningTeamNodes(team.graph, cancelledAt),
+      };
+      await store.save(team);
+      await trace(team, "Team cancelled", "blocked");
+      return cleanPrivateResources(team, true);
+    },
+
+    async remove(id): Promise<boolean> {
+      const team = await store.read(id);
+      if (team === null) return false;
+      if (["preparing", "running", "merging"].includes(team.state)) {
+        throw new Error("Stop the agent before deleting its run.");
+      }
+      const taskIds = new Set(Object.values(team.childTaskIds));
+      if (team.merge.combinedTaskId !== null) taskIds.add(team.merge.combinedTaskId);
+      for (const taskId of taskIds) {
+        const task = await options.workspaceService.read(taskId);
+        // Keep applied edits and their Undo checkpoint in the project task history.
+        if (task === null) continue;
+        if (task.checkpoint !== null) {
+          if (task.state === "review") {
+            for (const change of task.changes) await options.workspaceService.reject(taskId, change.path);
+          }
+          continue;
+        }
+        await options.workspaceService.discard(taskId);
+      }
+      return store.remove(id);
+    },
+
+    async buildCombinedReview(id): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (team === null || team.state !== "running" || teamGraphState(team.graph) !== "completed") {
+        throw new Error("AI Team is not ready to merge");
+      }
+      if (team.base === null) throw new Error("AI Team immutable base is unavailable");
+      const immutableBase = team.base;
+
+      const contributions = [];
+      for (const node of team.plan.nodes) {
+        const handoff = team.handoffs.find((candidate) => candidate.nodeId === node.id);
+        if (handoff === undefined) throw new Error(`AI Team node ${node.id} has no handoff`);
+        const childId = team.childTaskIds[node.roleId];
+        if (childId === undefined) throw new Error(`AI Team role ${node.roleId} has no child workspace`);
+        const child = await options.workspaceService.read(childId);
+        if (child === null) throw new Error("AI Team child workspace was not found");
+        const paths = new Set(handoff.changedPaths);
+        const changes = child.changes.filter((change) => paths.has(change.path));
+        if (changes.length !== paths.size) throw new Error(`AI Team handoff for ${node.id} names an unknown change`);
+        contributions.push({ nodeId: node.id, changes });
+      }
+
+      const mergePlan = planTeamMerge(team.plan, contributions);
+      team = {
+        ...transitionAiTeamRecord(team, "merging", now()),
+        merge: { state: "merging", combinedTaskId: null, conflicts: [] },
+      };
+      await store.save(team);
+      if (mergePlan.conflicts.length > 0) {
+        team = {
+          ...transitionAiTeamRecord(team, "conflict", now()),
+          merge: {
+            state: "conflict",
+            combinedTaskId: null,
+            conflicts: mergePlan.conflicts,
+          },
+        };
+        await store.save(team);
+        await trace(
+          team,
+          "Team merge needs conflict review",
+          "blocked",
+          team.merge.conflicts.map((conflict) => conflict.path).join(", "),
+        );
+        return team;
+      }
+      if (mergePlan.changes.length === 0) {
+        // Research/review-only tasks have nothing to apply. Their handoffs are the
+        // result; pausing here would make every resume attempt repeat the empty merge.
+        team = {
+          ...transitionAiTeamRecord(team, "completed", now()),
+          merge: { state: "completed", combinedTaskId: null, conflicts: [] },
+        };
+        await store.save(team);
+        await trace(team, "Team completed without file changes", "ok");
+        return cleanPrivateResources(team, false);
+      }
+
+      const source =
+        immutableBase.kind === "git-revision"
+          ? { kind: "git-revision" as const, revision: immutableBase.revision }
+          : {
+              kind: "shadow-base" as const,
+              root: join(options.userDataDirectory, "ai-teams", team.id, "base"),
+            };
+      let combinedTaskId: string | null = null;
+      try {
+        const combined = await options.workspaceService.start({
+          workspaceRoot: team.workspaceRoot,
+          prompt: `Combined review: ${team.plan.prompt}`,
+          parentTeamId: team.id,
+          reviewable: true,
+          tokenLimit: team.budget.tokenLimit,
+          costMicrosLimit: team.budget.costMicrosLimit,
+          sandboxSource: source,
+          reservedStorageBytes: immutableBase.sizeBytes,
+        });
+        combinedTaskId = combined.id;
+        team = {
+          ...team,
+          merge: { state: "merging", combinedTaskId: combined.id, conflicts: [] },
+          updatedAt: now(),
+        };
+        await store.save(team);
+        for (const change of mergePlan.changes) {
+          await options.workspaceService.importChange(combined.id, change);
+        }
+        team = {
+          ...transitionAiTeamRecord(team, "review", now()),
+          merge: { state: "review", combinedTaskId: combined.id, conflicts: [] },
+        };
+        await store.save(team);
+        await trace(team, `Combined ${String(mergePlan.changes.length)} changed file(s) for review`, "ok");
+        return team;
+      } catch (error) {
+        if (combinedTaskId !== null) {
+          try {
+            await options.workspaceService.discard(combinedTaskId);
+          } catch {
+            // The durable parent is still paused below. A retained discarded candidate
+            // is never exposed as a reviewable merge or applied to the human workspace.
+          }
+        }
+        team = transitionAiTeamRecord(team, "paused", now());
+        team = { ...team, merge: { state: "idle", combinedTaskId: null, conflicts: [] } };
+        await store.save(team);
+        await trace(
+          team,
+          "Team paused while building combined review",
+          "failed",
+          error instanceof Error ? error.message : "combined review failed",
+        );
+        return team;
+      }
+    },
+
+    async completeReview(id, combinedTaskId): Promise<AiTeamRecord> {
+      let team = await store.read(id);
+      if (
+        team?.state === "completed" &&
+        team.merge.combinedTaskId === combinedTaskId
+      ) {
+        return cleanPrivateResources(team, false);
+      }
+      if (
+        team === null ||
+        team.state !== "review" ||
+        team.merge.state !== "review" ||
+        team.merge.combinedTaskId !== combinedTaskId
+      ) {
+        throw new Error("AI Team combined review is not ready to complete");
+      }
+      const combined = await options.workspaceService.read(combinedTaskId);
+      if (
+        combined === null ||
+        combined.state !== "applied" ||
+        combined.parentTeamId !== team.id ||
+        !combined.reviewable
+      ) {
+        throw new Error("AI Team combined review has not been applied");
+      }
+      team = transitionAiTeamRecord(team, "completed", Math.max(now(), team.updatedAt));
+      team = {
+        ...team,
+        merge: { state: "completed", combinedTaskId, conflicts: [] },
+      };
+      await store.save(team);
+      await trace(team, "Combined Team review applied", "ok");
+      return cleanPrivateResources(team, false);
+    },
+
+    traces: (id) => store.traces(id),
+    async recoverActive(): Promise<AiTeamRecord[]> {
+      const recovered = await store.recoverActive(now());
+      for (const team of await store.listAll()) {
+        try {
+          if (team.state === "review" && team.merge.combinedTaskId !== null) {
+            const combined = await options.workspaceService.read(team.merge.combinedTaskId);
+            if (combined?.state === "applied") {
+              recovered.push(await this.completeReview(team.id, combined.id));
+              continue;
+            }
+          }
+          if (team.state === "cancelled") await cleanPrivateResources(team, true);
+          if (team.state === "completed") await cleanPrivateResources(team, false);
+        } catch {
+          // Durable records remain intact; a later startup or explicit action retries.
+        }
+      }
+      return recovered;
+    },
+  };
+}
