@@ -272,19 +272,7 @@ export function AppShell({
     return anchorAt === -1 ? hash === "" : hash === href.slice(anchorAt);
   };
 
-  if (!configured) {
-    return (
-      <section className="band">
-        <div className="wrap">
-          <div className="notice" data-tone="info">
-            Sign-in isn&apos;t configured on this deployment yet. Set the{" "}
-            <code className="mono">NEXT_PUBLIC_FIREBASE_*</code> environment variables to
-            enable it.
-          </div>
-        </div>
-      </section>
-    );
-  }
+  if (!configured) return null;
 
   // An admin page waits for the admin answer too: signing in finishes before it arrives,
   // and "Not an admin account" flashed at administrators in between.
