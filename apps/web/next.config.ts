@@ -37,7 +37,20 @@ const config: NextConfig = {
    * repository, but `npm run deploy` runs from `apps/web`, where it picks `apps/web` and
    * puts the API outside the project. Same code, same command, two different answers.
    */
-  turbopack: { root: join(HERE, "..", "..") },
+  /*
+   * Vercel installs this app's dependencies in `apps/web/node_modules`, while the root above
+   * is the repository, whose `node_modules` is empty there. `services/api` imports
+   * `@supabase/supabase-js` and this app imports `firebase/*`, so both have to be named
+   * explicitly. A filesystem path is rewritten into a broken relative import.
+   */
+  turbopack: {
+    root: join(HERE, "..", ".."),
+    resolveAlias: {
+      "@supabase/supabase-js": "./apps/web/node_modules/@supabase/supabase-js",
+      "firebase/app": "./apps/web/node_modules/firebase/app",
+      "firebase/auth": "./apps/web/node_modules/firebase/auth",
+    },
+  },
 
   /*
    * The routes retired by the single-page restructure, moved permanently.
