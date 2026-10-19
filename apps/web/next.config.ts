@@ -38,17 +38,16 @@ const config: NextConfig = {
    * puts the API outside the project. Same code, same command, two different answers.
    */
   /*
-   * Vercel installs this app's dependencies in `apps/web/node_modules`, while the root above
-   * is the repository, whose `node_modules` is empty there. `services/api` imports
-   * `@supabase/supabase-js` and this app imports `firebase/*`, so both have to be named
-   * explicitly. A filesystem path is rewritten into a broken relative import.
+   * Vercel installs this app's dependencies in `apps/web/node_modules`. Turbopack's root is
+   * the repository, so `services/api` never walks into that folder. These names are relative
+   * to this app, which is where the install actually put the packages.
    */
   turbopack: {
     root: join(HERE, "..", ".."),
     resolveAlias: {
-      "@supabase/supabase-js": "./apps/web/node_modules/@supabase/supabase-js",
-      "firebase/app": "./apps/web/node_modules/firebase/app",
-      "firebase/auth": "./apps/web/node_modules/firebase/auth",
+      "@supabase/supabase-js": "./node_modules/@supabase/supabase-js",
+      "firebase/app": "./node_modules/firebase/app",
+      "firebase/auth": "./node_modules/firebase/auth",
     },
   },
 
